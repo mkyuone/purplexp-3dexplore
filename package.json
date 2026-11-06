@@ -1,0 +1,26 @@
+{
+  "name": "spatial-cad-workbench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host localhost --port 4180 --strictPort",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host localhost --port 4180 --strictPort",
+    "test": "node --experimental-strip-types --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "lucide-react": "1.68.0",
+    "occt-wasm": "5.8.1",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "three": "0.184.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/three": "0.184.1",
+    "typescript": "5.9.3",
+    "vite": "7.3.7"
+  }
+}
