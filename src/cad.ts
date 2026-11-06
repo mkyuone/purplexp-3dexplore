@@ -5,6 +5,8 @@ export interface CadMesh {
   normals: Float32Array;
   indices: Uint32Array;
   color?: CadColor;
+  /** Contiguous index ranges for the optional occurrence palette. */
+  groups?: { start: number; count: number }[];
 }
 
 export interface CadOccurrence {
@@ -15,6 +17,8 @@ export interface CadOccurrence {
   mesh?: number;
   /** sRGB surface color, shared by default and overridable per occurrence. */
   color?: CadColor;
+  /** sRGB face colors in the shared mesh's group order. */
+  colors?: (CadColor | undefined)[];
   children: CadOccurrence[];
 }
 

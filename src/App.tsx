@@ -5,10 +5,12 @@ import { CadScene } from './scene';
 import { GestureController, type GestureState } from './gestures';
 import { HandSimulator } from './simulator';
 import { AssemblyPanel, indexOccurrences, PartPanel } from './panels';
+import carModelUrl from './models/ultraviolet-full-car.step?url';
 
-const sampleName = 'suspension.step';
+const startingModelName = 'Ultraviolet Full Car.step';
+const simulationMode = import.meta.env.DEV && new URLSearchParams(window.location.search).get('simulate') === '1';
 const emptyRoots: CadAssembly['roots'] = [];
-type Runtime = { scene: CadScene; gestures: GestureController; simulator: HandSimulator };
+type Runtime = { scene: CadScene; gestures?: GestureController; simulator?: HandSimulator };
 type Exhibit = { name: string; assembly: CadAssembly };
 
 function visitorCue(state: GestureState | null) {
@@ -30,7 +32,7 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [rendererError, setRendererError] = useState<string | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
-  const [enabled, setEnabled] = useState(true);
+  const [enabled, setEnabled] = useState(simulationMode);
   const [selected, setSelected] = useState<string | null>(null);
   const [pose, setPose] = useState<GestureState | null>(null);
   const [, setRevision] = useState(0);
@@ -54,7 +56,7 @@ export function App() {
       const assembly = await importStep(data, controller.signal);
       const active = runtime.current;
       if (controller.signal.aborted || !active) return;
-      active.gestures.cancel();
+      active.gestures?.cancel();
       active.scene.load(assembly);
       setExhibit({ name, assembly });
       setSelected(null);
@@ -70,10 +72,10 @@ export function App() {
     }
   }
 
-  function loadSample() {
-    return load(sampleName, async signal => {
-      const response = await fetch(`${import.meta.env.BASE_URL}samples/${sampleName}`, { signal });
-      if (!response.ok) throw new Error('The bundled sample could not be opened.');
+  function loadStartingModel() {
+    return load(startingModelName, async signal => {
+      const response = await fetch(carModelUrl, { signal });
+      if (!response.ok) throw new Error('The starting model could not be opened.');
       return response.arrayBuffer();
     });
   }
@@ -87,20 +89,24 @@ export function App() {
       setRendererError('A WebGL 2 context could not be created. Open the explorer in a browser with hardware acceleration enabled.');
       return;
     }
-    const gestures = new GestureController(scene, state => {
-      runtime.current?.simulator.setJoinTarget(state.join);
-      setSelected(scene.getSelected());
-      setPose(state);
-    });
-    const simulator = new HandSimulator(viewport.current, frame => gestures.receive(frame), (x, y) => scene.pick(x, y) ? 'part' : 'view');
-    runtime.current = { scene, gestures, simulator };
-    simulator.setEnabled(true);
-    void loadSample();
+    const active: Runtime = { scene };
+    runtime.current = active;
+    if (simulationMode) {
+      const gestures = new GestureController(scene, state => {
+        active.simulator?.setJoinTarget(state.join);
+        setSelected(scene.getSelected());
+        setPose(state);
+      });
+      active.gestures = gestures;
+      active.simulator = new HandSimulator(viewport.current, frame => gestures.receive(frame), (x, y) => scene.pick(x, y) ? 'part' : 'view');
+      active.simulator.setEnabled(true);
+    }
+    void loadStartingModel();
     return () => {
       importAbort.current?.abort();
       importAbort.current = null;
-      simulator.dispose();
-      gestures.dispose();
+      active.simulator?.dispose();
+      active.gestures?.dispose();
       scene.dispose();
       runtime.current = null;
     };
@@ -129,13 +135,13 @@ export function App() {
   function edit(change: (scene: CadScene) => void) {
     const active = runtime.current;
     if (!active) return;
-    active.gestures.cancel();
+    active.gestures?.cancel();
     change(active.scene);
     setRevision(value => value + 1);
   }
 
   function openSetup() {
-    runtime.current?.simulator.setEnabled(false);
+    runtime.current?.simulator?.setEnabled(false);
     setup.current?.showModal();
     setSetupOpen(true);
   }
@@ -143,9 +149,9 @@ export function App() {
   function closeSetup() {
     setSetupOpen(false);
     const active = runtime.current;
-    active?.gestures.cancel();
-    active?.simulator.setEnabled(enabled);
-    viewport.current?.focus({ preventScroll: true });
+    active?.gestures?.cancel();
+    active?.simulator?.setEnabled(enabled);
+    if (simulationMode) viewport.current?.focus({ preventScroll: true });
   }
 
   const stageMessage = loading ? <div className="message loading" role="status"><LoaderCircle size={18} /> <span>Importing {loading}</span></div>
@@ -154,22 +160,17 @@ export function App() {
     </div> : null;
 
   return <main className="explorer">
-    <section ref={viewport} className="exhibit" tabIndex={0} aria-label="Interactive CAD exhibit" aria-describedby="visitor-cue">
+    <h1 className="sr-only">Spatial CAD Explorer</h1>
+    <section ref={viewport} className="exhibit" tabIndex={simulationMode ? 0 : undefined} aria-label="Interactive CAD exhibit" aria-describedby={simulationMode ? 'visitor-cue' : undefined}>
       <div className="stage-light" />
       <canvas ref={canvas} className="model" aria-label="3D CAD assembly" />
-      <header className="masthead">
-        <div className="brand"><Box aria-hidden="true" /><span>Spatial CAD Explorer</span></div>
-        <button className="setup-trigger" type="button" aria-haspopup="dialog" onClick={openSetup}><Settings size={22} /> Setup</button>
-      </header>
-      <div className="intro">
-        <h1>Reach in and explore</h1>
-        <p id="visitor-cue" aria-live="polite">{enabled ? visitorCue(pose) : 'Open Setup to enable simulated hands.'}</p>
-      </div>
+      <button className="setup-trigger" type="button" aria-haspopup="dialog" onClick={openSetup}><Settings size={22} /> Setup</button>
+      {simulationMode && <p id="visitor-cue" className="sr-only" aria-live="polite">{enabled ? visitorCue(pose) : 'Open Setup to enable simulated hands.'}</p>}
       {!setupOpen && stageMessage && <div className="stage-message">{stageMessage}</div>}
       {!exhibit && !loading && !rendererError && <div className="empty-stage">
         <Box size={35} /><p>Open Setup to load an assembly.</p>
       </div>}
-      {enabled && !setupOpen && exhibit && <div className="hands-layer" aria-hidden="true">
+      {simulationMode && enabled && !setupOpen && exhibit && <div className="hands-layer" aria-hidden="true">
         {pose?.hands.map(hand => <div key={hand.id}
           className={`hand-cursor${hand.id === 'right' ? ' second' : ''}${hand.pinched ? ' is-pinched' : ''}${hand.fist ? ' is-view-grip' : ''}`}
           style={{ left: `${hand.x * 100}%`, top: `${hand.y * 100}%`, transform: `translate(-50%, -50%) scale(${Math.max(0.65, Math.min(1.45, 1 + hand.depth))})` }}>
@@ -180,12 +181,12 @@ export function App() {
           <span className="join-label">{pose.target === 'view' ? 'Make a fist here' : 'Pinch here'}</span>
         </div>}
       </div>}
-      <footer className="exhibit-footer">
+      {simulationMode && <footer className="exhibit-footer">
         {enabled && !setupOpen && (pose?.target === 'view'
           ? <div className="part-caption"><Orbit size={16} /><span>Exhibit view</span></div>
           : focusPart && <div className="part-caption"><Box size={16} /><span>{focusPart.name}</span></div>)}
         <span className="input-status" data-active={enabled && pose?.status !== 'lost' && !rendererError}><i />{enabled ? 'Simulated hands' : 'Simulation paused'}</span>
-      </footer>
+      </footer>}
     </section>
 
     <dialog ref={setup} className="setup-panel" aria-labelledby="setup-title" onClose={closeSetup}>
@@ -199,7 +200,7 @@ export function App() {
           <p className="file-name" title={exhibit?.name}>{exhibit?.name ?? 'No model loaded'} <span>mm · Z up</span></p>
           <div className="file-actions">
             <button className="button button-primary" type="button" onClick={() => picker.current?.click()} disabled={!!rendererError}><Upload size={16} /> Import STEP</button>
-            <button className="button" type="button" onClick={() => void loadSample()} disabled={!!rendererError}>Load sample</button>
+            <button className="button" type="button" onClick={() => void loadStartingModel()} disabled={!!rendererError}>Load starting model</button>
           </div>
           <input ref={picker} type="file" aria-label="STEP file" accept=".step,.stp" onChange={onFile} hidden />
           {stageMessage}
@@ -224,7 +225,7 @@ export function App() {
             })} disabled={!exhibit}>Reset exhibit</button>
           </div>
         </section>
-        <section className="panel sim-panel" aria-label="Simulator controls">
+        {simulationMode && <section className="panel sim-panel" aria-label="Simulator controls">
           <div className="panel-heading"><h2>Simulated hands</h2>
             <button className="sim-toggle" role="switch" aria-label="Simulated hands" aria-checked={enabled} type="button" onClick={() => setEnabled(value => !value)} disabled={!!rendererError}><span /></button>
           </div>
@@ -238,7 +239,7 @@ export function App() {
             <div><dt><kbd>Esc</kbd></dt><dd>Drop tracking</dd></div>
           </dl>
           <p className="setup-hint">Shift-drag to orbit with the pointer. On touchscreens, drag a part to move it or drag empty space to orbit. Add a second finger at the ring to resize or zoom.</p>
-        </section>
+        </section>}
       </div>}
     </dialog>
   </main>;

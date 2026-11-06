@@ -48,6 +48,36 @@ test("an inch STEP export returns millimeter geometry", () => {
   }
 });
 
+test("STEP keeps an individually styled face on its source triangles", () => {
+  const shape = kernel.makeBox(12, 18, 24);
+  const faces = kernel.getSubShapes(shape, "face");
+  const doc = kernel.createXCAFDocument();
+  try {
+    const label = doc.addShape(shape, { name: "Two-tone box", color: [1, 0, 0] });
+    const face = faces[0];
+    const { xmin, ymin, zmin, xmax, ymax, zmax } = kernel.getBoundingBox(face);
+    doc.addSubShape(label, face, { color: [0, 0, 1] });
+
+    const data = new TextEncoder().encode(doc.exportSTEP());
+    const { roots: [part], meshes: [mesh] } = readStep(kernel, data.buffer);
+    const palette = part.colors?.map((color) => color?.map((value) => Math.round(value * 255)));
+    const blue = palette?.findIndex((color) => color?.join(",") === "0,0,255") ?? -1;
+    assert.ok(blue >= 0);
+    assert.deepEqual(palette?.[1 - blue], [255, 0, 0]);
+    assert.equal(mesh.groups?.length, 2);
+    const { start, count } = mesh.groups![blue];
+    assert.equal(count, 6);
+    const vertices = Array.from(mesh.indices.subarray(start, start + count), (index) =>
+      Array.from(mesh.positions.subarray(index * 3, index * 3 + 3)));
+    assert.deepEqual([0, 1, 2].map((axis) => Math.min(...vertices.map((vertex) => vertex[axis]))), [xmin, ymin, zmin]);
+    assert.deepEqual([0, 1, 2].map((axis) => Math.max(...vertices.map((vertex) => vertex[axis]))), [xmax, ymax, zmax]);
+  } finally {
+    doc.close();
+    for (const face of faces) kernel.release(face);
+    kernel.release(shape);
+  }
+});
+
 test("invalid STEP input is reported and a subsequent import still works", () => {
   assert.throws(
     () => readStep(kernel, new TextEncoder().encode("not a model").buffer),

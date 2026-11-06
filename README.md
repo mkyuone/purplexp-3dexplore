@@ -11,9 +11,13 @@ npm ci
 npm run dev
 ```
 
-Open [the exhibit](http://localhost:4180/). It starts with a bundled suspension rig that has four instances of the same wheel assembly. Open **Setup → Import STEP** to load a `.step` or `.stp` export. Setup also contains the assembly tree, view presets, colors, undo, and **Reset exhibit**. Operator edits and imported files live in the current browser session.
+Open [the exhibit](http://localhost:4180/). It starts with Team Arion’s Ultraviolet car from `src/models/ultraviolet-full-car.step`. The STEP includes the car and helmet colors from the engineering renderings.
+
+Open **Setup → Import STEP** to load a `.step` or `.stp` export. Setup also contains the assembly tree, view presets, colors, undo, and **Reset exhibit**. Operator edits and files opened through the picker live in the current browser session.
 
 ## Simulate the hands
+
+On the development server, open [the simulator](http://localhost:4180/?simulate=1) to enable these controls. The production build presents the exhibit without the simulator.
 
 - Aim at a component with the pointer or **W A S D**. Click and hold or hold **Space** to pinch. Move sideways or use **Q / E** to move the grip toward or away from you.
 - While holding the first pinch, hold **Enter** to bring in and pinch with the second hand at the ring. Use the **arrow keys** to move it, or **[ / ]** for depth. Spread or turn the two grips to scale or rotate. Release one grip to keep moving with the other.
@@ -21,6 +25,6 @@ Open [the exhibit](http://localhost:4180/). It starts with a bundled suspension 
 - On a touchscreen, start a drag on a component to move it, or start on empty space to orbit. Touch the second finger at the join ring to rotate and resize the part or zoom the view.
 - **Esc** simulates tracking loss. The part stays at its last position and requires a fresh grip. Open Setup to pause the simulator while preparing the exhibit.
 
-`npm test` checks STEP import and pose handling. `npm run build` produces a static `dist/` bundle, including the local STEP worker, WASM, and sample. `npm run preview` serves that bundle on the same port when the dev server is stopped.
+`npm test` checks STEP import and pose handling. `npm run build` produces a static `dist/` bundle with the car STEP, importer, and WebAssembly runtime. `npm run preview` serves that bundle on the same port when the dev server is stopped.
 
-The current input source simulates both hands and their depth. The pose contract in `src/gestures.ts` is the integration point for a calibrated depth camera. STEP display colors use one dominant material per occurrence.
+The current input source simulates both hands and their depth. The pose contract in `src/gestures.ts` is the integration point for a calibrated depth camera. The importer preserves STEP face colors when it can match them to the geometry, with a part color as the fallback.
