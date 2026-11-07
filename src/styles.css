@@ -82,9 +82,33 @@ button svg { flex: none; }
   pointer-events: none;
 }
 .visitor-hint.simulator-hint { bottom: 52px; }
+.reset-countdown {
+  position: absolute;
+  top: 76px;
+  left: 50%;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: max-content;
+  max-width: calc(100% - 36px);
+  padding: 11px 15px;
+  border: 1px solid #765b96;
+  border-radius: 12px;
+  background: #21182deb;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+.reset-countdown > svg { flex: none; color: var(--violet); }
+.reset-countdown > div { min-width: 0; }
+.reset-countdown p { margin: 0 0 7px; font-size: 13px; line-height: 1.35; }
+.reset-countdown progress { display: block; width: 100%; height: 3px; border: 0; border-radius: 99px; overflow: hidden; background: #554264; accent-color: var(--violet); }
+.reset-countdown progress::-webkit-progress-bar { background: #554264; }
+.reset-countdown progress::-webkit-progress-value { background: var(--violet); }
+.reset-countdown progress::-moz-progress-bar { background: var(--violet); }
 
 .hands-layer { z-index: 3; pointer-events: none; }
-.hand-cursor, .join-target { position: absolute; transform: translate(-50%, -50%); }
+.hand-cursor { position: absolute; transform: translate(-50%, -50%); }
 .hand-cursor {
   --hand-color: #d6adff;
   display: grid;
@@ -101,18 +125,6 @@ button svg { flex: none; }
 .hand-cursor.is-view-grip:not(.second) { --hand-color: #a5d8ff; }
 .hand-cursor.is-pinched, .hand-cursor.is-view-grip { border-color: var(--hand-color); background: color-mix(in srgb, var(--hand-color) 25%, #151025); }
 .hand-cursor.is-pinched svg { transform: scale(.82); }
-.join-target { display: grid; place-items: center; color: var(--mint); }
-.join-ring {
-  display: grid;
-  place-items: center;
-  width: clamp(42px, 5.6vmin, 70px);
-  height: clamp(42px, 5.6vmin, 70px);
-  border: 1.5px dashed currentColor;
-  border-radius: 50%;
-  background: #11182799;
-  box-shadow: 0 0 18px #7ef0cc30;
-}
-.join-label { position: absolute; top: calc(100% + 6px); padding: 4px 8px; border-radius: 6px; background: #111827dd; color: #dcfff3; font-size: 12px; white-space: nowrap; }
 .exhibit-footer {
   position: absolute;
   inset: auto clamp(16px, 3vw, 44px) clamp(16px, 2.35vw, 34px);
@@ -229,6 +241,21 @@ button svg { flex: none; }
 kbd { display: inline-block; padding: 2px 5px; background: #2c2339; border: 1px solid #514160; border-radius: 4px; color: #f2eaff; font: 11px ui-monospace, monospace; }
 .setup-hint { margin-top: 12px; }
 .camera-calibrate { margin-top: 10px; }
+.navigation-choice { display: grid; gap: 6px; margin-top: 12px; color: var(--muted); font-size: 13px; }
+.navigation-choice select { inline-size: 100%; min-height: 36px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px; background: #272036; color: var(--text); font: inherit; }
+.preview-choice { display: flex; align-items: center; gap: 8px; margin-top: 12px; color: var(--muted); font-size: 13px; }
+.preview-choice input { margin: 0; accent-color: var(--violet); }
+.camera-testing { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 15px; }
+.camera-testing fieldset { min-width: 0; margin: 0; border: 0; padding: 0; }
+.camera-testing legend { padding: 0; color: var(--text); font-size: 13px; font-weight: 650; }
+.camera-testing .navigation-choice { margin-top: 10px; }
+.camera-option-note, .camera-settings-error { margin: 9px 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+.camera-settings-error { color: #ffd0d3; }
+.camera-settings-spinner { animation: spin 1s linear infinite; }
+.camera-diagnostics { display: grid; gap: 6px; margin: 13px 0 0; border: 1px solid var(--line); border-radius: 7px; padding: 10px; background: #171220; font-size: 12px; }
+.camera-diagnostics div { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 8px; }
+.camera-diagnostics dt { color: var(--muted); }
+.camera-diagnostics dd { margin: 0; color: var(--text); overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 
 @media (max-width: 550px) {
   .explorer.is-setup-open { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(125px, 42svh) minmax(0, 1fr); }
@@ -240,4 +267,5 @@ kbd { display: inline-block; padding: 2px 5px; background: #2c2339; border: 1px 
 }
 @media (prefers-reduced-motion: reduce) {
   .message.loading svg { animation: none; }
+  .camera-settings-spinner { animation: none; }
 }

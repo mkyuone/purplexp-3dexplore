@@ -9,6 +9,7 @@ export interface HandPose {
   readonly depthValid: boolean
   readonly pinched: boolean
   readonly fist?: boolean
+  readonly thumbsUp?: boolean
 }
 
 // A source timestamps frames against the receiver's monotonic clock. Positive depth
@@ -30,6 +31,8 @@ export function isInsideJoin(target: JoinTarget, x: number, y: number) {
 export interface GestureState {
   status: GestureStatus
   hands: readonly HandPose[]
+  activeHands: readonly string[]
+  resetProgress: number
   hovered: string | null
   held: string | null
   target: 'part' | 'view' | null
@@ -65,6 +68,7 @@ interface PartGrip {
 interface ActiveGrip {
   first: HandPose
   second: HandPose | null
+  viewAnchor: { x: number; y: number; depth: number }
   joinSide: number
   joinVertical: number
   pairBlocked: boolean
@@ -72,8 +76,17 @@ interface ActiveGrip {
 }
 
 export const FRAME_MAX_AGE_MS = 240
+export const RESET_HOLD_MS = 1500
 const MIN_HAND_SEPARATION = 0.06
 const RESUME_HAND_SEPARATION = 0.08
+const TARGET_GRACE_MS = 200
+const TARGET_GRACE_PX = 28
+const TRACKING_GRACE_MS = 150
+const CLOSED_GRIP_CONFIRM_MS = 100
+const PAIR_RECOVERY_MS = 100
+const VIEW_ORBIT_DEADZONE = 0.005
+const VIEW_DEPTH_DEADZONE = 0.006
+const VIEW_DEPTH_ZOOM_GAIN = 2
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value))
@@ -86,7 +99,7 @@ function isUsableHand(hand: HandPose) {
 }
 
 function isNeutral(hand: HandPose) {
-  return !hand.pinched && !hand.fist
+  return !hand.pinched && !hand.fist && !hand.thumbsUp
 }
 
 function matchesGrip(grip: ActiveGrip, hand: HandPose) {
@@ -99,6 +112,7 @@ function sameHands(left: readonly HandPose[], right: readonly HandPose[]) {
     return hand.id === other.id && hand.x === other.x && hand.y === other.y
       && hand.depth === other.depth && hand.depthValid === other.depthValid
       && hand.pinched === other.pinched && Boolean(hand.fist) === Boolean(other.fist)
+      && Boolean(hand.thumbsUp) === Boolean(other.thumbsUp)
   })
 }
 
@@ -118,22 +132,43 @@ function crossedBetweenFrames(previous: Vector3, next: Vector3) {
 export class GestureController {
   private readonly scene: GestureScene
   private readonly onState: (state: GestureState) => void
+  private readonly joinAnywhere: boolean
+  private readonly liveTracking: boolean
+  private readonly onReset?: () => void
   private viewportWidth = 1000
   private viewportHeight = 1000
   private grip: ActiveGrip | null = null
+  private interruption: { capturedAt: number; receivedAt: number } | null = null
   private armed = new Set<string>()
   private lastSequence = -1
   private lastCapture = -Infinity
+  private lastReceivedAt = -Infinity
   private timeout: ReturnType<typeof setTimeout> | undefined
   private recovering = false
+  private recoverClosed = false
+  private retryPinch: string | null = null
+  private closedCandidate: { hand: HandPose; target: string | null; capturedAt: number } | null = null
   private hovered: string[] = []
+  private hoverCandidates = new Map<string, { id: string; x: number; y: number; capturedAt: number }>()
+  private resetCandidate: { id: string; capturedAt: number; elapsed: number } | null = null
+  // Keep this latch across source loss and cancellation: missing frames are not
+  // evidence that the visitor released a thumbs-up that already fired.
+  private resetOwner: string | null = null
   private state: GestureState = {
-    status: 'ready', hands: [], hovered: null, held: null, target: null, join: null,
+    status: 'ready', hands: [], activeHands: [], resetProgress: 0, hovered: null, held: null, target: null, join: null,
   }
 
-  constructor(scene: GestureScene, onState: (state: GestureState) => void) {
+  constructor(scene: GestureScene, onState: (state: GestureState) => void, options: {
+    joinAnywhere?: boolean
+    liveTracking?: boolean
+    onReset?: () => void
+  } = {}) {
     this.scene = scene
     this.onState = onState
+    this.joinAnywhere = options.joinAnywhere ?? false
+    this.liveTracking = options.liveTracking ?? false
+    this.onReset = options.onReset
+    this.recoverClosed = this.liveTracking
   }
 
   setViewport(width: number, height: number) {
@@ -145,15 +180,20 @@ export class GestureController {
   }
 
   // Call on source replacement, after detaching the previous stream's listener.
-  resetStream() {
+  resetStream(allowClosedRecovery = this.liveTracking) {
     this.lastSequence = -1
     this.lastCapture = -Infinity
-    this.loseTracking()
+    this.lastReceivedAt = -Infinity
+    this.loseTracking(false)
+    this.recoverClosed = this.liveTracking && allowClosedRecovery
   }
 
   cancel() {
+    this.resetCandidate = null
     this.endGrip()
     this.armed.clear()
+    this.hoverCandidates.clear()
+    this.recoverClosed = false
     this.recovering = false
     this.updateState(this.state.hands)
   }
@@ -161,22 +201,97 @@ export class GestureController {
   dispose() {
     clearTimeout(this.timeout)
     this.timeout = undefined
+    this.interruption = null
+    this.closedCandidate = null
+    this.retryPinch = null
+    this.hoverCandidates.clear()
+    this.resetCandidate = null
   }
 
   receive(frame: PoseFrame) {
     if (!Number.isSafeInteger(frame.sequence) || frame.sequence <= this.lastSequence
       || !Number.isFinite(frame.capturedAt) || frame.capturedAt < this.lastCapture) return
-    const age = performance.now() - frame.capturedAt
-    if (age < -20 || age >= FRAME_MAX_AGE_MS) return
+    const receivedAt = performance.now()
+    const age = receivedAt - frame.capturedAt
+    if (age < -20 || age >= FRAME_MAX_AGE_MS) {
+      if (this.resetCandidate) {
+        this.resetCandidate = null
+        this.updateState(this.state.hands)
+      }
+      return
+    }
 
-    if (this.state.hands.length && frame.capturedAt - this.lastCapture >= FRAME_MAX_AGE_MS) this.loseTracking()
+    const stalled = this.state.hands.length && (receivedAt - this.lastReceivedAt >= FRAME_MAX_AGE_MS
+      || frame.capturedAt - this.lastCapture >= FRAME_MAX_AGE_MS)
+    const interruption = this.interruption
+    const grace = this.liveTracking ? FRAME_MAX_AGE_MS : TRACKING_GRACE_MS
+    if (stalled || (interruption && (receivedAt - interruption.receivedAt >= grace
+      || frame.capturedAt - interruption.capturedAt >= grace))) this.loseTracking()
     this.lastSequence = frame.sequence
     this.lastCapture = frame.capturedAt
+    this.lastReceivedAt = receivedAt
     const hands = frame.hands.filter(isUsableHand)
     if (frame.tracking === 'lost' || frame.tracking === 'ambiguous' || frame.hands.length > 2
       || new Set(frame.hands.map(hand => hand.id)).size !== frame.hands.length) {
+      this.interruptTracking()
+      return
+    }
+
+    if (this.updateReset(hands, frame.capturedAt)) {
+      if (this.timeout === undefined) this.checkTimeout()
+      return
+    }
+
+    const grip = this.grip
+    if (grip) {
+      const first = hands.find(hand => hand.id === grip.first.id)
+      const second = grip.second && hands.find(hand => hand.id === grip.second?.id)
+      if (this.interruption || !first || (grip.second && !second)) {
+        if ((first && isNeutral(first)) || (second && isNeutral(second))) {
+          const remaining = [first, second].find(hand => hand && matchesGrip(grip, hand))
+          this.interruption = null
+          if (remaining) this.rebase(grip, remaining, null)
+          else this.endGrip()
+          this.armed = new Set(hands.filter(isNeutral).map(hand => hand.id))
+          this.recovering = false
+          this.updateState(hands)
+          return
+        }
+        if (first && matchesGrip(grip, first)
+          && (!grip.second || (second && matchesGrip(grip, second)))) {
+          this.interruption = null
+          this.rebase(grip, first, second || null)
+          this.updateState(hands)
+          return
+        }
+        if (this.liveTracking && grip.second && interruption
+          && (receivedAt - interruption.receivedAt >= PAIR_RECOVERY_MS
+            || frame.capturedAt - interruption.capturedAt >= PAIR_RECOVERY_MS)) {
+          const remaining = [first, second].find(hand => hand && matchesGrip(grip, hand))
+          if (remaining) {
+            this.interruption = null
+            this.rebase(grip, remaining, null)
+            this.updateState(hands)
+            return
+          }
+        }
+        this.interruptTracking()
+        return
+      }
+    }
+
+    if (this.liveTracking && !hands.length && this.state.hands.length) {
       this.loseTracking()
       return
+    }
+
+    for (const [id, candidate] of this.hoverCandidates) {
+      const hand = hands.find(hand => hand.id === id)
+      if (!hand || frame.capturedAt - candidate.capturedAt > TARGET_GRACE_MS
+        || Math.hypot(
+          (hand.x - candidate.x) * this.viewportWidth,
+          (hand.y - candidate.y) * this.viewportHeight,
+        ) > TARGET_GRACE_PX) this.hoverCandidates.delete(id)
     }
 
     if (hands.length) {
@@ -187,6 +302,7 @@ export class GestureController {
     }
     const neutral = hands.filter(isNeutral)
     if (neutral.length) this.recovering = false
+    if (this.retryPinch !== null && hands.some(hand => hand.id === this.retryPinch && isNeutral(hand))) this.retryPinch = null
     const fresh = hands.filter(hand => !isNeutral(hand) && this.armed.has(hand.id))
     // Require an open hand between grips, including a direct pinch-to-fist change.
     this.armed = new Set(neutral.map(hand => hand.id))
@@ -196,13 +312,18 @@ export class GestureController {
     } else {
       for (const hand of fresh) {
         if (this.startGrip(hand)) break
+        if (this.liveTracking && hand.pinched && fresh.length === 1 && this.closedCandidate === null) this.retryPinch = hand.id
       }
+      if (!this.grip && (this.recoverClosed || this.retryPinch !== null)) this.tryClosedRecovery(hands)
     }
     this.updateState(hands)
   }
 
   private checkTimeout() {
-    const remaining = FRAME_MAX_AGE_MS - (performance.now() - this.lastCapture)
+    const deadline = this.interruption
+      ? this.interruption.receivedAt + (this.liveTracking ? FRAME_MAX_AGE_MS : TRACKING_GRACE_MS)
+      : this.lastReceivedAt + FRAME_MAX_AGE_MS
+    const remaining = deadline - performance.now()
     if (remaining <= 0) {
       this.loseTracking()
       return
@@ -210,19 +331,86 @@ export class GestureController {
     this.timeout = setTimeout(() => this.checkTimeout(), remaining)
   }
 
-  private loseTracking() {
+  private loseTracking(allowClosedRecovery = true) {
     clearTimeout(this.timeout)
     this.timeout = undefined
+    this.resetCandidate = null
+    this.recoverClosed = this.liveTracking && allowClosedRecovery
+      && (this.recoverClosed || this.grip !== null || this.armed.size > 0 || this.retryPinch !== null)
     this.endGrip()
     this.armed.clear()
+    this.hoverCandidates.clear()
+    this.closedCandidate = null
     this.recovering = true
     this.updateState([])
+  }
+
+  private interruptTracking() {
+    this.resetCandidate = null
+    if (!this.grip) {
+      this.loseTracking()
+      return
+    }
+    if (!this.interruption) {
+      // Camera processing can delay a report. The browser gives it a full
+      // grace period while capture timestamps still bound the physical gap.
+      this.interruption = { capturedAt: this.lastCapture, receivedAt: this.lastReceivedAt }
+      clearTimeout(this.timeout)
+      this.timeout = undefined
+    }
+    this.armed.clear()
+    this.hoverCandidates.clear()
+    this.closedCandidate = null
+    if (this.timeout === undefined) this.checkTimeout()
+    this.updateState([])
+  }
+
+  private updateReset(hands: readonly HandPose[], capturedAt: number) {
+    const thumbs = hands.filter(hand => hand.thumbsUp)
+    const firstThumb = () => thumbs.reduce((first, hand) => hand.id < first.id ? hand : first)
+    if (this.resetOwner !== null) {
+      const owner = hands.find(hand => hand.id === this.resetOwner)
+      if (owner && !owner.thumbsUp && !thumbs.length) this.resetOwner = null
+      else if (!owner && thumbs.length) {
+        // A restarted source may rename a still-held hand. Retain the lock and
+        // require this newly observed owner to release before another reset.
+        this.resetOwner = firstThumb().id
+      }
+    }
+    if (!thumbs.length) {
+      this.resetCandidate = null
+      return false
+    }
+
+    this.endGrip()
+    this.armed.clear()
+    this.hoverCandidates.clear()
+    this.recoverClosed = false
+    this.recovering = false
+    if (this.resetOwner !== null) {
+      this.resetCandidate = null
+      this.updateState(hands)
+      return true
+    }
+    const hand = thumbs.find(hand => hand.id === this.resetCandidate?.id) ?? firstThumb()
+    if (this.resetCandidate?.id === hand.id) {
+      this.resetCandidate.elapsed += capturedAt - this.resetCandidate.capturedAt
+      this.resetCandidate.capturedAt = capturedAt
+    } else this.resetCandidate = { id: hand.id, capturedAt, elapsed: 0 }
+    if (this.resetCandidate.elapsed >= RESET_HOLD_MS) {
+      this.resetOwner = hand.id
+      this.resetCandidate = null
+      this.updateState(hands)
+      this.onReset?.()
+    } else this.updateState(hands)
+    return true
   }
 
   private startGrip(first: HandPose) {
     let part: PartGrip | null = null
     if (first.pinched) {
-      const id = this.scene.pick(first.x, first.y)
+      // Closing the fingers can move the aim just beyond the highlighted surface.
+      const id = this.scene.pick(first.x, first.y) ?? this.hoverCandidates.get(first.id)?.id
       if (!id) return false
       const pose = this.scene.getPose(id)
       if (!pose) return false
@@ -231,10 +419,55 @@ export class GestureController {
     }
 
     this.grip = {
-      first, second: null, joinSide: first.x <= 0.64 ? 1 : -1, joinVertical: first.y <= 0.5 ? 1 : -1,
+      first, second: null, viewAnchor: { x: first.x, y: first.y, depth: first.depth },
+      joinSide: first.x <= 0.64 ? 1 : -1, joinVertical: first.y <= 0.5 ? 1 : -1,
       pairBlocked: false, part,
     }
+    this.hoverCandidates.clear()
+    this.recoverClosed = false
+    this.retryPinch = null
+    this.recovering = false
+    this.closedCandidate = null
     return true
+  }
+
+  private matchesClosedCandidate(hand: HandPose, target: string | null, requireSteadyAim: boolean) {
+    const candidate = this.closedCandidate
+    return candidate !== null && candidate.hand.id === hand.id && candidate.hand.pinched === hand.pinched
+      && candidate.target === target && (!requireSteadyAim || (Math.hypot(
+        (hand.x - candidate.hand.x) * this.viewportWidth,
+        (hand.y - candidate.hand.y) * this.viewportHeight,
+      ) <= TARGET_GRACE_PX && Math.abs(hand.depth - candidate.hand.depth) <= 0.035))
+  }
+
+  private confirmClosed(hand: HandPose, target: string | null, requireSteadyAim: boolean) {
+    if (!this.matchesClosedCandidate(hand, target, requireSteadyAim)) {
+      this.closedCandidate = { hand, target, capturedAt: this.lastCapture }
+      return false
+    }
+    return this.lastCapture - this.closedCandidate!.capturedAt >= CLOSED_GRIP_CONFIRM_MS
+  }
+
+  private tryClosedRecovery(hands: readonly HandPose[]) {
+    const closed = hands.filter(hand => this.retryPinch !== null
+      ? hand.id === this.retryPinch && hand.pinched : this.recoverClosed && !isNeutral(hand))
+    if (closed.length > 1 && closed.some(hand => hand.fist)) {
+      this.closedCandidate = null
+      return
+    }
+    const candidates = closed.map(hand => ({
+      hand, target: hand.pinched ? this.scene.pick(hand.x, hand.y) : null,
+    })).filter(({ hand, target }) => target !== null || hand.fist)
+    const existing = candidates.find(({ hand, target }) => this.matchesClosedCandidate(hand, target, true))
+    const sharedPart = candidates.length > 0 && candidates.every(({ hand, target }) => hand.pinched && target === candidates[0].target)
+    const selected = existing ?? (candidates.length === 1 || sharedPart
+      ? candidates.sort((left, right) => left.hand.id.localeCompare(right.hand.id))[0] : undefined)
+    if (!selected) {
+      this.closedCandidate = null
+      return
+    }
+    const { hand, target } = selected
+    if (this.confirmClosed(hand, target, true)) this.startGrip(hand)
   }
 
   private updateGrip(hands: readonly HandPose[], fresh: readonly HandPose[]) {
@@ -263,20 +496,39 @@ export class GestureController {
       } else if (grip.part) {
         this.movePart(grip.part, first, null)
       } else {
-        const dx = first.x - grip.first.x
-        const dy = first.y - grip.first.y
-        if (dx || dy) this.scene.orbit(dx, dy)
+        const anchor = grip.viewAnchor
+        const dx = first.x - anchor.x
+        const dy = first.y - anchor.y
+        const travel = Math.hypot(dx, dy)
+        if (travel > VIEW_ORBIT_DEADZONE) {
+          const fraction = 1 - VIEW_ORBIT_DEADZONE / travel
+          this.scene.orbit(dx * fraction, dy * fraction)
+          anchor.x += dx * fraction
+          anchor.y += dy * fraction
+        }
+        const depth = first.depth - anchor.depth
+        const excess = Math.max(0, Math.abs(depth) - VIEW_DEPTH_DEADZONE)
+        if (excess > 0) {
+          const applied = Math.sign(depth) * excess
+          this.scene.zoom(Math.exp(applied * VIEW_DEPTH_ZOOM_GAIN))
+          anchor.depth += applied
+        }
       }
     }
 
     grip.first = first
     grip.second = second || null
-    if (!second) {
+    if (grip.part && !second) {
       const join = this.joinTarget(grip)
-      const joining = fresh.find(hand => hand.id !== first.id && matchesGrip(grip, hand)
-        && this.handAxis(first, hand).lengthSq() >= MIN_HAND_SEPARATION ** 2
-        && isInsideJoin(join, hand.x, hand.y))
-      if (joining) this.rebase(grip, first, joining)
+      const joining = hands.find(hand => hand.id !== first.id && hand.pinched)
+      if (!joining) {
+        this.closedCandidate = null
+        return
+      }
+      const confirmed = this.liveTracking && this.confirmClosed(joining, grip.part.id, false)
+      if ((fresh.includes(joining) || confirmed)
+        && this.handAxis(first, joining).lengthSq() >= MIN_HAND_SEPARATION ** 2
+        && (this.joinAnywhere || isInsideJoin(join, joining.x, joining.y))) this.rebase(grip, first, joining)
     }
   }
 
@@ -294,17 +546,16 @@ export class GestureController {
     const recover = !blocked && interrupted
     if (grip.part) {
       this.movePart(grip.part, first, second, blocked || recover)
-    } else if (!blocked && !recover) {
-      const priorSeparation = previous.length()
-      if (separation !== priorSeparation) this.scene.zoom(separation / priorSeparation)
     }
     if (recover) this.rebase(grip, first, second)
     grip.pairBlocked = blocked
   }
 
   private rebase(grip: ActiveGrip, first: HandPose, second: HandPose | null) {
+    this.closedCandidate = null
     grip.first = first
     grip.second = second
+    grip.viewAnchor = { x: first.x, y: first.y, depth: first.depth }
     grip.pairBlocked = false
     if (!second) {
       grip.joinSide = first.x <= 0.64 ? 1 : -1
@@ -378,29 +629,46 @@ export class GestureController {
   private endGrip() {
     const part = this.grip?.part
     this.grip = null
+    this.interruption = null
+    this.closedCandidate = null
+    this.retryPinch = null
     if (part) this.scene.commitGrip(part.id, part.original)
   }
 
   private updateState(hands: readonly HandPose[]) {
     const grip = this.grip
-    const hovered = !grip
-      ? [...new Set(hands.filter(isNeutral).map(hand => this.scene.pick(hand.x, hand.y)).filter(id => id !== null))]
-      : []
+    const activeHands = grip && !this.interruption ? hands.filter(hand =>
+      (hand.id === grip.first.id || hand.id === grip.second?.id) && matchesGrip(grip, hand)).map(hand => hand.id) : []
+    const hovered: string[] = []
+    if (!grip) {
+      for (const hand of hands.filter(isNeutral)) {
+        const id = this.scene.pick(hand.x, hand.y)
+        if (id === null) continue
+        if (this.armed.has(hand.id)) {
+          this.hoverCandidates.set(hand.id, { id, x: hand.x, y: hand.y, capturedAt: this.lastCapture })
+        }
+        if (!hovered.includes(id)) hovered.push(id)
+      }
+    }
     const state: GestureState = {
       status: grip?.second ? 'both' : grip ? 'holding' : this.recovering ? 'lost' : hands.length ? 'aim' : 'ready',
       hands,
+      activeHands,
+      resetProgress: this.resetCandidate ? clamp(this.resetCandidate.elapsed / RESET_HOLD_MS, 0, 1) : 0,
       hovered: hovered[0] ?? null,
       held: grip?.part?.id ?? null,
       target: grip ? grip.part ? 'part' : 'view' : null,
-      join: grip && !grip.second ? this.joinTarget(grip) : null,
+      join: grip?.part && !grip.second ? this.joinTarget(grip) : null,
     }
     const previous = this.state
     if (hovered.length !== this.hovered.length || hovered.some((id, index) => id !== this.hovered[index])) {
       this.scene.hover(hovered)
       this.hovered = hovered
     }
-    if (previous.status === state.status && previous.hovered === state.hovered
-      && previous.held === state.held && previous.target === state.target && sameHands(previous.hands, hands)) return
+    if (previous.status === state.status && previous.hovered === state.hovered && previous.resetProgress === state.resetProgress
+      && previous.held === state.held && previous.target === state.target && sameHands(previous.hands, hands)
+      && previous.activeHands.length === state.activeHands.length
+      && previous.activeHands.every((id, index) => id === state.activeHands[index])) return
     this.state = state
     this.onState(state)
   }

@@ -6,6 +6,22 @@
   background: radial-gradient(ellipse at center, #271c3b, #151021 75%);
 }
 
+.calibration-preview {
+  position: absolute;
+  inset: clamp(8px, 2vmin, 18px) 0 auto;
+  inline-size: min(62%, 340px);
+  margin: 0 auto;
+  overflow: hidden;
+  pointer-events: none;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #21192f;
+}
+
+.calibration-preview[data-below='true'] {
+  inset-block: auto clamp(8px, 2vmin, 18px);
+}
+
 .calibration-target {
   position: absolute;
   display: grid;
@@ -13,11 +29,16 @@
   inline-size: clamp(28px, 7vmin, 52px);
   aspect-ratio: 1;
   transform: translate(-50%, -50%);
-  border: 2px solid var(--mint);
+  border: 2px solid currentColor;
   border-radius: 50%;
+  color: var(--violet);
+  box-shadow: 0 0 18px #c6a2ff40;
+  pointer-events: none;
+}
+
+.calibration-target[data-ready='true'] {
   color: var(--mint);
   box-shadow: 0 0 18px #7ef0cc50;
-  pointer-events: none;
 }
 
 .calibration-target::after {
@@ -73,6 +94,14 @@
 
 .calibration-prompt .calibration-status {
   margin-block-start: 6px;
+  color: var(--text);
+}
+
+.calibration-prompt .calibration-readiness {
+  margin-block-start: 4px;
+}
+
+.calibration-prompt .calibration-readiness[data-ready='true'] {
   color: var(--mint);
 }
 
@@ -84,6 +113,10 @@
 
 .calibration-actions .button {
   min-block-size: 44px;
+}
+
+.calibration-actions .button-primary {
+  min-inline-size: 106px;
 }
 
 .calibration-actions .button[aria-disabled='true'] {

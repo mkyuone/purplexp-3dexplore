@@ -1,9 +1,9 @@
 import {
-  ACESFilmicToneMapping, Box3, BufferAttribute, BufferGeometry, Color, DirectionalLight,
+  Box3, BufferAttribute, BufferGeometry, Color, DirectionalLight,
   Group, HemisphereLight,
-  MathUtils, Matrix4, Mesh, MeshStandardMaterial, PCFShadowMap, PerspectiveCamera, Plane,
+  MathUtils, Matrix4, Mesh, MeshPhysicalMaterial, MeshStandardMaterial, NeutralToneMapping, PCFShadowMap, PerspectiveCamera, Plane,
   PlaneGeometry, PMREMGenerator, Quaternion, Raycaster, Scene, ShaderMaterial, ShadowMaterial,
-  Sphere, Spherical, SRGBColorSpace, Vector2, Vector3, WebGLRenderer, type WebGLRenderTarget,
+  Sphere, Spherical, SRGBColorSpace, Vector2, Vector3, WebGLRenderer, type MeshPhysicalMaterialParameters, type WebGLRenderTarget,
 } from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import type { CadAssembly, CadMesh, CadOccurrence } from './cad';
@@ -35,6 +35,8 @@ interface CameraFrame { position: Vector3; target: Vector3 }
 
 export type CameraView = 'front' | 'side' | 'isometric';
 export type SceneContextStatus = 'lost' | 'restored';
+type SurfaceFinish = Pick<MeshPhysicalMaterialParameters, 'roughness' | 'metalness' | 'clearcoat' | 'clearcoatRoughness'>;
+export type SurfaceFinishes = Readonly<Partial<Record<string, SurfaceFinish>>>;
 
 const cameraDirections: Record<CameraView, Vector3> = {
   front: new Vector3(0, 0, 1),
@@ -60,6 +62,12 @@ function makeGeometry(mesh: CadMesh) {
 function materialsOf(mesh?: OccurrenceMesh) {
   if (!mesh) return [];
   return Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+}
+
+function makeMaterial(color: Color, finishes: SurfaceFinishes) {
+  const finish = finishes[color.getHexString()];
+  const parameters = { color, roughness: 0.47, ...finish };
+  return finish?.clearcoat ? new MeshPhysicalMaterial(parameters) : new MeshStandardMaterial(parameters);
 }
 
 function makeModel(): SceneModel {
@@ -122,7 +130,7 @@ export class CadScene {
   private readonly raycaster = new Raycaster();
   private readonly ndc = new Vector2();
   private readonly picks: Array<{ x: number; y: number; id: string | null }> = [];
-  private readonly keyLight = new DirectionalLight(0xfffaf4, 2.35);
+  private readonly keyLight = new DirectionalLight(0xfffaf4, 2.1);
   private readonly ambientLight = new HemisphereLight(0xf2f3ff, 0x918a9f);
   private readonly ground = new Mesh(
     new PlaneGeometry(45, 45),
@@ -168,28 +176,28 @@ export class CadScene {
     private readonly onContextChange?: (status: SceneContextStatus) => void,
   ) {
     this.renderer = new WebGLRenderer({ canvas, antialias: true, alpha: true });
-    this.renderer.toneMapping = ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.04;
+    this.renderer.toneMapping = NeutralToneMapping;
+    this.renderer.toneMappingExposure = 0.96;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = PCFShadowMap;
-    this.world.environmentIntensity = 0.68;
+    this.world.environmentIntensity = 0.72;
     this.rebuildStudioMap();
 
     const key = this.keyLight;
-    key.position.set(-3.5, 8, 5.5);
+    key.position.set(-3.5, 10.5, 4.1);
     key.castShadow = true;
     key.shadow.autoUpdate = false;
     key.shadow.needsUpdate = true;
-    key.shadow.mapSize.set(1536, 1536);
+    key.shadow.mapSize.set(2048, 2048);
     Object.assign(key.shadow.camera, { left: -7, right: 7, top: 7, bottom: -7, far: 28 });
     key.shadow.camera.updateProjectionMatrix();
-    key.shadow.normalBias = 0.012;
+    key.shadow.normalBias = 0.008;
     key.shadow.bias = -0.00015;
-    key.shadow.radius = 5;
-    const fill = new DirectionalLight(0xcddbf4, 0.55);
+    key.shadow.radius = 9;
+    const fill = new DirectionalLight(0xe2eaff, 0.68);
     fill.position.set(6, 3, 2);
-    const rim = new DirectionalLight(0xd0b9f4, 1.22);
-    rim.position.set(-3, 4, -6);
+    const rim = new DirectionalLight(0xe0cbff, 1.35);
+    rim.position.set(-3, 3.5, -6);
 
     this.ground.rotation.x = -Math.PI / 2;
     this.ground.receiveShadow = true;
@@ -207,7 +215,7 @@ export class CadScene {
     this.resize();
   }
 
-  load(assembly: CadAssembly) {
+  load(assembly: CadAssembly, finishes: SurfaceFinishes = {}) {
     const draft = makeModel();
     let floorHeight: number;
     let framing: CameraFrame;
@@ -215,7 +223,7 @@ export class CadScene {
       draft.root.rotation.x = -Math.PI / 2;
       for (const mesh of assembly.meshes) draft.geometries.push(makeGeometry(mesh));
       for (const root of assembly.roots) {
-        draft.root.add(this.buildOccurrence(root, null, draft, assembly.meshes).placement);
+        draft.root.add(this.buildOccurrence(root, null, draft, assembly.meshes, finishes).placement);
       }
 
       const bounds = new Box3().setFromObject(draft.root);
@@ -225,7 +233,7 @@ export class CadScene {
       draft.scale = 5.6 / Math.max(size, 1e-9);
       draft.root.scale.setScalar(draft.scale);
       draft.root.position.copy(center).multiplyScalar(-draft.scale);
-      floorHeight = (bounds.min.y - center.y) * draft.scale - 0.015;
+      floorHeight = (bounds.min.y - center.y) * draft.scale - 0.008;
       const fitted = this.frameModel(draft, cameraDirections.isometric);
       if (!fitted) throw new Error('The STEP assembly could not be framed.');
       framing = fitted;
@@ -248,7 +256,7 @@ export class CadScene {
     disposeModel(previous);
   }
 
-  private buildOccurrence(node: CadOccurrence, parent: SceneOccurrence | null, model: SceneModel, meshes: CadMesh[]) {
+  private buildOccurrence(node: CadOccurrence, parent: SceneOccurrence | null, model: SceneModel, meshes: CadMesh[], finishes: SurfaceFinishes) {
     const placement = new Group();
     const matrix = new Matrix4().fromArray(node.matrix);
     // Keep the complete imported affine placement on its own node.
@@ -275,7 +283,7 @@ export class CadScene {
         const values = entry ?? fallback;
         return values ? new Color().setRGB(...values, SRGBColorSpace) : new Color('#a3adbc');
       });
-      const materials = sourceColors.map((color) => new MeshStandardMaterial({ color, roughness: 0.47 }));
+      const materials = sourceColors.map((color) => makeMaterial(color, finishes));
       const mesh = new Mesh(geometry, materials.length > 1 ? materials : materials[0]);
       mesh.userData.occurrenceId = node.id;
       mesh.castShadow = true;
@@ -288,7 +296,7 @@ export class CadScene {
     }
 
     for (const child of node.children) {
-      const built = this.buildOccurrence(child, occurrence, model, meshes);
+      const built = this.buildOccurrence(child, occurrence, model, meshes, finishes);
       contents.add(built.placement);
       bounds.union(built.bounds.applyMatrix4(built.placement.matrix));
     }
