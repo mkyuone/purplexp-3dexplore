@@ -6,18 +6,19 @@ export function indexOccurrences(roots: CadOccurrence[]) {
   const byId = new Map<string, CadOccurrence>();
   const parents = new Map<string, string>();
   let parts = 0;
-  let firstPart: string | null = null;
-  function visit(node: CadOccurrence, parent?: string) {
+  const visible = new Set<string>();
+  function visit(node: CadOccurrence, parent?: string): boolean {
     byId.set(node.id, node);
     if (parent !== undefined) parents.set(node.id, parent);
-    if (node.mesh !== undefined) {
-      parts++;
-      firstPart ??= node.id;
-    }
-    node.children.forEach(child => visit(child, node.id));
+    const hasMesh = node.mesh !== undefined;
+    if (hasMesh) parts++;
+    const children = node.children.map(child => visit(child, node.id));
+    if (!hasMesh && !children.includes(true)) return false;
+    visible.add(node.id);
+    return true;
   }
   roots.forEach(node => visit(node));
-  return { byId, parents, parts, firstPart };
+  return { byId, parents, parts, visible };
 }
 
 type AssemblyIndex = ReturnType<typeof indexOccurrences>;
@@ -49,7 +50,8 @@ export function AssemblyPanel({ roots, index, selected, onSelect }: {
   }
 
   function renderNode(node: CadOccurrence, depth: number): ReactNode {
-    const group = node.children.length > 0;
+    if (!index.visible.has(node.id)) return null;
+    const group = node.children.some(child => index.visible.has(child.id));
     const open = expanded.has(node.id);
     return <li key={node.id}>
       <div className={`assembly-row${selected === node.id ? ' is-selected' : ''}`} style={{ paddingInlineStart: 4 + depth * 17 }}>
@@ -102,7 +104,7 @@ export function PartPanel({ part, details, canUndo, onColor, onRestore, onUndo }
       <div className="part-actions">
         <button className="button" type="button" onClick={onRestore}><RotateCcw size={16} /> {part.children.length ? 'Restore assembly' : 'Restore part'}</button>
       </div>
-    </> : <p className="panel-empty">Select a part in the assembly or grab it in the exhibit.</p>}
+    </> : <p className="panel-empty">Select a part from the assembly or tap it in the preview.</p>}
     {canUndo && <button className="button undo-button" type="button" onClick={onUndo}><Undo2 size={16} /> Undo last edit</button>}
   </section>;
 }

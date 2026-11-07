@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { OcctKernel } from "occt-wasm";
+import { readStepFile } from "../src/cad.ts";
 import { readStep } from "../src/step-model.ts";
 
 const kernel = await OcctKernel.init();
@@ -89,5 +90,27 @@ test("invalid STEP input is reported and a subsequent import still works", () =>
     assert.ok(readStep(kernel, input.buffer).meshes[0].indices.length > 0);
   } finally {
     kernel.release(box);
+  }
+});
+
+test("a superseding import aborts its pending local file read", async () => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "FileReader");
+  let started = false;
+  let aborted = false;
+  const PendingReader = class {
+    readAsArrayBuffer() { started = true; }
+    abort() { aborted = true; }
+  };
+  Object.defineProperty(globalThis, "FileReader", { configurable: true, value: PendingReader });
+  try {
+    const controller = new AbortController();
+    const pending = readStepFile(new File(["pending read"], "pending.step"), controller.signal);
+    assert.equal(started, true);
+    controller.abort();
+    await assert.rejects(pending, { name: "AbortError" });
+    assert.equal(aborted, true);
+  } finally {
+    if (original) Object.defineProperty(globalThis, "FileReader", original);
+    else Reflect.deleteProperty(globalThis, "FileReader");
   }
 });

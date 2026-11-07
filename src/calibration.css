@@ -1,0 +1,99 @@
+.calibration-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  color: var(--text);
+  background: radial-gradient(ellipse at center, #271c3b, #151021 75%);
+}
+
+.calibration-target {
+  position: absolute;
+  display: grid;
+  place-items: center;
+  inline-size: clamp(28px, 7vmin, 52px);
+  aspect-ratio: 1;
+  transform: translate(-50%, -50%);
+  border: 2px solid var(--mint);
+  border-radius: 50%;
+  color: var(--mint);
+  box-shadow: 0 0 18px #7ef0cc50;
+  pointer-events: none;
+}
+
+.calibration-target::after {
+  content: '';
+  inline-size: 6px;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.calibration-prompt {
+  --prompt-inset: clamp(10px, 2.5vmin, 22px);
+  position: absolute;
+  inset-inline: 12px;
+  inset-block-end: var(--prompt-inset);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 18px;
+  max-inline-size: 580px;
+  max-block-size: calc(86% - var(--prompt-inset) - 28px);
+  margin-inline: auto;
+  padding: 12px 14px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #21192f;
+  touch-action: pan-y;
+}
+
+.calibration-prompt[data-target-position='lower'] {
+  inset-block-start: var(--prompt-inset);
+  inset-block-end: auto;
+}
+
+.calibration-prompt[data-target-position='center'] {
+  max-block-size: calc(50% - var(--prompt-inset) - 28px);
+}
+
+.calibration-prompt h2 {
+  margin: 0 0 4px;
+  font-size: 15px;
+}
+
+.calibration-prompt p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.calibration-prompt .calibration-status {
+  margin-block-start: 6px;
+  color: var(--mint);
+}
+
+.calibration-actions {
+  display: flex;
+  flex: none;
+  gap: 7px;
+}
+
+.calibration-actions .button {
+  min-block-size: 44px;
+}
+
+.calibration-actions .button[aria-disabled='true'] {
+  opacity: .55;
+  cursor: default;
+}
+
+@media (max-width: 470px) {
+  .calibration-prompt {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}

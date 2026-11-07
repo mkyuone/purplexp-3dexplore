@@ -29,6 +29,37 @@ export interface CadAssembly {
 
 export type StepResponse = { assembly: CadAssembly } | { error: string };
 
+export async function readStepFile(file: File, signal?: AbortSignal): Promise<ArrayBuffer> {
+  signal?.throwIfAborted();
+  if (!signal) return file.arrayBuffer();
+
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    const cleanup = () => signal.removeEventListener("abort", abort);
+    const abort = () => {
+      cleanup();
+      reader.abort();
+      reject(signal.reason ?? new DOMException("The file read was canceled.", "AbortError"));
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    reader.onload = () => {
+      cleanup();
+      if (reader.result instanceof ArrayBuffer) resolve(reader.result);
+      else reject(new Error("The STEP file could not be read."));
+    };
+    reader.onerror = () => {
+      cleanup();
+      reject(reader.error ?? new Error("The STEP file could not be read."));
+    };
+    try {
+      reader.readAsArrayBuffer(file);
+    } catch (error) {
+      cleanup();
+      reject(error);
+    }
+  });
+}
+
 export async function importStep(data: ArrayBuffer, signal?: AbortSignal): Promise<CadAssembly> {
   signal?.throwIfAborted();
   const worker = new Worker(new URL("./step.worker.ts", import.meta.url), { type: "module" });

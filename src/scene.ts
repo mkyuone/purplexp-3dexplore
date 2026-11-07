@@ -1,28 +1,40 @@
 import {
   ACESFilmicToneMapping, Box3, BufferAttribute, BufferGeometry, Color, DirectionalLight,
-  EdgesGeometry, Group, HemisphereLight, LineBasicMaterial, LineSegments,
+  Group, HemisphereLight,
   MathUtils, Matrix4, Mesh, MeshStandardMaterial, PCFShadowMap, PerspectiveCamera, Plane,
   PlaneGeometry, PMREMGenerator, Quaternion, Raycaster, Scene, ShaderMaterial, ShadowMaterial,
-  Spherical, SRGBColorSpace, Vector2, Vector3, WebGLRenderer, type WebGLRenderTarget,
+  Sphere, Spherical, SRGBColorSpace, Vector2, Vector3, WebGLRenderer, type WebGLRenderTarget,
 } from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import type { CadAssembly, CadMesh, CadOccurrence } from './cad';
 import type { ObjectPose } from './gestures';
+import { CALIBRATION_INSET_X, CALIBRATION_INSET_Y } from './reach';
 
 type OccurrenceMesh = Mesh<BufferGeometry, MeshStandardMaterial | MeshStandardMaterial[]>;
 
 interface SceneOccurrence {
   id: string;
   parent: SceneOccurrence | null;
+  children: SceneOccurrence[];
   pivot: Vector3;
   placement: Group;
   editable: Group;
   mesh?: OccurrenceMesh;
   sourceColors?: Color[];
-  outline?: LineSegments;
 }
 
+interface SceneModel {
+  root: Group;
+  occurrences: Map<string, SceneOccurrence>;
+  meshes: OccurrenceMesh[];
+  geometries: BufferGeometry[];
+  scale: number;
+}
+
+interface CameraFrame { position: Vector3; target: Vector3 }
+
 export type CameraView = 'front' | 'side' | 'isometric';
+export type SceneContextStatus = 'lost' | 'restored';
 
 const cameraDirections: Record<CameraView, Vector3> = {
   front: new Vector3(0, 0, 1),
@@ -41,12 +53,28 @@ function makeGeometry(mesh: CadMesh) {
     geometry.computeVertexNormals();
   }
   geometry.computeBoundingBox();
+  geometry.boundingSphere = geometry.boundingBox!.getBoundingSphere(new Sphere());
   return geometry;
 }
 
 function materialsOf(mesh?: OccurrenceMesh) {
   if (!mesh) return [];
   return Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+}
+
+function makeModel(): SceneModel {
+  return { root: new Group(), occurrences: new Map(), meshes: [], geometries: [], scale: 1 };
+}
+
+function disposeModel(model: SceneModel) {
+  model.root.clear();
+  for (const mesh of model.meshes) {
+    for (const material of materialsOf(mesh)) material.dispose();
+  }
+  model.geometries.forEach((geometry) => geometry.dispose());
+  model.meshes.length = 0;
+  model.geometries.length = 0;
+  model.occurrences.clear();
 }
 
 function localPose(node: Group): ObjectPose {
@@ -75,6 +103,8 @@ function makeStudioMap(renderer: WebGLRenderer) {
   const pmrem = new PMREMGenerator(renderer);
   try {
     return pmrem.fromScene(studio, 0.05, 0.1, 60, { size: 128 });
+  } catch {
+    return null;
   } finally {
     studio.dispose();
     pmrem.dispose();
@@ -85,14 +115,15 @@ export class CadScene {
   private readonly world = new Scene();
   private readonly camera = new PerspectiveCamera(34, 1, 0.01, 1000);
   private readonly renderer: WebGLRenderer;
-  private readonly studioMap: WebGLRenderTarget | null;
+  private studioMap: WebGLRenderTarget | null = null;
   private readonly observer: ResizeObserver;
-  private readonly assemblyRoot = new Group();
+  private model = makeModel();
   private readonly target = new Vector3();
   private readonly raycaster = new Raycaster();
   private readonly ndc = new Vector2();
   private readonly picks: Array<{ x: number; y: number; id: string | null }> = [];
   private readonly keyLight = new DirectionalLight(0xfffaf4, 2.35);
+  private readonly ambientLight = new HemisphereLight(0xf2f3ff, 0x918a9f);
   private readonly ground = new Mesh(
     new PlaneGeometry(45, 45),
     new ShadowMaterial({ color: 0x090712, opacity: 0.37, depthWrite: false }),
@@ -121,32 +152,28 @@ export class CadScene {
       `,
     }),
   );
-  private readonly selectedLine = new LineBasicMaterial({
-    color: 0xb49cff, depthWrite: false, toneMapped: false,
-  });
-  private readonly hoverLine = new LineBasicMaterial({
-    color: 0x62d9d1, depthWrite: false, toneMapped: false,
-  });
-  private readonly edges = new Map<BufferGeometry, EdgesGeometry>();
-  private readonly occurrences = new Map<string, SceneOccurrence>();
-  private readonly meshes: OccurrenceMesh[] = [];
-  private readonly geometries: BufferGeometry[] = [];
   private readonly undoStack: Array<() => void> = [];
   private selection: string | null = null;
   private hovered: string[] = [];
   private frame: number | null = null;
-  private modelScale = 1;
+  private modelMatricesDirty = false;
   private fitOnResize = false;
+  private contextLost = false;
+  private width = 0;
+  private height = 0;
+  private pixelRatio = 0;
 
-  constructor(private readonly canvas: HTMLCanvasElement) {
+  constructor(
+    private readonly canvas: HTMLCanvasElement,
+    private readonly onContextChange?: (status: SceneContextStatus) => void,
+  ) {
     this.renderer = new WebGLRenderer({ canvas, antialias: true, alpha: true });
     this.renderer.toneMapping = ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.04;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = PCFShadowMap;
-    this.studioMap = makeStudioMap(this.renderer);
-    this.world.environment = this.studioMap?.texture ?? null;
     this.world.environmentIntensity = 0.68;
+    this.rebuildStudioMap();
 
     const key = this.keyLight;
     key.position.set(-3.5, 8, 5.5);
@@ -169,45 +196,59 @@ export class CadScene {
     this.floorGlow.rotation.x = -Math.PI / 2;
     this.floorGlow.renderOrder = 1;
     this.ground.renderOrder = 2;
-    this.world.add(new HemisphereLight(0xf2f3ff, 0x918a9f, this.studioMap ? 0.55 : 1.15), key, fill, rim,
-      this.floorGlow, this.ground, this.assemblyRoot);
+    this.world.add(this.ambientLight, key, fill, rim, this.floorGlow, this.ground, this.model.root);
 
     this.camera.position.copy(cameraDirections.isometric).multiplyScalar(12);
     this.aimCamera();
+    canvas.addEventListener('webglcontextlost', this.handleContextLost);
+    canvas.addEventListener('webglcontextrestored', this.handleContextRestored);
     this.observer = new ResizeObserver(() => this.resize());
     this.observer.observe(canvas);
     this.resize();
   }
 
   load(assembly: CadAssembly) {
-    this.clearAssembly();
-    this.keyLight.shadow.needsUpdate = true;
-    this.assemblyRoot.rotation.set(-Math.PI / 2, 0, 0);
-    this.assemblyRoot.position.set(0, 0, 0);
-    this.assemblyRoot.scale.setScalar(1);
-    for (const mesh of assembly.meshes) this.geometries.push(makeGeometry(mesh));
-    for (const root of assembly.roots) {
-      this.assemblyRoot.add(this.buildOccurrence(root, null, assembly.meshes).placement);
+    const draft = makeModel();
+    let floorHeight: number;
+    let framing: CameraFrame;
+    try {
+      draft.root.rotation.x = -Math.PI / 2;
+      for (const mesh of assembly.meshes) draft.geometries.push(makeGeometry(mesh));
+      for (const root of assembly.roots) {
+        draft.root.add(this.buildOccurrence(root, null, draft, assembly.meshes).placement);
+      }
+
+      const bounds = new Box3().setFromObject(draft.root);
+      const size = bounds.getSize(new Vector3()).length();
+      if (!Number.isFinite(size) || size <= 0) throw new Error('The STEP assembly has no usable bounds.');
+      const center = bounds.getCenter(new Vector3());
+      draft.scale = 5.6 / Math.max(size, 1e-9);
+      draft.root.scale.setScalar(draft.scale);
+      draft.root.position.copy(center).multiplyScalar(-draft.scale);
+      floorHeight = (bounds.min.y - center.y) * draft.scale - 0.015;
+      const fitted = this.frameModel(draft, cameraDirections.isometric);
+      if (!fitted) throw new Error('The STEP assembly could not be framed.');
+      framing = fitted;
+    } catch (error) {
+      disposeModel(draft);
+      throw error;
     }
 
-    const bounds = new Box3().setFromObject(this.assemblyRoot);
-    if (bounds.isEmpty()) {
-      this.requestRender(true);
-      return;
-    }
-
-    const center = bounds.getCenter(new Vector3());
-    this.modelScale = 5.6 / Math.max(bounds.getSize(new Vector3()).length(), 1e-9);
-    this.assemblyRoot.scale.setScalar(this.modelScale);
-    this.assemblyRoot.position.copy(center).multiplyScalar(-this.modelScale);
-    this.assemblyRoot.updateMatrixWorld(true);
-    this.ground.position.y = (bounds.min.y - center.y) * this.modelScale - 0.015;
-    this.floorGlow.position.y = this.ground.position.y - 0.008;
-
-    this.fit('isometric');
+    const previous = this.model;
+    this.world.remove(previous.root);
+    this.world.add(draft.root);
+    this.model = draft;
+    this.selection = null;
+    this.hovered = [];
+    this.undoStack.length = 0;
+    this.ground.position.y = floorHeight;
+    this.floorGlow.position.y = floorHeight - 0.008;
+    this.applyFraming(framing);
+    this.geometryChanged();
+    disposeModel(previous);
   }
 
-  private buildOccurrence(node: CadOccurrence, parent: SceneOccurrence | null, meshes: CadMesh[]) {
+  private buildOccurrence(node: CadOccurrence, parent: SceneOccurrence | null, model: SceneModel, meshes: CadMesh[]) {
     const placement = new Group();
     const matrix = new Matrix4().fromArray(node.matrix);
     // Keep the complete imported affine placement on its own node.
@@ -219,13 +260,15 @@ export class CadScene {
     placement.add(editable);
     editable.add(contents);
     const occurrence: SceneOccurrence = {
-      id: node.id, parent, pivot: new Vector3(), placement, editable,
+      id: node.id, parent, children: [], pivot: new Vector3(), placement, editable,
     };
-    this.occurrences.set(node.id, occurrence);
+    model.occurrences.set(node.id, occurrence);
+    parent?.children.push(occurrence);
 
     const bounds = new Box3();
     if (node.mesh !== undefined) {
-      const geometry = this.geometries[node.mesh];
+      const geometry = model.geometries[node.mesh];
+      if (!geometry) throw new Error('A STEP part references missing geometry.');
       const fallback = meshes[node.mesh].color;
       const palette = node.colors?.length === geometry.groups.length ? node.colors : [node.color ?? fallback];
       const sourceColors = palette.map((entry) => {
@@ -238,14 +281,14 @@ export class CadScene {
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       contents.add(mesh);
-      this.meshes.push(mesh);
+      model.meshes.push(mesh);
       occurrence.mesh = mesh;
       occurrence.sourceColors = sourceColors;
       if (geometry.boundingBox) bounds.copy(geometry.boundingBox);
     }
 
     for (const child of node.children) {
-      const built = this.buildOccurrence(child, occurrence, meshes);
+      const built = this.buildOccurrence(child, occurrence, model, meshes);
       contents.add(built.placement);
       bounds.union(built.bounds.applyMatrix4(built.placement.matrix));
     }
@@ -258,14 +301,17 @@ export class CadScene {
   resize() {
     const width = this.canvas.clientWidth;
     const height = this.canvas.clientHeight;
-    if (!width || !height) return;
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.renderer.setSize(width, height, false);
+    const pixelRatio = Math.min(window.devicePixelRatio, 2);
+    if (!width || !height || (width === this.width && height === this.height && pixelRatio === this.pixelRatio)) return;
+    this.width = width;
+    this.height = height;
+    this.pixelRatio = pixelRatio;
+    this.renderer.setDrawingBufferSize(width, height, pixelRatio);
     const aspect = width / height;
     const aspectChanged = this.camera.aspect !== aspect;
     this.camera.aspect = aspect;
     this.camera.updateProjectionMatrix();
-    if (aspectChanged && this.fitOnResize && this.meshes.length) {
+    if (aspectChanged && this.fitOnResize && this.model.meshes.length) {
       this.fit();
       return;
     }
@@ -273,38 +319,50 @@ export class CadScene {
   }
 
   fit(view?: CameraView) {
-    const bounds = new Box3().setFromObject(this.assemblyRoot);
-    if (bounds.isEmpty()) return;
     const direction = view
       ? cameraDirections[view]
       : this.camera.position.clone().sub(this.target).normalize();
-    bounds.getCenter(this.target);
+    const framing = this.frameModel(this.model, direction);
+    if (!framing) return;
+    this.applyFraming(framing);
+    this.requestRender(true);
+  }
+
+  private frameModel(model: SceneModel, direction: Vector3): CameraFrame | null {
+    const bounds = new Box3().setFromObject(model.root);
+    if (bounds.isEmpty()) return null;
+    const target = bounds.getCenter(new Vector3());
     const right = new Vector3(0, 1, 0).cross(direction).normalize();
     const up = direction.clone().cross(right);
-    const vertical = Math.tan(MathUtils.degToRad(this.camera.fov / 2));
-    const horizontal = vertical * this.camera.aspect;
+    const halfVerticalFov = Math.tan(MathUtils.degToRad(this.camera.fov / 2));
+    const reachX = halfVerticalFov * this.camera.aspect * (1 - 2 * CALIBRATION_INSET_X);
+    const reachY = halfVerticalFov * (1 - 2 * CALIBRATION_INSET_Y);
     let distance = 1;
     const corner = new Vector3();
-    for (const mesh of this.meshes) {
+    for (const mesh of model.meshes) {
       const box = mesh.geometry.boundingBox;
       if (!box || box.isEmpty()) continue;
       for (const x of [box.min.x, box.max.x]) {
         for (const y of [box.min.y, box.max.y]) {
           for (const z of [box.min.z, box.max.z]) {
-            corner.set(x, y, z).applyMatrix4(mesh.matrixWorld).sub(this.target);
+            corner.set(x, y, z).applyMatrix4(mesh.matrixWorld).sub(target);
             const clearance = Math.max(
-              Math.abs(corner.dot(right)) / (horizontal * 0.86),
-              Math.abs(corner.dot(up)) / (vertical * 0.72),
+              Math.abs(corner.dot(right)) / reachX,
+              Math.abs(corner.dot(up)) / reachY,
             );
             distance = Math.max(distance, corner.dot(direction) + clearance);
           }
         }
       }
     }
-    this.camera.position.copy(this.target).addScaledVector(direction, distance);
+    return { position: target.clone().addScaledVector(direction, distance), target };
+  }
+
+  private applyFraming({ position, target }: CameraFrame) {
+    this.target.copy(target);
+    this.camera.position.copy(position);
     this.fitOnResize = true;
     this.aimCamera();
-    this.requestRender(true);
   }
 
   orbit(dx: number, dy: number) {
@@ -318,6 +376,7 @@ export class CadScene {
   }
 
   zoom(factor: number) {
+    if (!(factor > 0) || !Number.isFinite(factor)) return;
     const offset = this.camera.position.clone().sub(this.target);
     offset.setLength(MathUtils.clamp(offset.length() / factor, 1.4, 300));
     this.camera.position.copy(this.target).add(offset);
@@ -350,9 +409,12 @@ export class CadScene {
     if (x < 0 || x > 1 || y < 0 || y > 1) return null;
     const cached = this.picks.find((pick) => pick.x === x && pick.y === y);
     if (cached) return cached.id;
-    this.assemblyRoot.updateMatrixWorld(true);
+    if (this.modelMatricesDirty) {
+      this.model.root.updateMatrixWorld(true);
+      this.modelMatricesDirty = false;
+    }
     this.castRay(x, y);
-    const hit = this.raycaster.intersectObjects(this.meshes, false)[0];
+    const hit = this.raycaster.intersectObjects(this.model.meshes, false)[0];
     const id = hit ? hit.object.userData.occurrenceId as string : null;
     this.picks.unshift({ x, y, id });
     if (this.picks.length > 2) this.picks.pop();
@@ -360,7 +422,7 @@ export class CadScene {
   }
 
   isWithin(id: string, group: string) {
-    let occurrence = this.occurrences.get(id);
+    let occurrence = this.model.occurrences.get(id);
     while (occurrence) {
       if (occurrence.id === group) return true;
       occurrence = occurrence.parent ?? undefined;
@@ -374,50 +436,37 @@ export class CadScene {
 
   select(id: string | null) {
     if (this.selection === id) return;
+    const previous = this.selection;
     this.selection = id;
-    this.updateHighlights();
+    if (previous !== null) this.updateHighlight(previous, true);
+    if (id !== null) this.updateHighlight(id, true);
+    this.requestRender();
   }
 
   hover(ids: string[]) {
     if (ids.length === this.hovered.length && ids.every((id, index) => id === this.hovered[index])) return;
+    const changed = new Set([...this.hovered, ...ids]);
     this.hovered = ids;
-    this.updateHighlights();
-  }
-
-  private updateHighlights() {
-    for (const occurrence of this.occurrences.values()) {
-      const mesh = occurrence.mesh;
-      if (!mesh) continue;
-      const selected = this.selection !== null && this.isWithin(occurrence.id, this.selection);
-      const hovered = this.hovered.includes(occurrence.id);
-      if (!selected && !hovered) {
-        if (occurrence.outline) occurrence.outline.visible = false;
-        for (const material of materialsOf(mesh)) material.emissive.setHex(0);
-        continue;
-      }
-
-      if (!occurrence.outline) {
-        let edges = this.edges.get(mesh.geometry);
-        if (!edges) {
-          edges = new EdgesGeometry(mesh.geometry, 24);
-          this.edges.set(mesh.geometry, edges);
-        }
-        occurrence.outline = new LineSegments(edges, this.hoverLine);
-        occurrence.outline.renderOrder = 1;
-        mesh.add(occurrence.outline);
-      }
-      occurrence.outline.visible = true;
-      occurrence.outline.material = selected ? this.selectedLine : this.hoverLine;
-      for (const material of materialsOf(mesh)) {
-        material.emissive.setHex(selected ? 0x554098 : 0x19767f);
-        material.emissiveIntensity = 0.24;
-      }
-    }
+    for (const id of changed) this.updateHighlight(id);
     this.requestRender();
   }
 
+  private updateHighlight(id: string, includeChildren = false) {
+    const occurrence = this.model.occurrences.get(id);
+    if (!occurrence) return;
+    const selected = this.selection !== null && this.isWithin(id, this.selection);
+    const tint = selected ? 0x554098 : this.hovered.includes(id) ? 0x19767f : 0;
+    for (const material of materialsOf(occurrence.mesh)) {
+      material.emissive.setHex(tint);
+      material.emissiveIntensity = 0.38;
+    }
+    if (includeChildren) {
+      for (const child of occurrence.children) this.updateHighlight(child.id, true);
+    }
+  }
+
   getPose(id: string): ObjectPose | null {
-    const occurrence = this.occurrences.get(id);
+    const occurrence = this.model.occurrences.get(id);
     if (!occurrence) return null;
     const editable = occurrence.editable;
     const position = new Vector3();
@@ -425,14 +474,14 @@ export class CadScene {
     const scale = new Vector3();
     editable.updateWorldMatrix(true, false);
     editable.matrixWorld.decompose(position, rotation, scale);
-    return { position, rotation, scale: Math.abs(scale.x) / this.modelScale };
+    return { position, rotation, scale: Math.abs(scale.x) / this.model.scale };
   }
 
   private toLocalPose(occurrence: SceneOccurrence, pose: ObjectPose): ObjectPose {
     occurrence.placement.updateWorldMatrix(true, false);
     const parent = occurrence.placement.matrixWorld;
     const matrix = new Matrix4().compose(
-      pose.position, pose.rotation, new Vector3().setScalar(pose.scale * this.modelScale),
+      pose.position, pose.rotation, new Vector3().setScalar(pose.scale * this.model.scale),
     );
     matrix.premultiply(parent.clone().invert());
     const position = new Vector3();
@@ -443,15 +492,14 @@ export class CadScene {
   }
 
   setPose(id: string, pose: ObjectPose) {
-    const occurrence = this.occurrences.get(id);
+    const occurrence = this.model.occurrences.get(id);
     if (!occurrence) return;
     applyPose(occurrence.editable, this.toLocalPose(occurrence, pose));
-    this.keyLight.shadow.needsUpdate = true;
-    this.requestRender(true);
+    this.geometryChanged();
   }
 
   commitGrip(id: string, startingPose: ObjectPose) {
-    const occurrence = this.occurrences.get(id);
+    const occurrence = this.model.occurrences.get(id);
     if (!occurrence) return;
     const before = this.toLocalPose(occurrence, startingPose);
     if (!samePose(before, localPose(occurrence.editable))) {
@@ -460,7 +508,7 @@ export class CadScene {
   }
 
   describe(id: string) {
-    const occurrence = this.occurrences.get(id);
+    const occurrence = this.model.occurrences.get(id);
     if (!occurrence) return null;
     const offset = occurrence.editable.position.clone().sub(occurrence.pivot).toArray();
     const materials = materialsOf(occurrence.mesh);
@@ -472,7 +520,7 @@ export class CadScene {
   color(id: string, cssHex: string) {
     const next = new Color(cssHex);
     const restore: Array<() => void> = [];
-    for (const occurrence of this.occurrences.values()) {
+    for (const occurrence of this.model.occurrences.values()) {
       if (!this.isWithin(occurrence.id, id)) continue;
       for (const { color } of materialsOf(occurrence.mesh)) {
         if (color.equals(next)) continue;
@@ -487,7 +535,7 @@ export class CadScene {
 
   reset(id?: string) {
     const restore: Array<() => void> = [];
-    for (const occurrence of this.occurrences.values()) {
+    for (const occurrence of this.model.occurrences.values()) {
       if (id !== undefined && !this.isWithin(occurrence.id, id)) continue;
       const initial = { position: occurrence.pivot, rotation: new Quaternion(), scale: 1 };
       const before = localPose(occurrence.editable);
@@ -504,8 +552,7 @@ export class CadScene {
       }
     }
     if (restore.length) this.pushUndo(() => restore.forEach((undo) => undo()));
-    this.keyLight.shadow.needsUpdate = true;
-    this.requestRender(true);
+    this.geometryChanged();
   }
 
   canUndo() {
@@ -513,9 +560,10 @@ export class CadScene {
   }
 
   undo() {
-    this.undoStack.pop()?.();
-    this.keyLight.shadow.needsUpdate = true;
-    this.requestRender(true);
+    const restore = this.undoStack.pop();
+    if (!restore) return;
+    restore();
+    this.geometryChanged();
   }
 
   private pushUndo(restore: () => void) {
@@ -523,43 +571,62 @@ export class CadScene {
     if (this.undoStack.length > 100) this.undoStack.shift();
   }
 
+  private geometryChanged() {
+    this.modelMatricesDirty = true;
+    this.keyLight.shadow.needsUpdate = true;
+    this.requestRender(true);
+  }
+
   private requestRender(picksChanged = false) {
     if (picksChanged) this.picks.length = 0;
-    if (this.frame !== null) return;
+    if (this.contextLost || this.frame !== null) return;
     this.frame = requestAnimationFrame(() => {
       this.frame = null;
       this.renderer.render(this.world, this.camera);
+      this.modelMatricesDirty = false;
     });
   }
 
-  private clearAssembly() {
-    this.assemblyRoot.clear();
-    for (const mesh of this.meshes) {
-      for (const material of materialsOf(mesh)) material.dispose();
-    }
-    this.edges.forEach((edge) => edge.dispose());
-    this.geometries.forEach((geometry) => geometry.dispose());
-    this.edges.clear();
-    this.occurrences.clear();
-    this.meshes.length = 0;
-    this.geometries.length = 0;
-    this.undoStack.length = 0;
-    this.selection = null;
-    this.hovered = [];
+  private rebuildStudioMap() {
+    this.studioMap?.dispose();
+    this.studioMap = makeStudioMap(this.renderer);
+    this.world.environment = this.studioMap?.texture ?? null;
+    this.ambientLight.intensity = this.studioMap ? 0.55 : 1.15;
   }
+
+  private handleContextLost = (event: Event) => {
+    event.preventDefault();
+    this.contextLost = true;
+    if (this.frame !== null) cancelAnimationFrame(this.frame);
+    this.frame = null;
+    this.onContextChange?.('lost');
+  };
+
+  private handleContextRestored = () => {
+    this.contextLost = false;
+    this.rebuildStudioMap();
+    const shadow = this.keyLight.shadow;
+    shadow.dispose();
+    shadow.map = null;
+    shadow.mapPass = null;
+    this.renderer.setViewport(0, 0, this.width, this.height);
+    this.geometryChanged();
+    this.onContextChange?.('restored');
+  };
 
   dispose() {
     this.observer.disconnect();
+    this.canvas.removeEventListener('webglcontextlost', this.handleContextLost);
+    this.canvas.removeEventListener('webglcontextrestored', this.handleContextRestored);
     if (this.frame !== null) cancelAnimationFrame(this.frame);
-    this.clearAssembly();
+    this.undoStack.length = 0;
+    disposeModel(this.model);
     this.floorGlow.geometry.dispose();
     this.floorGlow.material.dispose();
     this.ground.geometry.dispose();
     this.ground.material.dispose();
     this.keyLight.shadow.dispose();
     this.studioMap?.dispose();
-    this.selectedLine.dispose();
-    this.hoverLine.dispose();
     this.renderer.dispose();
   }
 }

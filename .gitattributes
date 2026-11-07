@@ -1,1 +1,2 @@
 src/models/ultraviolet-full-car.step -text -diff
+src/models/ultraviolet-full-car.cadmesh -text -diff

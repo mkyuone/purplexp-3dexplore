@@ -1,4 +1,4 @@
-import type { HandPose, JoinTarget, PoseFrame } from './gestures.ts'
+import { isInsideJoin, type HandPose, type JoinTarget, type PoseFrame } from './gestures.ts'
 
 export type SimHandId = 'left' | 'right'
 type Grip = 'part' | 'view'
@@ -173,7 +173,7 @@ export class HandSimulator {
     if (held) {
       if (grip && (grip.kind !== kind || grip.sources.has(source))) return
       if (id === 'right' && source !== 'pointer' && this.join && !grip
-        && Math.hypot(hand.x - this.join.x, hand.y - this.join.y) > this.join.radius) this.aimSecondAtJoin()
+        && !isInsideJoin(this.join, hand.x, hand.y)) this.aimSecondAtJoin()
       if (!hand.visible) {
         this.ensureVisible(id)
         this.emit()

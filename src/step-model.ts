@@ -31,12 +31,15 @@ interface MaterialScene {
 type SurfaceColor = CadColor | undefined;
 type FaceStyle = { occurrence: CadOccurrence; colors: SurfaceColor[] };
 type Bounds = { min: number[]; max: number[] };
+type FaceCandidate = { bounds: Bounds; color: string };
+type CoordinateIndex = { coordinate: number; candidates: FaceCandidate[]; largest: number };
 
 const toSrgb = (value: number) =>
   value <= 0.0031308 ? 12.92 * value : 1.055 * value ** (1 / 2.4) - 0.055;
 
 const colorKey = (color: SurfaceColor) => color?.join(",") ?? "";
-const nearPosition = (a: number, b: number) => Math.abs(a - b) <= 0.0002 + Math.max(Math.abs(a), Math.abs(b)) * 2e-7;
+const positionTolerance = (magnitude: number) => 0.0002 + magnitude * 2e-7;
+const nearPosition = (a: number, b: number) => Math.abs(a - b) <= positionTolerance(Math.max(Math.abs(a), Math.abs(b)));
 
 function readMaterialScene(doc: StepDocument): MaterialScene | undefined {
   try {
@@ -86,11 +89,57 @@ function sameBounds(a: Bounds, b: Bounds) {
     && a.max.every((value, axis) => nearPosition(value, b.max[axis]));
 }
 
+const coordinateOf = (bounds: Bounds, coordinate: number) =>
+  coordinate < 3 ? bounds.min[coordinate] : bounds.max[coordinate - 3];
+
+function indexCandidates(candidates: FaceCandidate[]): CoordinateIndex[] {
+  if (new Set(candidates.map((candidate) => candidate.color)).size < 2) return [];
+  return Array.from({ length: 6 }, (_, coordinate) => {
+    const value = (candidate: FaceCandidate) => coordinateOf(candidate.bounds, coordinate);
+    const sorted = candidates.slice().sort((a, b) => value(a) - value(b));
+    const largest = Math.max(Math.abs(value(sorted[0])), Math.abs(value(sorted[sorted.length - 1])));
+    return { coordinate, candidates: sorted, largest };
+  });
+}
+
+function boundary(index: CoordinateIndex, limit: number, includeEqual: boolean) {
+  let low = 0;
+  let high = index.candidates.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    const value = coordinateOf(index.candidates[middle].bounds, index.coordinate);
+    if (value < limit || (includeEqual && value === limit)) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function hasConflictingColor(indexes: CoordinateIndex[], bounds: Bounds, color: string) {
+  let shortest: { candidates: FaceCandidate[]; start: number; end: number } | undefined;
+  for (const index of indexes) {
+    const value = coordinateOf(bounds, index.coordinate);
+    // Use a conservative interval and keep sameBounds as the final check.
+    const radius = 2 * positionTolerance(Math.max(Math.abs(value), index.largest));
+    const start = boundary(index, value - radius, false);
+    const end = boundary(index, value + radius, true);
+    if (end - start <= 1) return false; // Only the already-verified face can be present.
+    if (!shortest || end - start < shortest.end - shortest.start) {
+      shortest = { candidates: index.candidates, start, end };
+    }
+  }
+  if (!shortest) return false;
+  for (let i = shortest.start; i < shortest.end; i++) {
+    const candidate = shortest.candidates[i];
+    if (candidate.color !== color && sameBounds(bounds, candidate.bounds)) return true;
+  }
+  return false;
+}
+
 function matchesFaces(
   scene: MaterialScene, primitives: MaterialPrimitive[], colors: SurfaceColor[], mesh: CadMesh, faces: Int32Array,
 ) {
   if (faces.length !== primitives.length * 3) return false;
-  const candidatesByCount = new Map<number, Array<{ bounds: Bounds; color: string }>>();
+  const candidatesByCount = new Map<number, FaceCandidate[]>();
   const boundsInOrder: Bounds[] = [];
   for (const [face, primitive] of primitives.entries()) {
     const accessor = scene.accessors[primitive.attributes.POSITION];
@@ -103,6 +152,7 @@ function matchesFaces(
     candidates.push({ bounds, color: colorKey(colors[face]) });
     candidatesByCount.set(count, candidates);
   }
+  const indexByCount = new Map(Array.from(candidatesByCount, ([count, candidates]) => [count, indexCandidates(candidates)]));
 
   // OCCT 5.8.1 reports index offsets/counts here, including three indices per triangle.
   // Use exporter order only after verifying complete coverage and an unambiguous color match.
@@ -115,9 +165,8 @@ function matchesFaces(
     const bounds = faceBounds(mesh, start, count);
     if (!sameBounds(bounds, boundsInOrder[face])) return false;
     const color = colorKey(colors[face]);
-    if (candidatesByCount.get(count)?.some((candidate) => candidate.color !== color && sameBounds(bounds, candidate.bounds))) {
-      return false;
-    }
+    const index = indexByCount.get(count);
+    if (index && hasConflictingColor(index, bounds, color)) return false;
   }
   return end === mesh.indices.length;
 }
