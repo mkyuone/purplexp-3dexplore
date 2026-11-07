@@ -6,7 +6,7 @@ import { CadScene, type SurfaceFinishes } from './scene';
 import { GestureController, RESET_HOLD_MS, type GestureState } from './gestures';
 import { HandSimulator } from './simulator';
 import { AssemblyPanel, indexOccurrences, PartPanel } from './panels';
-import { applyHandCameraSettings, calibrateHands, connectLiveHands, fetchHandCameraSettings, handDisplayKey, type HandCameraSelection, type HandCameraSettings, type HandNavigation, type LiveHandStatus } from './live-hands';
+import { applyHandCameraSettings, calibrateHands, connectLiveHands, fetchHandCameraSettings, handDisplayKey, type HandCameraSettings, type HandNavigation, type LiveHandStatus } from './live-hands';
 import { attachVisitorControls } from './visitor-controls';
 import { CalibrationPanel } from './calibration-panel';
 import { CameraPreview } from './camera-preview';
@@ -39,18 +39,14 @@ function visitorCue(state: GestureState | null, simulation: boolean) {
   return 'Pinch a part to move it. Make a fist to look around.';
 }
 
-function cameraSelection(settings: HandCameraSelection): HandCameraSelection {
-  return { source: 'rgb', tracker: settings.tracker, fps: settings.fps };
-}
-
-function CameraSettings() {
+function CameraSettings({ navigation }: { navigation: HandNavigation }) {
   const session = useRef<AbortController | null>(null);
   const requestVersion = useRef(0);
   const posting = useRef(false);
   const dirty = useRef(false);
   const [settings, setSettings] = useState<HandCameraSettings | null>(null);
-  const [active, setActive] = useState<HandCameraSettings | null>(null);
-  const [draft, setDraft] = useState<HandCameraSelection | null>(null);
+  const [activeFps, setActiveFps] = useState<number | null>(null);
+  const [draftFps, setDraftFps] = useState<number | null>(null);
   const [sending, setSending] = useState(false);
   const [pollError, setPollError] = useState<string | null>(null);
   const [applyError, setApplyError] = useState<string | null>(null);
@@ -58,9 +54,9 @@ function CameraSettings() {
   function receive(next: HandCameraSettings) {
     setSettings(next);
     if (!next.applying) {
-      if (!next.error) setActive(next);
-      if (!dirty.current) setDraft(cameraSelection(next));
-    } else setDraft(current => current ?? cameraSelection(next));
+      if (!next.error) setActiveFps(next.fps);
+      if (!dirty.current) setDraftFps(next.fps);
+    } else setDraftFps(current => current ?? next.fps);
   }
 
   useEffect(() => {
@@ -92,30 +88,27 @@ function CameraSettings() {
   }, []);
 
   const busy = sending || settings?.applying === true;
-  const validDraft = !!draft && !!settings
-    && settings.sources.some(item => item.value === draft.source)
-    && settings.trackers.some(item => item.value === draft.tracker && item.available)
-    && settings.frameRates.includes(draft.fps);
-  const changed = !!draft && (!active || draft.source !== active.source || draft.tracker !== active.tracker || draft.fps !== active.fps);
+  const validDraft = draftFps !== null && settings?.frameRates.includes(draftFps);
+  const changed = draftFps !== activeFps;
 
-  function editDraft(change: Partial<HandCameraSelection>) {
+  function editDraft(fps: number) {
     dirty.current = true;
-    setDraft(current => current ? { ...current, ...change } : current);
+    setDraftFps(fps);
     setApplyError(null);
   }
 
   async function apply() {
     const controller = session.current;
-    if (!controller || !draft || !validDraft || busy || posting.current) return;
+    if (!controller || draftFps === null || !validDraft || busy || posting.current) return;
     posting.current = true;
     requestVersion.current++;
     setSending(true);
     setApplyError(null);
     try {
-      const next = await applyHandCameraSettings(draft, controller.signal);
+      const next = await applyHandCameraSettings(draftFps, controller.signal);
       if (controller.signal.aborted) return;
       dirty.current = false;
-      setDraft(cameraSelection(next));
+      setDraftFps(next.fps);
       receive(next);
       setPollError(null);
     } catch (cause) {
@@ -128,23 +121,19 @@ function CameraSettings() {
 
   const metrics = settings?.diagnostics;
   const issue = applyError ?? settings?.error ?? pollError;
+  const rgbOnly = navigation === 'fuzzy' && metrics?.depthHands !== undefined
+    && (metrics.trackedHands ?? 0) > metrics.depthHands;
+  const waitingForDepth = (metrics?.estimatedHands ?? 0) > 0 && metrics?.depthHands === 0;
   return <div className="camera-testing">
     <fieldset disabled={busy || !settings}>
-      <legend>Camera testing</legend>
-      {settings && draft ? <>
-        <p className="camera-option-note">Compare hand trackers using the RGB camera.</p>
-        <label className="navigation-choice">Hand tracker
-          <select value={draft.tracker} onChange={event => editDraft({ tracker: event.target.value })}>
-            {settings.trackers.map(item => <option key={item.value} value={item.value} disabled={!item.available}>{item.label}{item.available ? '' : ' · unavailable'}</option>)}
-          </select>
-        </label>
-        {settings.trackers.filter(item => !item.available && item.reason).map(item => <p key={item.value} className="camera-option-note">{item.label}: {item.reason}</p>)}
+      <legend>Camera settings</legend>
+      {settings && draftFps !== null ? <>
         <label className="navigation-choice">Capture rate
-          <select value={draft.fps} onChange={event => editDraft({ fps: Number(event.target.value) })}>
+          <select value={draftFps} onChange={event => editDraft(Number(event.target.value))}>
             {settings.frameRates.map(fps => <option key={fps} value={fps}>{fps} fps</option>)}
           </select>
         </label>
-        <p className="camera-option-note">Changing the tracker or capture rate restarts the camera.</p>
+        <p className="camera-option-note">Changing the capture rate restarts the camera.</p>
         <button className="button" type="button" disabled={!changed || !validDraft} onClick={() => void apply()}>
           {busy && <LoaderCircle size={15} className="camera-settings-spinner" />}{busy ? 'Applying…' : 'Apply and restart'}
         </button>
@@ -152,15 +141,16 @@ function CameraSettings() {
     </fieldset>
     {busy && <p className="camera-option-note" role="status">Restarting the camera with the requested settings…</p>}
     {issue && <p className="camera-settings-error" role="alert">{issue}</p>}
-    {active && <dl className="camera-diagnostics" aria-label="Active camera diagnostics">
-      <div><dt>Active image</dt><dd>{active.sources.find(item => item.value === active.source)?.label ?? active.source}</dd></div>
-      <div><dt>Active tracker</dt><dd>{active.trackers.find(item => item.value === active.tracker)?.label ?? active.tracker} · {active.fps} fps capture</dd></div>
+    {activeFps !== null && <dl className="camera-diagnostics" aria-label="Active camera diagnostics">
+      <div><dt>Active capture</dt><dd>{activeFps} fps</dd></div>
       {!busy && metrics && [metrics.estimatedHands, metrics.depthHands, metrics.trackedHands].some(value => value !== undefined) && <div><dt>Hands</dt><dd>{metrics.estimatedHands ?? '—'} seen · {metrics.depthHands ?? '—'} depth · {metrics.trackedHands ?? '—'} tracked</dd></div>}
       {!busy && metrics?.poseFps !== undefined && <div><dt>Pose rate</dt><dd>{metrics.poseFps.toFixed(1)} fps</dd></div>}
       {!busy && metrics?.processingMs !== undefined && <div><dt>Processing</dt><dd>{metrics.processingMs.toFixed(1)} ms</dd></div>}
       {!busy && metrics?.frameAgeMs !== undefined && <div><dt>Frame age</dt><dd>{Math.round(metrics.frameAgeMs)} ms</dd></div>}
     </dl>}
-    {!busy && (metrics?.estimatedHands ?? 0) > 0 && metrics?.depthHands === 0 && <p className="camera-option-note">Hand seen, waiting for palm depth.</p>}
+    {!busy && (rgbOnly || waitingForDepth) && <p className="camera-option-note">
+      {rgbOnly ? 'RGB tracking active. Depth movement is paused.' : 'Hand seen, waiting for palm depth.'}
+    </p>}
   </div>;
 }
 
@@ -565,7 +555,7 @@ export function App() {
           </label>}
           {liveEnabled && (liveStatus.phase === 'ready' || liveStatus.phase === 'calibration') && <button className="button camera-calibrate" type="button" disabled={calibrationBusy || !!graphicsIssue} onClick={() => void changeCalibration('begin')}>{navigation === 'fuzzy' ? 'Optional reach calibration' : 'Calibrate reach'}</button>}
           {calibrationError && <p className="setup-hint" role="alert">{calibrationError}</p>}
-          <CameraSettings />
+          <CameraSettings navigation={navigation} />
         </section>}
         <section className="panel file-panel" aria-label="STEP import">
           <h2>Model</h2>

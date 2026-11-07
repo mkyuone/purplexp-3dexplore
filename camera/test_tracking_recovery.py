@@ -16,6 +16,51 @@ def candidate(x=0.0, *, grip=PINCH, side=None):
 
 
 class TrackingRecoveryTests(TestCase):
+    def test_rgb_fallback_and_metric_return_follow_palm_across_grip_anchors(self):
+        tracker = HandTracker()
+        open_hand = replace(candidate(grip=OPEN, side='Left'), image_index=(0.26, 0.20))
+        _, (before,) = tracker.update([open_hand], 1)
+        fist = replace(candidate(.02, grip=FIST, side='Left'), pose=None, pointing=False, pinch_gap=None)
+        status, (optical,) = tracker.update([fist], 1.04)
+        self.assertEqual((status, optical.id, optical.grip), ('tracking', before.id, 'fist'))
+        self.assertIsNone(optical.pose)
+        self.assertEqual(optical.image, fist.image_palm)
+
+        recovered = candidate(.04, grip=FIST, side='Left')
+        status, (measured,) = tracker.update([recovered], 1.08)
+        self.assertEqual((status, measured.id, measured.grip), ('tracking', before.id, 'fist'))
+        self.assertEqual(measured.pose.palm, recovered.pose.palm)
+        self.assertEqual(measured.pose.tip, measured.pose.palm)
+
+    def test_optical_match_rejects_conflicting_handedness_and_distant_palms(self):
+        original = candidate(grip=OPEN, side='Left')
+        for replacement in (
+            candidate(grip=OPEN, side='Right'),
+            candidate(.15, grip=OPEN, side='Left'),
+        ):
+            with self.subTest(replacement=replacement):
+                tracker = HandTracker()
+                _, (before,) = tracker.update([original], 1)
+                optical = replace(replacement, pose=None, pointing=False, pinch_gap=None)
+                status, (after,) = tracker.update([optical], 1.04)
+                self.assertEqual(status, 'tracking')
+                self.assertNotEqual(after.id, before.id)
+                self.assertIsNone(after.pose)
+
+    def test_mixed_depth_tracks_keep_identity_when_reordered_and_reject_overlapping_palms(self):
+        tracker = HandTracker()
+        left = candidate(-.12, grip=OPEN, side='Left')
+        right = candidate(.12, grip=FIST, side='Right')
+        _, (first, second) = tracker.update([left, right], 1)
+        optical = replace(right, pose=None, pointing=False, pinch_gap=None)
+        status, (same_first, same_second) = tracker.update([optical, left], 1.04)
+        self.assertEqual(status, 'tracking')
+        self.assertEqual((same_first.id, same_second.id), (first.id, second.id))
+        self.assertIsNotNone(same_first.pose)
+        self.assertIsNone(same_second.pose)
+        overlapping = replace(optical, image_palm=(.40, .5))
+        self.assertEqual(tracker.update([left, overlapping], 1.08), ('ambiguous', ()))
+
     def test_brief_missing_frames_pause_output_then_resume_measured_pose_with_same_identity(self):
         tracker = HandTracker()
         _, (before,) = tracker.update([candidate()], 1.00)

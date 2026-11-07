@@ -5,7 +5,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from calibration import Pose
-from realsense import fuse_hand
+from realsense import CameraFeed, fuse_hand
 from tracking import Candidate, GripFeatures, Hand, HandTracker
 
 OPEN = GripFeatures(0.8, 0, 0)
@@ -68,6 +68,56 @@ class FusedImageTests(TestCase):
         profile = SimpleNamespace(as_video_stream_profile=lambda: SimpleNamespace(intrinsics=None))
         self.depth = SimpleNamespace(profile=profile, get_data=lambda: SimpleNamespace(shape=(480, 640)), get_units=lambda: .001)
         self.np = SimpleNamespace(asanyarray=lambda data: data)
+
+    def test_invalid_palm_depth_preserves_fresh_rgb_and_rejects_offscreen_palm(self):
+        palm_depths = [(0, 0, .31), (0, 0, .55), (0, 0, .85)]
+        with patch('realsense.locate_depth', side_effect=palm_depths):
+            sample = fuse_hand(None, self.np, self.landmarks, [], [], self.depth, OPEN)
+        self.assertIsNone(sample.pose)
+        self.assertFalse(sample.pointing)
+        self.assertIsNone(sample.pinch_gap)
+        self.assertEqual(sample.image_index, (.37, .25))
+        self.assertEqual(sample.image_palm, (.5, .65))
+
+        self.landmarks[0] = SimpleNamespace(x=-.03, y=.75, z=0)
+        with patch('realsense.locate_depth', return_value=None):
+            self.assertIsNone(fuse_hand(None, self.np, self.landmarks, [], [], self.depth, OPEN))
+
+    def test_synchronized_rgb_frames_continue_through_missing_palm_pixels(self):
+        rgb = SimpleNamespace(shape=(480, 640, 3))
+        self.np.ascontiguousarray = lambda image: image
+        missing_pixels = SimpleNamespace(shape=(480, 640))
+        empty_depth = SimpleNamespace(**vars(self.depth))
+        empty_depth.get_data = lambda: missing_pixels
+
+        def frames(number, image, depth):
+            return SimpleNamespace(
+                get_color_frame=lambda: SimpleNamespace(get_frame_number=lambda: number, get_data=lambda: image),
+                get_depth_frame=lambda: depth,
+            )
+
+        raw = [frames(number, rgb, SimpleNamespace(get_frame_number=lambda n=number: n)) for number in range(1, 5)]
+        aligned = iter((frames(1, rgb, self.depth), frames(2, rgb, empty_depth),
+                        frames(3, rgb, None), frames(4, rgb, self.depth)))
+        raw = iter(raw)
+        pipeline = SimpleNamespace(try_wait_for_frames=lambda _: (True, next(raw)))
+        align = SimpleNamespace(process=lambda _: next(aligned))
+        estimator = SimpleNamespace(detect=lambda image, at: [
+            SimpleNamespace(landmarks=self.landmarks, handedness=(), features=OPEN),
+        ])
+        published = []
+        feed = SimpleNamespace(wanted=lambda revision: len(published) < 3,
+                               publish=lambda frame, revision: published.append(frame))
+        def locate(rs, np, pixels, *args):
+            return None if pixels is missing_pixels else (0, .02, .7)
+
+        with patch('realsense.locate_depth', side_effect=locate):
+            CameraFeed.track_frames(feed, None, self.np, estimator, pipeline, align, None, 0)
+        self.assertEqual([frame.sequence for frame in published], [1, 2, 3])
+        self.assertEqual([frame.diagnostics['depthHands'] for frame in published], [1, 0, 1])
+        self.assertEqual([frame.hands[0].id for frame in published], [published[0].hands[0].id] * 3)
+        self.assertIsNone(published[1].hands[0].pose)
+        self.assertIsNone(published[1].calibration_pose)
 
     def test_fusion_exposes_original_image_ray_for_valid_depth(self):
         with patch('realsense.grip_features', return_value=OPEN), patch('realsense.locate_depth', return_value=(0,.02,.7)):

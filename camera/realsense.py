@@ -2,7 +2,7 @@
 
 from collections import deque
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import dist, hypot, isfinite
 from pathlib import Path
 from statistics import median
@@ -14,7 +14,7 @@ import logging
 from calibration import MAX_DEPTH_M, MIN_DEPTH_M, Pose, Vec3, median_point, valid_point
 from estimators import is_thumbs_up
 from options import CameraOptions
-from tracking import Candidate, Hand, HandTracker, Track, Tracking, Vec2, grip_features
+from tracking import Candidate, Hand, HandTracker, Track, Tracking, Vec2, grip_features, valid_image
 
 FRAME_MAX_AGE = 0.22
 CALIBRATION_WINDOW = 0.7
@@ -80,12 +80,17 @@ def preview_markers(landmarks, samples: list[Candidate | None], tracks: tuple[Tr
         if len(hand) <= 8:
             continue
         sample = samples[index] if index < len(samples) else None
-        track = next((track for track in tracks if sample and track.palm == sample.pose.palm), None)
+        track = None
+        if sample is not None:
+            if sample.pose is not None:
+                track = next((track for track in tracks if track.palm == sample.pose.palm), None)
+            else:
+                track = next((track for track in tracks if track.palm is None and track.image_palm == sample.image_palm), None)
         thumbs_up = track.hand.thumbs_up if track else sample is not None and sample.thumbs_up
         fist = track.hand.grip == 'fist' if track else sample is not None and sample.features.folded == 4 and not thumbs_up
         point = sample.image_palm if (fist or thumbs_up) and sample else (hand[8].x, hand[8].y)
         if point is not None and all(0 <= value <= 1 for value in point):
-            markers.append(PreviewMarker(point, track is not None, fist))
+            markers.append(PreviewMarker(point, track is not None and track.palm is not None, fist))
     return tuple(markers)
 
 
@@ -155,50 +160,17 @@ def fuse_hand(rs, np, image_landmarks, world_landmarks, handedness, aligned_dept
     if features is None:
         return None
     depth = np.asanyarray(aligned_depth.get_data())
-    intrinsics = aligned_depth.profile.as_video_stream_profile().intrinsics
-    units = aligned_depth.get_units()
-
-    def locate(x: float, y: float, near: float | None = None) -> Vec3 | None:
-        return locate_depth(rs, np, depth, intrinsics, units, x, y, near)
-
+    height, width = depth.shape
     wrist = image_landmarks[0]
-    palm_points = []
-    for index in (5, 9, 17):
-        base = image_landmarks[index]
-        point = locate((wrist.x + base.x) / 2, (wrist.y + base.y) / 2)
-        if point is not None:
-            palm_points.append(point)
-    if len(palm_points) < 2:
-        return None
-    palm = median_point(palm_points)
-    if sum(abs(point[2] - palm[2]) <= 0.055 for point in palm_points) < 2:
-        return None
-
-    def fingertip(tip_index: int, joint_index: int) -> Vec3 | None:
-        target = image_landmarks[tip_index]
-        point = locate(target.x, target.y, palm[2])
-        if point is None and features.folded < 4:
-            # Stereo depth is sparse at a fingertip's outline. Use measured
-            # depth inside its distal segment on the same fingertip color ray.
-            joint = image_landmarks[joint_index]
-            sample = ((target.x + joint.x) / 2, (target.y + joint.y) / 2)
-            point = locate_depth(rs, np, depth, intrinsics, units, target.x, target.y, palm[2], sample)
-        return point
-
+    palm_bases = [image_landmarks[index] for index in (5, 9, 17)]
+    palm_rays = [((wrist.x + base.x) / 2, (wrist.y + base.y) / 2) for base in palm_bases]
+    image_palm = (median(x for x, _ in palm_rays), median(y for _, y in palm_rays))
     index = image_landmarks[8]
-    tip = fingertip(8, 7)
-    thumb_tip = fingertip(4, 3) if tip is not None else None
-    gap = dist(thumb_tip, tip) if tip is not None and thumb_tip is not None else None
     side = None
     if handedness and handedness[0].score >= 0.65:
         side = handedness[0].category_name
-    image_palm = (
-        median((wrist.x + image_landmarks[i].x) / 2 for i in (5, 9, 17)),
-        median((wrist.y + image_landmarks[i].y) / 2 for i in (5, 9, 17)),
-    )
     # Use image pixels for the finger closure ratio, so image aspect ratio
     # cannot change which thumb/index gap counts as a pinch.
-    height, width = depth.shape
     optical_points = [(image_landmarks[i].x * width, image_landmarks[i].y * height) for i in (4, 8, 5, 17)]
     optical_ratio = None
     if all(0 <= image_landmarks[i].x < 1 and 0 <= image_landmarks[i].y < 1 for i in (4, 8, 5, 17)):
@@ -207,11 +179,45 @@ def fuse_hand(rs, np, image_landmarks, world_landmarks, handedness, aligned_dept
         if palm_width >= 8:
             ratio = hypot(thumb[0] - finger[0], thumb[1] - finger[1]) / palm_width
             optical_ratio = ratio if isfinite(ratio) else None
-    return Candidate(
-        Pose(tip or palm, palm), side, features, gap, tip is not None,
+    sample = Candidate(
+        None, side, features, None, False,
         image_index=(index.x, index.y),
         image_palm=image_palm,
         optical_pinch_ratio=optical_ratio,
+    )
+    visible_palm = (valid_image((wrist.x, wrist.y)) and valid_image(image_palm)
+                    and sum(valid_image((base.x, base.y)) for base in palm_bases) >= 2)
+    optical_sample = sample if visible_palm else None
+
+    intrinsics = aligned_depth.profile.as_video_stream_profile().intrinsics
+    units = aligned_depth.get_units()
+
+    def locate(x: float, y: float, near: float | None = None) -> Vec3 | None:
+        return locate_depth(rs, np, depth, intrinsics, units, x, y, near)
+
+    palm_points = [point for x, y in palm_rays if (point := locate(x, y)) is not None]
+    if len(palm_points) < 2:
+        return optical_sample
+    palm = median_point(palm_points)
+    if sum(abs(point[2] - palm[2]) <= 0.055 for point in palm_points) < 2:
+        return optical_sample
+
+    def fingertip(tip_index: int, joint_index: int) -> Vec3 | None:
+        target = image_landmarks[tip_index]
+        point = locate(target.x, target.y, palm[2])
+        if point is None and features.folded < 4:
+            # Stereo depth is sparse at a fingertip's outline. Use measured
+            # depth inside its distal segment on the same fingertip color ray.
+            joint = image_landmarks[joint_index]
+            inner = ((target.x + joint.x) / 2, (target.y + joint.y) / 2)
+            point = locate_depth(rs, np, depth, intrinsics, units, target.x, target.y, palm[2], inner)
+        return point
+
+    tip = fingertip(8, 7)
+    thumb_tip = fingertip(4, 3) if tip is not None else None
+    gap = dist(thumb_tip, tip) if tip is not None and thumb_tip is not None else None
+    return replace(
+        sample, pose=Pose(tip or palm, palm), pinch_gap=gap, pointing=tip is not None,
         thumbs_up=is_thumbs_up(image_landmarks, width, height, features),
     )
 
@@ -442,10 +448,6 @@ class CameraFeed:
             to_depth = color_intrinsics.model == rs.distortion.modified_brown_conrady
             align = rs.align(rs.stream.depth if to_depth else rs.stream.color)
             alignment = 'depth' if to_depth else 'color'
-            image_intrinsics = profile.get_stream(rs.stream.depth).as_video_stream_profile().intrinsics if to_depth else color_intrinsics
-            estimator.set_camera({
-                name: getattr(image_intrinsics, name) for name in ('width', 'height', 'fx', 'fy', 'ppx', 'ppy', 'coeffs')
-            } | {'model': str(image_intrinsics.model)})
             with self.lock:
                 if revision != self.revision:
                     return
@@ -500,7 +502,7 @@ class CameraFeed:
             calibration_pose = sample.pose if sample and sample.pointing and sample.features.folded < 4 else None
             sequence += 1
             diagnostics = {
-                'depthHands': sum(sample is not None for sample in samples),
+                'depthHands': sum(sample is not None and sample.pose is not None for sample in samples),
                 'model': dict(getattr(estimator, 'diagnostics', {})),
             }
             self.publish(Frame(

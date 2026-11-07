@@ -59,6 +59,7 @@ class MappedHand:
     depth: float
     grip: Grip
     thumbs_up: bool = False
+    depth_valid: bool = True
 
 
 class FuzzyMapper:
@@ -81,10 +82,12 @@ class FuzzyMapper:
             return self.output
         elapsed = min(0.1, at - self.last_at) if self.last_at is not None else 0.0
         self.last_at = at
-        valid = [hand for hand in hands if hand.image is not None and len(hand.image) == 2 and hand.pose.valid()
+        valid = [hand for hand in hands if hand.image is not None and len(hand.image) == 2
+                 and (hand.pose is None or hand.pose.valid())
                  and all(isfinite(value) and 0 <= value <= 1 for value in hand.image)]
-        if valid:
-            observed_depth = median(hand.pose.palm[2] for hand in valid)
+        measured_depths = [hand.pose.palm[2] for hand in valid if hand.pose is not None]
+        if measured_depths:
+            observed_depth = median(measured_depths)
             if self.neutral_depth_m is None:
                 self.neutral_depth_m = observed_depth
             elif all(hand.grip == 'open' and not hand.thumbs_up for hand in hands):
@@ -96,13 +99,18 @@ class FuzzyMapper:
             image_x, image_y = hand.image
             x = 1 - soft_axis(image_x, IMAGE_LEFT, IMAGE_RIGHT)
             y = soft_axis(image_y, IMAGE_TOP, IMAGE_BOTTOM)
-            depth = clamp((hand.pose.palm[2] - self.neutral_depth_m) / DEPTH_WIDTH_M, -MAX_DEPTH, MAX_DEPTH)
-            targets.append(MappedHand(hand.id, x, y, depth, hand.grip, hand.thumbs_up))
+            depth = 0.0
+            if hand.pose is not None:
+                assert self.neutral_depth_m is not None
+                depth = clamp((hand.pose.palm[2] - self.neutral_depth_m) / DEPTH_WIDTH_M, -MAX_DEPTH, MAX_DEPTH)
+            targets.append(MappedHand(hand.id, x, y, depth, hand.grip, hand.thumbs_up,
+                                      depth_valid=hand.pose is not None))
 
         depth_change = 0.0
         for target in targets:
             previous = self.previous.get(target.id)
-            if previous is not None and previous.grip == target.grip and previous.thumbs_up == target.thumbs_up:
+            if (previous is not None and previous.depth_valid and target.depth_valid
+                    and previous.grip == target.grip and previous.thumbs_up == target.thumbs_up):
                 change = abs(depth_deadzone(previous.depth, target.depth) - previous.depth)
                 depth_change = max(depth_change, change)
         depth_alpha = smoothing_alpha(depth_change, elapsed, DEPTH_STILL_SECONDS, DEPTH_MOVE_SECONDS)
@@ -118,8 +126,10 @@ class FuzzyMapper:
                 xy_alpha = smoothing_alpha(distance * fraction, elapsed, XY_STILL_SECONDS, XY_MOVE_SECONDS)
                 x = x if x in (0.0, 1.0) else previous.x + dx * fraction * xy_alpha
                 y = y if y in (0.0, 1.0) else previous.y + dy * fraction * xy_alpha
-                depth = previous.depth + (depth_deadzone(previous.depth, depth) - previous.depth) * depth_alpha
-            mapped.append(MappedHand(hand.id, x, y, depth, hand.grip, hand.thumbs_up))
+                if previous.depth_valid and hand.depth_valid:
+                    depth = previous.depth + (depth_deadzone(previous.depth, depth) - previous.depth) * depth_alpha
+            mapped.append(MappedHand(hand.id, x, y, depth, hand.grip, hand.thumbs_up,
+                                     depth_valid=hand.depth_valid))
 
         self.output = tuple(mapped)
         self.previous = {hand.id: hand for hand in mapped}

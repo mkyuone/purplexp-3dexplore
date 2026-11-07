@@ -7,12 +7,12 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from calibration import Pose, TARGETS, fit
-from estimators import image_features, is_thumbs_up
+from estimators import is_thumbs_up
 from navigation import DEPTH_WIDTH_M, FuzzyMapper, soft_axis, IMAGE_LEFT, IMAGE_RIGHT
 from realsense import fuse_hand
 from server import CameraService, Profiles
 from test_bridge import StubFeed
-from tracking import Candidate, GripFeatures, Hand, HandTracker, classify_grip
+from tracking import Candidate, GripFeatures, Hand, HandTracker, classify_grip, grip_features
 
 
 FOLDED = GripFeatures(1.1, 4, 4)
@@ -53,9 +53,22 @@ class ThumbsUpTests(TestCase):
         ):
             with self.subTest(width=width, height=height, angle=angle, mirror=mirror):
                 points = landmarks(width, height, angle, mirror)
-                features = image_features(points, width, height)
+                features = grip_features([(point.x * width, point.y * height, point.z) for point in points])
                 self.assertEqual(features.loosely_folded, 4)
                 self.assertTrue(is_thumbs_up(points, width, height, features))
+
+    def test_relaxed_thumbs_do_not_count_as_reset(self):
+        for changes in (
+            # The thumb clears the curled tips but rests close to the knuckles.
+            {2: (244, 231), 3: (244, 203), 4: (244, 175)},
+            # The thumb clears the fist but only extends partway.
+            {3: (201, 145), 4: (194, 125)},
+        ):
+            with self.subTest(changes=changes):
+                points = landmarks()
+                for index, (x, y) in changes.items():
+                    points[index] = SimpleNamespace(x=x / 382, y=y / 406, z=0.0)
+                self.assertFalse(is_thumbs_up(points, 382, 406, FOLDED))
 
     def test_sideways_downward_bent_or_tucked_thumbs_are_not_up(self):
         self.assertFalse(is_thumbs_up(landmarks(angle=90), 382, 406, FOLDED))
@@ -74,7 +87,7 @@ class ThumbsUpTests(TestCase):
     def test_open_pinch_v_and_missing_thumb_geometry_cannot_be_thumbs_up(self):
         for features in (GripFeatures(1.1, 0, 0), GripFeatures(0.2, 1, 2), GripFeatures(1.1, 2, 2)):
             self.assertFalse(is_thumbs_up(landmarks(), 382, 406, features))
-        for index in (0, 2, 3, 4, 8, 9, 17):
+        for index in (0, 2, 3, 4, 6, 8, 9, 17):
             points = landmarks()
             points[index] = SimpleNamespace(x=float('nan'), y=0.5, z=0.0)
             self.assertFalse(is_thumbs_up(points, 382, 406, FOLDED))
@@ -125,7 +138,12 @@ class ThumbsUpTests(TestCase):
         status, (hand,) = HandTracker().update([sample], 1)
         self.assertEqual((status, hand.thumbs_up, hand.grip), ('tracking', True, 'open'))
         with patch('realsense.locate_depth', return_value=None):
-            self.assertIsNone(fuse_hand(None, np, landmarks(), [], [], depth, FOLDED))
+            sample = fuse_hand(None, np, landmarks(), [], [], depth, FOLDED)
+        self.assertIsNone(sample.pose)
+        self.assertFalse(sample.thumbs_up)
+        status, (hand,) = HandTracker().update([sample], 1)
+        self.assertEqual(status, 'tracking')
+        self.assertFalse(hand.thumbs_up)
 
     def test_thumb_up_keeps_neutral_depth_fixed_and_changes_mapping_anchor_immediately(self):
         mapper = FuzzyMapper()

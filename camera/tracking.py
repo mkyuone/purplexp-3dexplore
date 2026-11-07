@@ -1,4 +1,4 @@
-"""Associate depth-valid hand poses and classify mutually exclusive grips."""
+"""Associate current hand observations and classify mutually exclusive grips."""
 
 from dataclasses import dataclass, replace
 from itertools import product
@@ -16,6 +16,10 @@ AMBIGUOUS_MATCH_MARGIN = 0.028
 MIN_PALM_SEPARATION = 0.045
 TRACK_TIMEOUT = 0.24
 REACQUIRE_DISTANCE_M = 0.085
+MAX_IMAGE_TRAVEL = 0.10
+REACQUIRE_IMAGE_TRAVEL = 0.055
+MIN_IMAGE_PALM_SEPARATION = 0.06
+IMAGE_MATCH_PENALTY = 0.03
 PINCH_START_GAP_M = 0.032
 PINCH_END_GAP_M = 0.052
 PINCH_START_RATIO = 0.42
@@ -28,6 +32,8 @@ OPTICAL_PINCH_HOLD_RATIO = 0.38
 OPTICAL_PINCH_OPEN_RATIO = 0.50
 OPTICAL_WORLD_START_RATIO = 0.34
 OPTICAL_WORLD_HOLD_RATIO = 0.52
+OPTICAL_CLEAR_OPEN_RATIO = 0.60
+OPTICAL_WORLD_CLEAR_OPEN_RATIO = 0.60
 GRIP_RELEASE_CONFIRM_SECONDS = 0.065
 PINCH_CLEAR_OPEN_GAP_M = 0.072
 PINCH_CLEAR_OPEN_RATIO = 0.76
@@ -42,7 +48,7 @@ class GripFeatures:
 
 @dataclass(frozen=True)
 class Candidate:
-    pose: Pose
+    pose: Pose | None
     side: str | None
     features: GripFeatures
     pinch_gap: float | None
@@ -56,7 +62,7 @@ class Candidate:
 @dataclass(frozen=True)
 class Hand:
     id: str
-    pose: Pose
+    pose: Pose | None
     grip: Grip
     pointing: bool
     # Unmirrored normalized aim in the aligned RGB image.
@@ -67,7 +73,7 @@ class Hand:
 @dataclass(frozen=True)
 class Track:
     hand: Hand
-    palm: Vec3
+    palm: Vec3 | None
     side: str | None
     pinch_since: float | None = None
     pinch_evidence_at: float | None = None
@@ -75,6 +81,7 @@ class Track:
     published: bool = True
     observed_at: float | None = None
     interrupted: bool = False
+    image_palm: Vec2 | None = None
 
 
 def grip_features(points: list[Vec3]) -> GripFeatures | None:
@@ -103,19 +110,22 @@ def grip_features(points: list[Vec3]) -> GripFeatures | None:
 
 
 def classify_grip(candidate: Candidate, previous: Grip = 'open') -> Grip:
-    if candidate.thumbs_up:
+    if candidate.thumbs_up and candidate.pose is not None:
         return 'open'
     features = candidate.features
-    gap = candidate.pinch_gap
+    gap = candidate.pinch_gap if candidate.pose is not None else None
     if previous == 'fist':
         return 'fist' if features.loosely_folded >= 3 else 'open'
+    if previous == 'pinch' and clear_pinch_opening(candidate):
+        return 'open'
     if previous != 'pinch' and features.folded == 4:
         return 'fist'
     if gap is None:
         # Both optical estimates must agree. An actual measured gap takes
         # precedence when both fingertips have depth.
         ratio = valid_optical_ratio(candidate)
-        if ratio is None or not candidate.pose.valid() or features.folded == 4 or features.loosely_folded == 4:
+        if (ratio is None or (candidate.pose is not None and not candidate.pose.valid())
+                or features.folded == 4 or features.loosely_folded == 4):
             return 'open'
         if previous == 'pinch':
             closed = ratio <= OPTICAL_PINCH_HOLD_RATIO and 0 <= features.pinch_ratio <= OPTICAL_WORLD_HOLD_RATIO
@@ -129,13 +139,14 @@ def classify_grip(candidate: Candidate, previous: Grip = 'open') -> Grip:
 
 
 def uncertain_release(candidate: Candidate, previous: Grip) -> bool:
-    if candidate.thumbs_up:
+    if candidate.thumbs_up and candidate.pose is not None:
         return False
     features = candidate.features
     if previous == 'fist':
         return features.loosely_folded == 2
     gap = candidate.pinch_gap
-    if previous != 'pinch' or gap is None or not candidate.pointing or features.folded == 4:
+    if (previous != 'pinch' or candidate.pose is None or gap is None or not candidate.pointing
+            or features.folded == 4 or clear_pinch_opening(candidate)):
         return False
     if gap >= PINCH_CLEAR_OPEN_GAP_M or features.pinch_ratio >= PINCH_CLEAR_OPEN_RATIO:
         return False
@@ -165,24 +176,33 @@ def valid_optical_ratio(candidate: Candidate) -> float | None:
     return ratio
 
 
+def clear_pinch_opening(candidate: Candidate) -> bool:
+    ratio = valid_optical_ratio(candidate)
+    world_ratio = candidate.features.pinch_ratio
+    return (ratio is not None and ratio >= OPTICAL_CLEAR_OPEN_RATIO
+            and isfinite(world_ratio) and world_ratio >= OPTICAL_WORLD_CLEAR_OPEN_RATIO
+            and candidate.features.loosely_folded < 4)
+
+
 def blend_image(start: Vec2, end: Vec2, alpha: float) -> Vec2:
     return start[0] + (end[0] - start[0]) * alpha, start[1] + (end[1] - start[1]) * alpha
 
 
 def match_cost(sample: Candidate, track: Track) -> float | None:
-    if track.interrupted and not same_reacquired_hand(sample, track):
-        return None
-    distance = dist(sample.pose.palm, track.palm)
-    if distance > MAX_HAND_TRAVEL:
-        return None
     side_changed = sample.side is not None and track.side is not None and sample.side != track.side
-    return distance + (0.045 if side_changed else 0)
-
-
-def same_reacquired_hand(sample: Candidate, track: Track) -> bool:
-    return dist(sample.pose.palm, track.palm) <= REACQUIRE_DISTANCE_M and (
-        sample.side is None or track.side is None or sample.side == track.side
-    )
+    if sample.pose is not None and track.palm is not None:
+        distance = dist(sample.pose.palm, track.palm)
+        limit = REACQUIRE_DISTANCE_M if track.interrupted else MAX_HAND_TRAVEL
+        if distance > limit or (track.interrupted and side_changed):
+            return None
+        return distance + (0.045 if side_changed else 0)
+    # The cursor changes between fingertip and palm. Identity always compares
+    # current palm anchors, with a tighter gate when the hand was absent.
+    if side_changed or not valid_image(sample.image_palm) or not valid_image(track.image_palm):
+        return None
+    distance = dist(sample.image_palm, track.image_palm)
+    limit = REACQUIRE_IMAGE_TRAVEL if track.interrupted else MAX_IMAGE_TRAVEL
+    return distance + IMAGE_MATCH_PENALTY if distance <= limit else None
 
 
 class HandTracker:
@@ -238,12 +258,21 @@ class HandTracker:
         if len(samples) > 2:
             self.reset()
             return 'ambiguous', ()
-        observed = [sample for sample in samples if sample is not None and sample.pose.valid()]
+        observed = [sample for sample in samples if sample is not None and (
+            sample.pose.valid() if sample.pose is not None else valid_image(sample.image_palm)
+        )]
         if not observed:
             return self.pause(at, 'ambiguous' if len(samples) > 1 else 'lost')
-        if len(observed) == 2 and dist(observed[0].pose.palm, observed[1].pose.palm) < MIN_PALM_SEPARATION:
-            self.reset()
-            return 'ambiguous', ()
+        if len(observed) == 2:
+            first, second = observed
+            if first.pose is not None and second.pose is not None:
+                separated = dist(first.pose.palm, second.pose.palm) >= MIN_PALM_SEPARATION
+            else:
+                separated = (valid_image(first.image_palm) and valid_image(second.image_palm)
+                             and dist(first.image_palm, second.image_palm) >= MIN_IMAGE_PALM_SEPARATION)
+            if not separated:
+                self.reset()
+                return 'ambiguous', ()
         if self.last_at is not None and at - self.last_at >= TRACK_TIMEOUT:
             self.reset()
         self.tracks = tuple(
@@ -264,19 +293,22 @@ class HandTracker:
             previous_grip = previous.hand.grip if previous else 'open'
             grip = classify_grip(sample, previous_grip)
             features = sample.features
-            thumbs_up = sample.thumbs_up and valid_image(sample.image_palm)
+            measured = sample.pose
+            pointing = measured is not None and sample.pointing
+            gap = sample.pinch_gap if measured is not None else None
+            thumbs_up = measured is not None and sample.thumbs_up and valid_image(sample.image_palm)
             optical_aim = valid_image(sample.image_index)
             optical_ratio = valid_optical_ratio(sample)
             optically_open = optical_ratio is not None and optical_ratio >= OPTICAL_PINCH_OPEN_RATIO
-            optical_pinch = sample.pinch_gap is None and grip == 'pinch'
+            optical_pinch = gap is None and grip == 'pinch'
             private_candidate = not previous.published if previous else optical_pinch
             pinch_since = None
             pinch_evidence_at = None
             release_since = None
             pinch_without_gap = (
-                previous_grip == 'pinch' and sample.pinch_gap is None and features.folded < 4
+                measured is not None and previous_grip == 'pinch' and gap is None and features.folded < 4
                 and not optical_pinch and not optically_open and not thumbs_up
-                and (features.pinch_ratio < PINCH_END_RATIO if sample.pointing
+                and (features.pinch_ratio < PINCH_END_RATIO if pointing
                      else optical_aim and features.pinch_ratio <= PINCH_START_RATIO)
             )
             if pinch_without_gap:
@@ -298,17 +330,21 @@ class HandTracker:
                 if at - release_since < GRIP_RELEASE_CONFIRM_SECONDS:
                     grip = previous_grip
                     pinch_evidence_at = previous.pinch_evidence_at
-            clearly_open = (grip == 'open' and features.loosely_folded < 3
-                            and (optically_open or features.pinch_ratio >= PINCH_END_RATIO
-                                 or sample.pinch_gap is not None and sample.pinch_gap >= PINCH_CLEAR_OPEN_GAP_M))
+            clearly_open = grip == 'open' and (
+                clear_pinch_opening(sample) or (features.loosely_folded < 3 and (
+                    optically_open or features.pinch_ratio >= PINCH_END_RATIO
+                    or gap is not None and gap >= PINCH_CLEAR_OPEN_GAP_M
+                ))
+            )
             # A hand first seen already closed has no neutral observation to
             # publish. Keep its identity private until it confirms or opens.
             published = not (private_candidate and grip == 'open' and not (clearly_open or thumbs_up))
-            if published and not sample.pointing and grip != 'fist' and not (optical_pinch or pinch_without_gap or thumbs_up):
+            if published and not pointing and grip != 'fist' and not (optical_pinch or pinch_without_gap or thumbs_up):
                 if not optical_aim or not clearly_open:
                     continue
 
-            tip, palm = sample.pose.tip, sample.pose.palm
+            tip = measured.tip if measured is not None else None
+            palm = measured.palm if measured is not None else None
             palm_anchor = grip == 'fist' or thumbs_up
             image = sample.image_palm if palm_anchor else sample.image_index
             if not valid_image(image):
@@ -316,10 +352,11 @@ class HandTracker:
             if previous:
                 old = previous.hand
                 identifier = old.id
-                palm = blend(old.pose.palm, palm, alpha)
                 old_palm_anchor = old.grip == 'fist' or old.thumbs_up
-                if not palm_anchor and not old_palm_anchor and sample.pointing and old.pointing:
-                    tip = blend(old.pose.tip, tip, alpha)
+                if palm is not None and old.pose is not None:
+                    palm = blend(old.pose.palm, palm, alpha)
+                    if tip is not None and not palm_anchor and not old_palm_anchor and pointing and old.pointing:
+                        tip = blend(old.pose.tip, tip, alpha)
                 if image is not None and old.image is not None and palm_anchor == old_palm_anchor:
                     image = blend_image(old.image, image, alpha)
             else:
@@ -327,12 +364,13 @@ class HandTracker:
                 identifier = f'hand-{self.next_id}'
 
             side = sample.side if sample.side is not None else previous.side if previous else None
-            # Optical-only aiming carries the measured palm as its physical anchor.
-            pose = Pose(tip if not palm_anchor and sample.pointing else palm, palm)
-            hand = Hand(identifier, pose, grip, sample.pointing, image, thumbs_up)
+            pose = None
+            if palm is not None:
+                pose = Pose(tip if tip is not None and not palm_anchor and pointing else palm, palm)
+            hand = Hand(identifier, pose, grip, pointing, image, thumbs_up)
             next_tracks.append(Track(
-                hand, sample.pose.palm, side, pinch_since, pinch_evidence_at, release_since,
-                published, at,
+                hand, measured.palm if measured is not None else None, side, pinch_since, pinch_evidence_at,
+                release_since, published, at, image_palm=sample.image_palm,
             ))
 
         hands = tuple(track.hand for track in sorted(next_tracks, key=lambda track: track.hand.id) if track.published)

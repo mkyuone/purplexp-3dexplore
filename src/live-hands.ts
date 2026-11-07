@@ -2,10 +2,8 @@ import type { HandPose, PoseFrame } from './gestures';
 
 export type HandNavigation = 'fuzzy' | 'calibrated';
 
-export type HandCameraSelection = { source: 'rgb'; tracker: string; fps: number };
-export type HandCameraSettings = HandCameraSelection & {
-  sources: { value: string; label: string }[];
-  trackers: { value: string; label: string; available: boolean; reason?: string }[];
+export type HandCameraSettings = {
+  fps: number;
   frameRates: number[];
   applying: boolean;
   error?: string;
@@ -30,14 +28,9 @@ const poseUrl = import.meta.env?.VITE_HAND_POSE_URL || 'http://127.0.0.1:4182/po
 function readCameraSettings(value: unknown): HandCameraSettings {
   if (!value || typeof value !== 'object') throw new Error('The local hand camera returned invalid settings.');
   const settings = value as HandCameraSettings;
-  const choice = (item: { value?: unknown; label?: unknown }) => item && typeof item.value === 'string' && typeof item.label === 'string';
-  if (settings.source !== 'rgb' || typeof settings.tracker !== 'string'
-    || !Number.isSafeInteger(settings.fps) || settings.fps <= 0 || typeof settings.applying !== 'boolean'
-    || !Array.isArray(settings.sources) || !settings.sources.every(choice)
-    || !Array.isArray(settings.trackers) || !settings.trackers.every(item => choice(item) && typeof item.available === 'boolean')
-    || !Array.isArray(settings.frameRates) || !settings.frameRates.every(fps => Number.isSafeInteger(fps) && fps > 0)
-    || !settings.sources.some(item => item.value === settings.source)
-    || !settings.trackers.some(item => item.value === settings.tracker)
+  const isCaptureRate = (fps: unknown) => fps === 30 || fps === 60;
+  if (!isCaptureRate(settings.fps) || typeof settings.applying !== 'boolean'
+    || !Array.isArray(settings.frameRates) || !settings.frameRates.every(isCaptureRate)
     || !settings.frameRates.includes(settings.fps)) {
     throw new Error('The local hand camera returned invalid settings.');
   }
@@ -45,11 +38,7 @@ function readCameraSettings(value: unknown): HandCameraSettings {
   const finiteMetric = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
   const handCount = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
   return {
-    source: settings.source, tracker: settings.tracker, fps: settings.fps,
-    sources: settings.sources.map(({ value, label }) => ({ value, label })),
-    trackers: settings.trackers.map(({ value, label, available, reason }) => ({
-      value, label, available, reason: typeof reason === 'string' ? reason : undefined,
-    })),
+    fps: settings.fps,
     frameRates: settings.frameRates,
     applying: settings.applying, error: typeof settings.error === 'string' ? settings.error : undefined,
     diagnostics: metrics && typeof metrics === 'object' ? {
@@ -59,12 +48,13 @@ function readCameraSettings(value: unknown): HandCameraSettings {
   };
 }
 
-async function cameraSettingsRequest(selection: HandCameraSelection | undefined, signal: AbortSignal): Promise<HandCameraSettings> {
+async function cameraSettingsRequest(fps: number | undefined, signal: AbortSignal): Promise<HandCameraSettings> {
+  const updating = fps !== undefined;
   const response = await fetch(new URL('./settings', new URL(poseUrl, window.location.href)), {
-    method: selection ? 'POST' : 'GET', cache: 'no-store',
-    ...(selection ? {
+    method: updating ? 'POST' : 'GET', cache: 'no-store',
+    ...(updating ? {
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ source: 'rgb', tracker: selection.tracker, fps: selection.fps }),
+      body: JSON.stringify({ source: 'rgb', tracker: 'mediapipe', fps }),
     } : {}),
     signal: AbortSignal.any([signal, AbortSignal.timeout(2200)]),
   });
@@ -78,8 +68,8 @@ export function fetchHandCameraSettings(signal: AbortSignal) {
   return cameraSettingsRequest(undefined, signal);
 }
 
-export function applyHandCameraSettings(selection: HandCameraSelection, signal: AbortSignal) {
-  return cameraSettingsRequest(selection, signal);
+export function applyHandCameraSettings(fps: number, signal: AbortSignal) {
+  return cameraSettingsRequest(fps, signal);
 }
 
 export function handDisplayKey() {

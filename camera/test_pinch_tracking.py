@@ -30,6 +30,33 @@ class PinchTrackingTests(TestCase):
         self.assertEqual(held.grip, 'pinch')
         return tracker, held, closed
 
+    def test_agreeing_open_landmarks_release_even_if_measured_gap_stays_small(self):
+        tracker, held, closed = self.pinch()
+        disagreeing = replace(closed, optical_pinch_ratio=.63)
+        _, (still_held,) = tracker.update([disagreeing], 1.12)
+        self.assertEqual(still_held.grip, 'pinch')
+        opening = replace(disagreeing, features=GripFeatures(.62, 1, 2))
+        _, (released,) = tracker.update([opening], 1.16)
+        self.assertEqual((released.id, released.grip), (held.id, 'open'))
+
+    def test_fresh_rgb_only_pinch_confirms_and_releases_with_other_fingers_curled(self):
+        tracker = HandTracker()
+        closed = replace(optical_sample(), pose=None)
+        self.assertEqual(tracker.update([closed], 1), ('lost', ()))
+        self.assertEqual(tracker.update([closed], 1.02), ('lost', ()))
+        status, (held,) = tracker.update([closed], 1.04)
+        self.assertEqual((status, held.grip), ('tracking', 'pinch'))
+        self.assertIsNone(held.pose)
+
+        no_current_closure = replace(closed, optical_pinch_ratio=None)
+        self.assertEqual(tracker.update([no_current_closure], 1.08), ('lost', ()))
+        opening = replace(closed, optical_pinch_ratio=.65, features=GripFeatures(.62, 3, 3))
+        status, (released,) = tracker.update([opening], 1.12)
+        self.assertEqual((status, released.id, released.grip), ('tracking', held.id, 'open'))
+        self.assertIsNone(released.pose)
+        _, (still_open,) = tracker.update([opening], 1.16)
+        self.assertEqual(still_open.grip, 'open')
+
     def test_open_to_pinch_requires_brief_continuous_measured_confirmation(self):
         tracker = HandTracker()
         tracker.update([sample()], 1.00)

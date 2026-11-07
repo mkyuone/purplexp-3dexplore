@@ -1,5 +1,5 @@
 from dataclasses import replace
-from math import isclose
+from math import exp, isclose
 from unittest import TestCase
 
 from calibration import Pose
@@ -77,6 +77,40 @@ class FuzzyMappingTests(TestCase):
         self.assertEqual(mapper.update(invalid, 1.08), ())
         returned, = mapper.update([hand(x=0.7)], 1.12)
         self.assertLess(returned.x, 0.3)
+
+    def test_image_only_hands_cannot_establish_or_bias_the_measured_neutral(self):
+        mapper = FuzzyMapper()
+        image_only = replace(hand('rgb', x=0.6), pose=None, pointing=False)
+        fallback, = mapper.update([image_only], 1)
+        self.assertAlmostEqual(fallback.x, 1 - soft_axis(0.6, IMAGE_LEFT, IMAGE_RIGHT))
+        self.assertEqual((fallback.id, fallback.depth, fallback.depth_valid), ('rgb', 0, False))
+        self.assertIsNone(mapper.neutral_depth_m)
+
+        _, measured = mapper.update([image_only, hand('measured', depth=0.7)], 1.1)
+        self.assertTrue(measured.depth_valid)
+        self.assertAlmostEqual(mapper.neutral_depth_m, 0.7)
+        mapper.update([image_only, hand('measured', depth=0.9)], 1.2)
+        self.assertAlmostEqual(mapper.neutral_depth_m, 0.7 + 0.2 * (1 - exp(-0.1 / 1.8)))
+
+    def test_xy_smoothing_continues_as_measured_depth_disappears_and_returns(self):
+        mapper = FuzzyMapper()
+        mapper.update([hand(depth=0.7)], 1)
+        measured, = mapper.update([hand(depth=0.82, grip='pinch')], 1.04)
+        dropout = replace(hand(x=0.55, y=0.52, grip='pinch'), pose=None, pointing=False)
+        fallback, = mapper.update([dropout], 1.08)
+        target_x = 1 - soft_axis(0.55, IMAGE_LEFT, IMAGE_RIGHT)
+        self.assertLess(target_x, fallback.x)
+        self.assertLess(fallback.x, measured.x)
+        self.assertGreater(fallback.y, measured.y)
+        self.assertEqual((fallback.depth, fallback.depth_valid), (0, False))
+        self.assertEqual(mapper.update([dropout], 1.08), (fallback,))
+
+        returned, = mapper.update([hand(x=0.56, y=0.53, depth=0.82, grip='pinch')], 1.12)
+        self.assertLess(1 - soft_axis(0.56, IMAGE_LEFT, IMAGE_RIGHT), returned.x)
+        self.assertLess(returned.x, fallback.x)
+        self.assertTrue(returned.depth_valid)
+        self.assertAlmostEqual(returned.depth, measured.depth)
+        self.assertAlmostEqual(mapper.neutral_depth_m, 0.7)
 
     def test_still_hand_noise_is_damped_in_image_position_and_depth(self):
         mapper = FuzzyMapper()

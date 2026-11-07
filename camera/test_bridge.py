@@ -148,6 +148,37 @@ class CalibrationBridgeTests(TestCase):
             self.assertEqual(service.poses(display)['status'], 'ready')
             self.assertEqual(service.poses(display, 'calibrated')['status'], 'calibration')
 
+    def test_rgb_only_fist_publishes_xy_in_fuzzy_and_calibrated_waits_for_measured_depth(self):
+        display = '1280x720@1'
+        feed = StubFeed()
+        points = []
+        for target in TARGETS:
+            feed.set_target(target)
+            points.append(feed.history[-1].calibration_pose)
+        measured = replace(feed.history[-1].hands[0], image=(0.6, 0.5), grip='fist', pointing=False)
+        feed.replace_sample(-1, hands=(replace(measured, pose=None),), calibration_pose=None)
+
+        with TemporaryDirectory() as folder, patch('server.monotonic', lambda: feed.now):
+            profiles = Profiles(Path(folder) / 'profiles.json')
+            profiles.save(f'camera:profile|{display}', fit(points))
+            service = CameraService(feed, profiles)
+            fuzzy = service.poses(display)
+            self.assertEqual((fuzzy['status'], fuzzy['tracking']), ('ready', 'tracking'))
+            hand, = fuzzy['hands']
+            self.assertEqual(hand['id'], measured.id)
+            self.assertLess(hand['x'], 0.5)
+            self.assertEqual((hand['depth'], hand['depthValid'], hand['fist']), (0, False, True))
+            self.assertIsNone(service.fuzzy.neutral_depth_m)
+            calibrated = service.poses(display, 'calibrated')
+            self.assertEqual((calibrated['status'], calibrated['tracking'], calibrated['hands']), ('ready', 'lost', []))
+
+            feed.now += 0.04
+            feed.set_target(TARGETS[-1])
+            feed.replace_sample(-1, hands=(measured,))
+            self.assertTrue(service.poses(display)['hands'][0]['depthValid'])
+            hand, = service.poses(display, 'calibrated')['hands']
+            self.assertEqual((hand['id'], hand['depthValid'], hand['fist']), (measured.id, True, True))
+
     def test_off_center_capture_finishes_with_corner_depth(self):
         display = '1280x720@1'
         feed = StubFeed()

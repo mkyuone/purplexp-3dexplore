@@ -16,19 +16,20 @@ class SettingsFeed(StubFeed):
         super().__init__()
         self.options = CameraOptions()
         self.changes = 0
+        self.model_available = True
 
     def configure(self, options):
         self.options = options
         self.changes += 1
 
     def settings(self):
+        tracker = {'value': 'mediapipe', 'label': 'MediaPipe Full', 'available': self.model_available}
+        if not self.model_available:
+            tracker['reason'] = 'Install the MediaPipe Full model.'
         return {
             **self.options.to_dict(), 'applying': self.changes > 0,
             'sources': [{'value': 'rgb', 'label': 'RGB'}],
-            'trackers': [
-                {'value': 'mediapipe', 'label': 'MediaPipe', 'available': True},
-                {'value': 'rtmpose', 'label': 'RTMPose', 'available': False, 'reason': 'Install the RTMPose models.'},
-            ], 'frameRates': [30, 60],
+            'trackers': [tracker], 'frameRates': [30, 60],
         }
 
 
@@ -51,12 +52,14 @@ class CameraSettingsTests(TestCase):
         with TemporaryDirectory() as directory:
             path = Path(directory) / 'settings.json'
             self.assertEqual(load_options(path), CameraOptions())
-            options = CameraOptions('rgb', 'rtmpose', 60)
+            options = CameraOptions('rgb', 'mediapipe', 60)
             save_options(path, options)
             self.assertEqual(load_options(path), options)
             path.write_text('{"source":"ir1","tracker":"mercury","fps":60}')
             self.assertEqual(load_options(path), CameraOptions('rgb', 'mediapipe', 60))
             path.write_text('{"source":"rgb","tracker":"mediapipe-lite","fps":60}')
+            self.assertEqual(load_options(path), CameraOptions('rgb', 'mediapipe', 60))
+            path.write_text('{"source":"rgb","tracker":"rtmpose","fps":60}')
             self.assertEqual(load_options(path), CameraOptions('rgb', 'mediapipe', 60))
             path.write_text('{"source":"ir1","tracker":"mercury","fps":true}')
             self.assertEqual(load_options(path), CameraOptions())
@@ -67,8 +70,9 @@ class CameraSettingsTests(TestCase):
             service = CameraService(SettingsFeed(), Profiles(Path(directory) / 'profiles.json'), path)
             selected = CameraOptions('rgb', 'mediapipe', 60)
             service.settings(selected.to_dict())
-            with self.assertRaisesRegex(ValueError, 'Install the RTMPose'):
-                service.settings(CameraOptions('rgb', 'rtmpose', 60).to_dict())
+            service.feed.model_available = False
+            with self.assertRaisesRegex(ValueError, 'Install the MediaPipe Full'):
+                service.settings(CameraOptions('rgb', 'mediapipe', 30).to_dict())
             self.assertEqual(service.feed.changes, 1)
             self.assertEqual(load_options(path), selected)
             self.assertEqual(service.settings()['source'], 'rgb')
@@ -87,9 +91,11 @@ class CameraSettingsTests(TestCase):
             self.assertEqual(service.feed.changes, 0)
             status, _, _ = request(service, 'POST', '/settings', payload=['ir1'])
             self.assertEqual(status, 400)
-            status, _, result = request(service, 'POST', '/settings', payload={'source': 'rgb', 'tracker': 'mediapipe-lite', 'fps': 60})
-            self.assertEqual(status, 400)
-            self.assertIn('supported hand tracker', loads(result)['message'])
+            for tracker in ('mediapipe-lite', 'rtmpose'):
+                payload = {'source': 'rgb', 'tracker': tracker, 'fps': 60}
+                status, _, result = request(service, 'POST', '/settings', payload=payload)
+                self.assertEqual(status, 400)
+                self.assertIn('supported hand tracker', loads(result)['message'])
             self.assertEqual(service.feed.changes, 0)
             status, _, result = request(service, 'POST', '/settings', payload=CameraOptions('rgb', 'mediapipe', 60).to_dict())
             result = loads(result)

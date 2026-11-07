@@ -20,7 +20,7 @@ class CameraOptions:
     def from_dict(cls, value: object) -> 'CameraOptions':
         if not isinstance(value, dict) or set(value) != {'source', 'tracker', 'fps'}:
             raise ValueError('Choose a hand tracker and frame rate.')
-        if value['source'] != 'rgb' or value['tracker'] not in ('mediapipe', 'rtmpose'):
+        if value['source'] != 'rgb' or value['tracker'] != 'mediapipe':
             raise ValueError('Choose RGB and a supported hand tracker.')
         if type(value['fps']) is not int or value['fps'] not in (30, 60):
             raise ValueError('Choose 30 or 60 frames per second.')
@@ -36,7 +36,7 @@ def load_options(path: Path) -> CameraOptions:
         if isinstance(value, dict):
             if value.get('source') == 'ir1' or value.get('tracker') == 'mercury':
                 value = value | {'source': 'rgb', 'tracker': 'mediapipe'}
-            elif value.get('tracker') == 'mediapipe-lite':
+            elif value.get('tracker') in ('mediapipe-lite', 'rtmpose'):
                 value = value | {'tracker': 'mediapipe'}
         return CameraOptions.from_dict(value)
     except FileNotFoundError:

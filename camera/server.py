@@ -238,7 +238,7 @@ class CameraService:
                     self.fuzzy.reset()
                     self.fuzzy_session = info.session
                 hands = [{
-                    'id': hand.id, 'x': hand.x, 'y': hand.y, 'depth': hand.depth, 'depthValid': True,
+                    'id': hand.id, 'x': hand.x, 'y': hand.y, 'depth': hand.depth, 'depthValid': hand.depth_valid,
                     'pinched': hand.grip == 'pinch' and not hand.thumbs_up,
                     'fist': hand.grip == 'fist' and not hand.thumbs_up, 'thumbsUp': hand.thumbs_up,
                 } for hand in self.fuzzy.update(frame.hands, frame.at)]
@@ -250,7 +250,7 @@ class CameraService:
                     return calibrating()
                 hands = []
                 for hand in frame.hands:
-                    if not hand.pointing and hand.grip != 'fist' and not hand.thumbs_up:
+                    if hand.pose is None or (not hand.pointing and hand.grip != 'fist' and not hand.thumbs_up):
                         continue
                     projected = calibration.project(hand.pose)
                     if projected is not None:

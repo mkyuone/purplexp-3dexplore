@@ -165,7 +165,7 @@ test('joinAnywhere still requires neutral, matching pinch and usable hand separa
   assert.deepEqual(h.pose(), h.initial)
 })
 
-test('freezes on depth loss and ignores held newcomers, stale frames, and sequence replays', t => {
+test('freezes when the gripping hand is missing and ignores held newcomers, stale frames, and sequence replays', t => {
   let now = 1000
   t.mock.method(performance, 'now', () => now)
   const h = harness(t)
@@ -180,7 +180,7 @@ test('freezes on depth loss and ignores held newcomers, stale frames, and sequen
   assert.deepEqual(h.pose(), lastPose)
 
   const stranger = hand('stranger', 0.3, 0.4, true)
-  h.send({ ...moved, depthValid: false }, stranger)
+  h.send(stranger)
   assert.equal(h.state().status, 'holding')
   h.send({ ...stranger, x: 0.6 })
   assert.equal(h.state().held, 'wheel')
@@ -263,7 +263,7 @@ test('recent target acquisition clears on cancellation, replacement, loss and le
     { name: 'stream replacement', interrupt: h => h.controller.resetStream() },
     { name: 'viewport resize', interrupt: h => h.controller.setViewport(1600, 900) },
     { name: 'missing hand', interrupt: h => h.send() },
-    { name: 'invalid depth', interrupt: h => h.send({ ...open, depthValid: false }) },
+    { name: 'malformed depth', interrupt: h => h.send({ ...open, depth: NaN, depthValid: false }) },
     { name: 'outside viewport', interrupt: h => h.send({ ...open, x: 1.01 }) },
     { name: 'new hand ID', interrupt: h => h.send({ ...miss, id: 'other' }) },
     { name: 'travel beyond the tolerance', interrupt: h => h.send({ ...open, x: 0.9 }) },
@@ -376,6 +376,132 @@ test('a part stays frozen through loss, rebases on return, and releases on an op
   h.send({ ...returned, pinched: false })
   assert.equal(h.state().held, null)
   assert.equal(h.edits.length, 1)
+})
+
+test('an RGB-only pinch moves in XY, rebases through depth changes and releases after tracking loss', t => {
+  const h = harness(t, { liveTracking: true })
+  const open = { ...hand('first', 0.3, 0.4), depthValid: false }
+  const pinch = { ...open, pinched: true }
+  const expected = (x: number, y: number, z: number) => h.initial.position.clone().add(new Vector3(x, y, z))
+  h.send(open)
+  assert.equal(h.state().hovered, 'wheel')
+  h.send(pinch)
+  h.send({ ...pinch, x: 0.4, y: 0.5 })
+  assertVector(h.pose().position, expected(0.1, -0.1, 0))
+
+  const measured = { ...pinch, x: 0.5, y: 0.5, depthValid: true, depth: 0.45 }
+  h.send(measured)
+  assertVector(h.pose().position, expected(0.2, -0.1, 0))
+  h.send({ ...measured, depth: 0.6 })
+  assertVector(h.pose().position, expected(0.2, -0.1, 0.15))
+
+  const rgbAgain = { ...pinch, x: 0.6, y: 0.5 }
+  h.send(rgbAgain)
+  assertVector(h.pose().position, expected(0.3, -0.1, 0.15))
+  h.sendLost()
+  assert.deepEqual(h.state().activeHands, [])
+  h.send({ ...rgbAgain, x: 0.7 })
+  assert.deepEqual(h.state().activeHands, ['first'])
+  assertVector(h.pose().position, expected(0.3, -0.1, 0.15))
+  h.send({ ...rgbAgain, x: 0.75 })
+  assertVector(h.pose().position, expected(0.35, -0.1, 0.15))
+
+  h.sendLost()
+  h.send({ ...open, x: 0.75 })
+  assert.equal(h.state().held, null)
+  assert.equal(h.edits.length, 1)
+  h.send({ ...pinch, x: 0.75 })
+  assert.equal(h.state().held, 'wheel')
+  h.send({ ...open, x: 0.75, depthValid: true, depth: -0.2 })
+  assert.equal(h.state().held, null)
+  assert.equal(h.edits.length, 2)
+  assertVector(h.pose().position, expected(0.35, -0.1, 0.15))
+})
+
+test('an RGB-only fist keeps orbiting while depth zoom pauses and rebases', t => {
+  const h = harness(t, { liveTracking: true })
+  const open = { ...hand('first', 0.3, 0.4), depthValid: false }
+  const fist = { ...open, fist: true }
+  h.send(open)
+  h.send(fist)
+  h.send({ ...fist, x: 0.5 })
+  assert.equal(h.state().target, 'view')
+  assertVector(h.camera.orbit, new Vector3(0.195, 0, 0))
+  assert.equal(h.camera.zoom, 1)
+
+  const measured = { ...fist, x: 0.6, depthValid: true, depth: 0.4 }
+  h.send(measured)
+  assertVector(h.camera.orbit, new Vector3(0.295, 0, 0))
+  assert.equal(h.camera.zoom, 1)
+  h.send({ ...measured, depth: 0.506 })
+  assert.ok(Math.abs(h.camera.zoom - Math.exp(0.2)) < 1e-8)
+
+  h.send({ ...fist, x: 0.7 })
+  assertVector(h.camera.orbit, new Vector3(0.395, 0, 0))
+  assert.ok(Math.abs(h.camera.zoom - Math.exp(0.2)) < 1e-8)
+  h.sendLost()
+  const returned = { ...measured, x: 0.8, depth: -0.3 }
+  h.send(returned)
+  assertVector(h.camera.orbit, new Vector3(0.395, 0, 0))
+  assert.ok(Math.abs(h.camera.zoom - Math.exp(0.2)) < 1e-8)
+  h.send({ ...returned, x: 0.9, depth: -0.194 })
+  assertVector(h.camera.orbit, new Vector3(0.49, 0, 0))
+  assert.ok(Math.abs(h.camera.zoom - Math.exp(0.4)) < 1e-8)
+})
+
+test('a mixed-depth pair scales and rotates in XY and restores spatial depth without a jump', t => {
+  const h = harness(t, { joinAnywhere: true })
+  const open = { ...hand('first', 0.3, 0.4), depthValid: false }
+  const pinch = { ...open, pinched: true }
+  const secondOpen = hand('second', 0.6, 0.4, false, 0.45)
+  h.send(open, secondOpen)
+  h.send(pinch, secondOpen)
+  h.send(pinch, { ...secondOpen, pinched: true })
+  assert.equal(h.state().status, 'both')
+
+  const left = { ...pinch, x: 0.25, y: 0.5 }
+  const right = { ...secondOpen, x: 0.65, y: 0.5, pinched: true, depth: 0.8 }
+  h.send(left, right)
+  const flat = h.pose()
+  assertVector(flat.position, h.initial.position.clone().add(new Vector3(0, -0.1, 0)))
+  assert.ok(Math.abs(flat.scale - 4 / 3) < 1e-8)
+
+  const measured = { ...left, depthValid: true, depth: -0.15 }
+  h.send(measured, right)
+  assert.deepEqual(h.pose(), flat)
+  h.send({ ...measured, depth: -0.05 }, { ...right, depth: 0.9 })
+  const translated = h.pose()
+  assertVector(translated.position, flat.position.clone().add(new Vector3(0, 0, 0.1)))
+  assert.ok(Math.abs(translated.scale - flat.scale) < 1e-8)
+
+  const top = { ...measured, x: 0.45, y: 0.3, depth: 0.3 }
+  const bottom = { ...right, x: 0.45, y: 0.7, depthValid: false, depth: 0 }
+  h.send(top, bottom)
+  const rotated = h.pose()
+  assertVector(rotated.position, translated.position)
+  assertVector(new Vector3(1, 0, 0).applyQuaternion(rotated.rotation), new Vector3(0, -1, 0))
+  assert.ok(Math.abs(rotated.scale - translated.scale) < 1e-8)
+  h.send({ ...top, depthValid: false, depth: 0 }, { ...bottom, depthValid: true, depth: 0.8 })
+  assert.deepEqual(h.pose(), rotated)
+  h.send(top, { ...bottom, depthValid: true, depth: 0.8 })
+  assert.deepEqual(h.pose(), rotated)
+})
+
+test('a pair separated only in depth preserves scale when it switches to XY', t => {
+  const h = harness(t, { joinAnywhere: true })
+  const first = hand('first', 0.4, 0.4, false, -0.15)
+  const second = hand('second', 0.4, 0.4, false, 0.15)
+  h.send(first, second)
+  h.send({ ...first, pinched: true }, second)
+  h.send({ ...first, pinched: true }, { ...second, pinched: true })
+  assert.equal(h.state().status, 'both')
+  const rgb = { ...first, pinched: true, depthValid: false, depth: 0 }
+  const moved = { ...second, pinched: true, x: 0.6 }
+  h.send(rgb, moved)
+  assertVector(h.pose().position, h.initial.position.clone().add(new Vector3(0.1, 0, 0)))
+  assert.equal(h.pose().scale, 1)
+  h.send(rgb, { ...moved, x: 0.8 })
+  assert.ok(Math.abs(h.pose().scale - 2) < 1e-8)
 })
 
 test('a live hand returning with the same ID can resume past the simulator grace', t => {
@@ -918,6 +1044,8 @@ test('a 1.5-second thumbs-up freezes a grip and resets once until its owner rele
   h.controller.resetStream()
   h.resetSequence()
   thumb = { ...thumb, id: 'renamed' }
+  h.send(first, thumb)
+  h.send(first, { ...thumb, thumbsUp: false, depthValid: false })
   for (let index = 0; index < 32; index++) {
     now += 100
     h.send(first, thumb)
@@ -931,6 +1059,24 @@ test('a 1.5-second thumbs-up freezes a grip and resets once until its owner rele
   }
   assert.equal(resets, 2)
   assert.deepEqual(h.pose(), frozen)
+})
+
+test('a thumbs-up without measured depth cannot reset or start orbiting', t => {
+  let now = 1000
+  let resets = 0
+  t.mock.method(performance, 'now', () => now)
+  const h = harness(t, { liveTracking: true, onReset: () => { resets++ } })
+  const open = { ...hand('first', 0.3, 0.4), depthValid: false }
+  const thumb = { ...open, thumbsUp: true }
+  h.send(open)
+  h.send(thumb)
+  assert.equal(h.state().target, null)
+  for (let index = 0; index < RESET_HOLD_MS / 100; index++) {
+    now += 100
+    h.send(thumb)
+  }
+  assert.equal(h.state().resetProgress, 0)
+  assert.equal(resets, 0)
 })
 
 test('two thumbs-up choose a stable deterministic owner and changing owner restarts the countdown', t => {
