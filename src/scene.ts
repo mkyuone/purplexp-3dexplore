@@ -8,6 +8,8 @@ import {
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import type { CadAssembly, CadMesh, CadOccurrence } from './cad';
 import type { ObjectPose } from './gestures';
+import { makeHeadFloorGrid } from './head-floor-grid';
+import { applyHeadProjection, type ViewerOffset } from './head-projection';
 import { CALIBRATION_INSET_X, CALIBRATION_INSET_Y } from './reach';
 
 type OccurrenceMesh = Mesh<BufferGeometry, MeshStandardMaterial | MeshStandardMaterial[]>;
@@ -32,6 +34,14 @@ interface SceneModel {
 }
 
 interface CameraFrame { position: Vector3; target: Vector3 }
+interface HeadView {
+  target: Vector2;
+  applied: Vector2;
+  held: boolean;
+  release: { from: Vector2; at: number } | null;
+  layoutDirty: boolean;
+  onApplied?: (renderedAt: number) => void;
+}
 
 export type CameraView = 'front' | 'side' | 'isometric';
 export type SceneContextStatus = 'lost' | 'restored';
@@ -43,6 +53,15 @@ const cameraDirections: Record<CameraView, Vector3> = {
   side: new Vector3(1, 0, 0),
   isometric: new Vector3(0.82, 0.48, 1.25).normalize(),
 };
+const HEAD_SCREEN_FIT_RATIO = 0.58;
+const HEAD_RELEASE_MS = 160;
+const HEAD_RENDER_DELTA_SQ = 0.0005 ** 2;
+const HEAD_GRID_FLOOR_GAP = 0.012;
+
+function headOffsetChanged({ target, applied }: HeadView) {
+  if (target.x === 0 && target.y === 0) return applied.x !== 0 || applied.y !== 0;
+  return target.distanceToSquared(applied) >= HEAD_RENDER_DELTA_SQ;
+}
 
 function makeGeometry(mesh: CadMesh) {
   const geometry = new BufferGeometry();
@@ -122,6 +141,11 @@ function makeStudioMap(renderer: WebGLRenderer) {
 export class CadScene {
   private readonly world = new Scene();
   private readonly camera = new PerspectiveCamera(34, 1, 0.01, 1000);
+  private readonly viewerCamera = new PerspectiveCamera(34, 1, 0.01, 1000);
+  private renderedCamera = this.camera;
+  private headView: HeadView | null = null;
+  private headFloorGrid: ReturnType<typeof makeHeadFloorGrid> | null = null;
+  private screenDistance = 7;
   private readonly renderer: WebGLRenderer;
   private studioMap: WebGLRenderTarget | null = null;
   private readonly observer: ResizeObserver;
@@ -129,6 +153,7 @@ export class CadScene {
   private readonly target = new Vector3();
   private readonly raycaster = new Raycaster();
   private readonly ndc = new Vector2();
+  private readonly interactionSize = new Vector2();
   private readonly picks: Array<{ x: number; y: number; id: string | null }> = [];
   private readonly keyLight = new DirectionalLight(0xfffaf4, 2.1);
   private readonly ambientLight = new HemisphereLight(0xf2f3ff, 0x918a9f);
@@ -251,6 +276,7 @@ export class CadScene {
     this.undoStack.length = 0;
     this.ground.position.y = floorHeight;
     this.floorGlow.position.y = floorHeight - 0.008;
+    if (this.headFloorGrid) this.headFloorGrid.position.y = floorHeight - HEAD_GRID_FLOOR_GAP;
     this.applyFraming(framing);
     this.geometryChanged();
     disposeModel(previous);
@@ -319,6 +345,7 @@ export class CadScene {
     const aspectChanged = this.camera.aspect !== aspect;
     this.camera.aspect = aspect;
     this.camera.updateProjectionMatrix();
+    if (this.headView) this.headView.layoutDirty = true;
     if (aspectChanged && this.fitOnResize && this.model.meshes.length) {
       this.fit();
       return;
@@ -369,6 +396,7 @@ export class CadScene {
   private applyFraming({ position, target }: CameraFrame) {
     this.target.copy(target);
     this.camera.position.copy(position);
+    this.screenDistance = position.distanceTo(target) * HEAD_SCREEN_FIT_RATIO;
     this.fitOnResize = true;
     this.aimCamera();
   }
@@ -409,20 +437,89 @@ export class CadScene {
   private aimCamera() {
     this.camera.lookAt(this.target);
     this.camera.updateMatrixWorld();
+    if (this.headView) this.headView.layoutDirty = true;
+  }
+
+  setHeadPerspective(enabled: boolean) {
+    if (enabled === Boolean(this.headView)) return;
+    if (enabled) {
+      this.headView = {
+        target: new Vector2(),
+        applied: new Vector2(),
+        held: false,
+        release: null,
+        layoutDirty: true,
+      };
+      if (!this.headFloorGrid) {
+        this.headFloorGrid = makeHeadFloorGrid();
+        this.headFloorGrid.position.y = this.ground.position.y - HEAD_GRID_FLOOR_GAP;
+        this.world.add(this.headFloorGrid);
+      }
+      this.headFloorGrid.visible = true;
+    } else {
+      this.headView = null;
+      if (this.headFloorGrid) this.headFloorGrid.visible = false;
+    }
+    this.requestRender(true);
+  }
+
+  setViewerOffset({ x, y }: ViewerOffset, onApplied?: (renderedAt: number) => void) {
+    const view = this.headView;
+    if (!view || !Number.isFinite(x) || !Number.isFinite(y)) return;
+    view.target.set(MathUtils.clamp(x, -0.18, 0.18), MathUtils.clamp(y, -0.12, 0.12));
+    if (view.held || !headOffsetChanged(view)) {
+      view.onApplied = undefined;
+      return;
+    }
+    view.onApplied = view.release ? undefined : onApplied;
+    this.requestRender();
+  }
+
+  setHeadGripHeld(held: boolean) {
+    const view = this.headView;
+    if (!view || view.held === held) return;
+    view.held = held;
+    view.onApplied = undefined;
+    view.release = null;
+    if (!held && headOffsetChanged(view)) {
+      view.release = { from: view.applied.clone(), at: performance.now() };
+      this.requestRender();
+    }
+  }
+
+  private updateHeadCamera(time: number, view: HeadView) {
+    const layoutDirty = view.layoutDirty;
+    view.layoutDirty = false;
+
+    const { release } = view;
+    const moving = !view.held && (release !== null || headOffsetChanged(view));
+    if (moving) {
+      if (release) {
+        const progress = MathUtils.clamp((time - release.at) / HEAD_RELEASE_MS, 0, 1);
+        view.applied.lerpVectors(release.from, view.target, progress * (2 - progress));
+        if (progress === 1) view.release = null;
+      } else {
+        view.applied.copy(view.target);
+      }
+    }
+    if (moving || layoutDirty) {
+      applyHeadProjection(this.viewerCamera, this.camera, this.screenDistance, view.applied);
+      this.picks.length = 0;
+    }
   }
 
   private castRay(x: number, y: number) {
-    this.raycaster.setFromCamera(this.ndc.set(x * 2 - 1, 1 - y * 2), this.camera);
+    this.raycaster.setFromCamera(this.ndc.set(x * 2 - 1, 1 - y * 2), this.renderedCamera);
   }
 
   screenPoint(x: number, y: number, reference: Vector3, depth = 0) {
-    const towardViewer = new Vector3(0, 0, 1).applyQuaternion(this.camera.quaternion);
+    const camera = this.renderedCamera;
+    const towardViewer = new Vector3(0, 0, 1).applyQuaternion(camera.quaternion);
     this.castRay(x, y);
     const plane = new Plane().setFromNormalAndCoplanarPoint(towardViewer, reference);
     const point = this.raycaster.ray.intersectPlane(plane, new Vector3()) ?? reference.clone();
-    const referenceDistance = Math.abs(this.camera.position.clone().sub(reference).dot(towardViewer));
-    const width = 2 * referenceDistance * Math.tan(MathUtils.degToRad(this.camera.fov / 2))
-      * this.camera.aspect;
+    const referenceDistance = Math.abs(camera.position.clone().sub(reference).dot(towardViewer));
+    const width = camera.getViewSize(referenceDistance, this.interactionSize).x;
     return point.addScaledVector(towardViewer, depth * width);
   }
 
@@ -601,10 +698,22 @@ export class CadScene {
   private requestRender(picksChanged = false) {
     if (picksChanged) this.picks.length = 0;
     if (this.contextLost || this.frame !== null) return;
-    this.frame = requestAnimationFrame(() => {
+    this.frame = requestAnimationFrame((time) => {
       this.frame = null;
-      this.renderer.render(this.world, this.camera);
+      const view = this.headView;
+      if (view) this.updateHeadCamera(time, view);
+      const camera = view ? this.viewerCamera : this.camera;
+      if (this.renderedCamera !== camera) this.picks.length = 0;
+      this.renderer.render(this.world, camera);
+      this.renderedCamera = camera;
       this.modelMatricesDirty = false;
+      if (view?.release) {
+        this.requestRender();
+      } else if (view?.onApplied) {
+        const notify = view.onApplied;
+        view.onApplied = undefined;
+        notify(performance.now());
+      }
     });
   }
 
@@ -641,6 +750,8 @@ export class CadScene {
     this.canvas.removeEventListener('webglcontextrestored', this.handleContextRestored);
     if (this.frame !== null) cancelAnimationFrame(this.frame);
     this.undoStack.length = 0;
+    this.headFloorGrid?.geometry.dispose();
+    this.headFloorGrid?.material.dispose();
     disposeModel(this.model);
     this.floorGlow.geometry.dispose();
     this.floorGlow.material.dispose();

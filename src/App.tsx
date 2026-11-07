@@ -10,6 +10,7 @@ import { applyHandCameraSettings, calibrateHands, connectLiveHands, fetchHandCam
 import { attachVisitorControls } from './visitor-controls';
 import { CalibrationPanel } from './calibration-panel';
 import { CameraPreview } from './camera-preview';
+import { HeadPerspectivePanel, useHeadPerspective } from './head-perspective-panel';
 
 const startingModelName = 'Ultraviolet Full Car.step';
 const query = new URLSearchParams(window.location.search);
@@ -189,6 +190,7 @@ export function App() {
   const [selected, setSelected] = useState<string | null>(null);
   const [pose, setPose] = useState<GestureState | null>(null);
   const [, setRevision] = useState(0);
+  const headPerspective = useHeadPerspective(runtime, setupOpen);
   const calibrating = calibrationProgress !== null;
   const calibrationDisplayChanged = calibrating && liveStatus.display !== undefined && liveStatus.display !== calibrationProgress.display;
   const matchingCalibrationPoll = liveStatus.phase === 'calibration' && liveStatus.display === calibrationProgress?.display
@@ -259,6 +261,7 @@ export function App() {
     }
     const gestures = new GestureController(scene, state => {
       runtime.current?.simulator?.setJoinTarget(state.join);
+      scene.setHeadGripHeld(state.held !== null);
       setSelected(scene.getSelected());
       setPose(state);
       if (state.target) setHasExplored(true);
@@ -474,7 +477,8 @@ export function App() {
   const panning = pose?.target === 'view' && pose.status === 'both';
   const resetProgress = showPose && !loading && !graphicsIssue ? Math.max(0, Math.min(1, pose?.resetProgress ?? 0)) : 0;
   const resetSeconds = Math.max(0.1, (1 - resetProgress) * RESET_HOLD_MS / 1000).toFixed(1);
-  const visibleHint = !resetProgress && !setupOpen && !calibrating && exhibit && !contextLost && (calibrationSaved || !hasExplored) && (!simulationMode || enabled);
+  const immersiveHeadView = headPerspective.enabled && !setupOpen;
+  const visibleHint = !immersiveHeadView && !resetProgress && !setupOpen && !calibrating && exhibit && !contextLost && (calibrationSaved || !hasExplored) && (!simulationMode || enabled);
   const hint = calibrationSaved ? 'Calibration saved. Point at the model to try it.'
     : handsEnabled ? visitorCue(pose, simulationMode) : 'Drag to look around. Tap a part to inspect it.';
 
@@ -500,7 +504,7 @@ export function App() {
           <progress value={resetProgress} max={1} aria-hidden="true" />
         </div>
       </div>}
-      {operatorMode && liveEnabled && previewVisible && !calibrating && <CameraPreview className="navigation-preview" display={liveStatus.display ?? handDisplayKey()} />}
+      {operatorMode && liveEnabled && previewVisible && !calibrating && !immersiveHeadView && <CameraPreview className="navigation-preview" display={liveStatus.display ?? handDisplayKey()} />}
       {!setupOpen && !calibrating && (stageMessage || !exhibit) && <div className="stage-message">
         {stageMessage}
         {!exhibit && !loading && !graphicsIssue && <div className="empty-stage">
@@ -536,6 +540,7 @@ export function App() {
         <button ref={setupClose} className="button icon-button" type="button" aria-label="Close setup" onClick={closeSetup}><X size={20} /></button>
       </div>
       <div className="setup-scroll" onDragOver={event => { if (event.dataTransfer.types.includes('Files')) event.preventDefault(); }} onDrop={onDrop}>
+        {operatorMode && <HeadPerspectivePanel controls={headPerspective} unavailable={!!graphicsIssue || !exhibit} />}
         {operatorMode && <section className="panel" aria-label="Live hand camera">
           <div className="panel-heading"><h2>Hand camera</h2>
             <button className="button" type="button" onClick={toggleLive}>{liveEnabled ? 'Disconnect' : 'Connect'}</button>

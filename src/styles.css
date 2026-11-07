@@ -257,6 +257,20 @@ kbd { display: inline-block; padding: 2px 5px; background: #2c2339; border: 1px 
 .camera-diagnostics div { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 8px; }
 .camera-diagnostics dt { color: var(--muted); }
 .camera-diagnostics dd { margin: 0; color: var(--text); overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.head-camera-actions { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 10px; margin-top: 12px; }
+.head-camera-actions .navigation-choice { margin-top: 0; }
+.head-camera-actions select { width: 100%; min-width: 0; }
+.head-camera-preview {
+  display: block;
+  width: min(100%, 224px);
+  aspect-ratio: 4 / 3;
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #171220;
+  object-fit: contain;
+  transform: scaleX(-1);
+}
 
 @media (max-width: 550px) {
   .explorer.is-setup-open { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(125px, 42svh) minmax(0, 1fr); }
