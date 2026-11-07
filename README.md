@@ -27,7 +27,7 @@ python camera/download_rgb_models.py
 python -B camera/server.py --model .runtime/camera/hand_landmarker.task
 ```
 
-Open the [operator view](http://localhost:4180/?operator=1), then use **Setup → Hand camera → Connect**. It starts in **Fuzzy · no calibration** mode with a live mirrored camera preview. Use **Show live camera preview** in Setup to hide or show it while navigating. Close Setup and bring one relaxed open hand into view. Move it across the central camera area to aim, pinch to move a part, or make a fist to orbit. With that fist held, pull your hand toward yourself to zoom in and push it toward the camera to zoom out. Add a second pinch to resize and rotate a part. The cursor is mirrored and smoothed, with a small dead zone to reduce jitter. Depth adapts while your hands are open and stays fixed during a grip.
+Open the [operator view](http://localhost:4180/?operator=1), then use **Setup → Hand camera → Connect**. It starts in **Fuzzy · no calibration** mode with a live mirrored camera preview. Use **Show live camera preview** in Setup to hide or show it while navigating. Close Setup and bring one relaxed open hand into view. Move it across the central camera area to aim, pinch to move a part, or make a fist to orbit. With one fist held, pull your hand toward yourself to zoom in and push it toward the camera to zoom out. Move two fists together to pan the view. Add a second pinch to resize and rotate a part. The cursor is mirrored and smoothed, with a small dead zone to reduce jitter. Depth adapts while your hands are open and stays fixed during a grip.
 
 A short tracking interruption pauses the held part or view. Returning the same grip resumes from that position. If you move out of frame, come back and hold a pinch over a part to grab it again. When one hand drops out during a two-hand grip, the hand still in view can keep moving the part.
 
@@ -51,8 +51,8 @@ On the development server, open [the simulator](http://localhost:4180/?simulate=
 
 - Aim at a component with the pointer or **W A S D**. Click and hold or hold **Space** to pinch. Move sideways or use **Q / E** to move the grip toward or away from you.
 - While holding the first pinch, hold **Enter** to bring in and pinch with the second hand. Use the **arrow keys** to move it, or **[ / ]** for depth. Spread or turn the two grips to scale or rotate. Release one grip to keep moving with the other.
-- Hold **V** and move to orbit from anywhere. Use **Q / E** while holding the fist to zoom with depth. **B** holds the right fist instead, with the **arrow keys** for orbit and **[ / ]** for depth. **Shift-drag** also orbits with the pointer.
-- On a touchscreen, start a drag on a component to move it, or start on empty space to orbit. Add a second finger to rotate and resize the part or zoom the view.
+- Hold **V** to orbit with the left hand and use **Q / E** to zoom. Hold **B** to orbit with the right hand and use **[ / ]** to zoom. Hold **V** and **B** together and move the hands to pan. **Shift-drag** also orbits with the pointer.
+- On a touchscreen, start a drag on a component to move it, or start on empty space to orbit. Add a second finger to rotate and resize the part or pan the view.
 - **Esc** simulates tracking loss. The part stays at its last position and requires a fresh grip. Open Setup to pause the simulator while preparing the exhibit.
 
 `npm test` checks STEP import, the startup mesh, and pose handling. `python -B -m unittest discover -s camera` checks the camera calibration and tracking logic. `npm run build` produces a static `dist/` bundle with the startup mesh and on-demand STEP importer. `npm run preview` serves that bundle on the same port when the dev server is stopped.

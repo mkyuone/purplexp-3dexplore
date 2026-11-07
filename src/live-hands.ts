@@ -24,6 +24,7 @@ export type LiveHandStatus = {
 };
 
 const poseUrl = import.meta.env?.VITE_HAND_POSE_URL || 'http://127.0.0.1:4182/poses';
+const POSE_RETRY_WINDOW_MS = 500;
 
 function readCameraSettings(value: unknown): HandCameraSettings {
   if (!value || typeof value !== 'object') throw new Error('The local hand camera returned invalid settings.');
@@ -148,6 +149,8 @@ export function connectLiveHands(options: {
   let timer: ReturnType<typeof setTimeout>;
   let sourceId: string | undefined;
   let lastSequence = -1;
+  let lastCapturedAt = -Infinity;
+  let lastContactAt = -Infinity;
   let status: LiveHandStatus = { phase: 'connecting' };
   let display: string | undefined;
 
@@ -167,7 +170,7 @@ export function connectLiveHands(options: {
       url.searchParams.set('display', currentDisplay);
       url.searchParams.set('mode', options.navigation);
       const response = await fetch(url, {
-        cache: 'no-store', signal: AbortSignal.any([session.signal, AbortSignal.timeout(800)]),
+        cache: 'no-store', signal: AbortSignal.any([session.signal, AbortSignal.timeout(sourceId === undefined ? 800 : 160)]),
       });
       if (!response.ok) throw new Error('Hand camera unavailable.');
       const value = await response.json();
@@ -179,7 +182,10 @@ export function connectLiveHands(options: {
       }
       // The bridge is still connected. Leave the controller's stall timer in
       // charge and keep polling at full speed for the next fresh pose.
-      if (value?.status === 'recovering') return;
+      if (value?.status === 'recovering') {
+        lastContactAt = performance.now();
+        return;
+      }
       const next = readStatus(value, currentDisplay);
       if (next.phase !== 'ready') {
         if (sourceId !== undefined) options.reset();
@@ -194,19 +200,29 @@ export function connectLiveHands(options: {
         || !Array.isArray(value.hands) || value.hands.length > 2 || !value.hands.every(validHand)) {
         throw new Error('Invalid hand camera frame.');
       }
+      const receivedAt = performance.now();
+      lastContactAt = receivedAt;
       if (value.ageMs >= 220) return;
       if (sourceId !== value.session) {
         sourceId = value.session;
         lastSequence = -1;
+        lastCapturedAt = -Infinity;
         options.reset();
       }
       setStatus(next);
       if (value.sequence > lastSequence) {
         lastSequence = value.sequence;
-        options.receive({ sequence: value.sequence, capturedAt: startedAt - value.ageMs, tracking: value.tracking, hands: value.hands });
+        // Age is sampled on the bridge during the request. Keep request timing
+        // jitter from making a newer capture appear older than its predecessor.
+        const capturedAt = (startedAt + receivedAt) / 2 - value.ageMs;
+        lastCapturedAt = Math.max(lastCapturedAt, capturedAt);
+        options.receive({ sequence: value.sequence, capturedAt: lastCapturedAt, tracking: value.tracking, hands: value.hands });
       }
     } catch {
       if (session.signal.aborted) return;
+      // One failed poll can recover in the same camera session. The gesture
+      // controller pauses stale motion while we wait for a fresh observation.
+      if (sourceId !== undefined && performance.now() - lastContactAt < POSE_RETRY_WINDOW_MS) return;
       if (sourceId !== undefined) options.reset();
       sourceId = undefined;
       setStatus({ phase: 'offline', display });

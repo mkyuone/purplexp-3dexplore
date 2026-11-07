@@ -54,6 +54,7 @@ interface GestureScene {
   setPose(id: string, pose: ObjectPose): void
   screenPoint(x: number, y: number, reference: Vector3, depth?: number): Vector3
   orbit(dx: number, dy: number): void
+  pan(dx: number, dy: number): void
   zoom(factor: number): void
   commitGrip(id: string, startingPose: ObjectPose): void
 }
@@ -63,12 +64,20 @@ interface PartGrip {
   original: ObjectPose
   base: ObjectPose
   startFirst: Vector3
-  startSecond: Vector3 | null
+  pair: { startSecond: Vector3; direction: Vector3; rotation: Quaternion } | null
+}
+
+interface SecondaryGrip {
+  id: string
+  observedAt: number
+  heldMs: number
+  missing: boolean
 }
 
 interface ActiveGrip {
   first: HandPose
   second: HandPose | null
+  secondaryGrip: SecondaryGrip | null
   viewAnchor: { x: number; y: number; depth: number }
   joinSide: number
   joinVertical: number
@@ -78,13 +87,14 @@ interface ActiveGrip {
 
 export const FRAME_MAX_AGE_MS = 240
 export const RESET_HOLD_MS = 1500
+export const LIVE_PINCH_CONTINUITY_MS = 320
 const MIN_HAND_SEPARATION = 0.06
 const RESUME_HAND_SEPARATION = 0.08
 const TARGET_GRACE_MS = 200
 const TARGET_GRACE_PX = 28
 const TRACKING_GRACE_MS = 150
 const CLOSED_GRIP_CONFIRM_MS = 100
-const PAIR_RECOVERY_MS = 100
+const PINCH_REIDENTIFY_DISTANCE = 0.08
 const VIEW_ORBIT_DEADZONE = 0.005
 const VIEW_DEPTH_DEADZONE = 0.006
 const VIEW_DEPTH_ZOOM_GAIN = 2
@@ -143,7 +153,7 @@ export class GestureController {
   private viewportWidth = 1000
   private viewportHeight = 1000
   private grip: ActiveGrip | null = null
-  private interruption: { capturedAt: number; receivedAt: number } | null = null
+  private interruption: { capturedAt: number; receivedAt: number; knownIds: Set<string>; allowNewId: boolean } | null = null
   private armed = new Set<string>()
   private lastSequence = -1
   private lastCapture = -Infinity
@@ -152,7 +162,7 @@ export class GestureController {
   private recovering = false
   private recoverClosed = false
   private retryPinch: string | null = null
-  private closedCandidate: { hand: HandPose; target: string | null; capturedAt: number } | null = null
+  private closedCandidate: { hand: HandPose; target: string | null; secondId?: string; capturedAt: number } | null = null
   private hovered: string[] = []
   private hoverCandidates = new Map<string, { id: string; x: number; y: number; capturedAt: number }>()
   private resetCandidate: { id: string; capturedAt: number; elapsed: number } | null = null
@@ -226,19 +236,23 @@ export class GestureController {
       return
     }
 
-    const stalled = this.state.hands.length && (receivedAt - this.lastReceivedAt >= FRAME_MAX_AGE_MS
-      || frame.capturedAt - this.lastCapture >= FRAME_MAX_AGE_MS)
+    const gap = Math.max(receivedAt - this.lastReceivedAt, frame.capturedAt - this.lastCapture)
+    const quiet = this.state.hands.length > 0 && gap >= FRAME_MAX_AGE_MS
     const interruption = this.interruption
-    const grace = this.liveTracking ? FRAME_MAX_AGE_MS : TRACKING_GRACE_MS
-    if (stalled || (interruption && (receivedAt - interruption.receivedAt >= grace
+    const continuity = this.liveTracking && this.grip?.part ? LIVE_PINCH_CONTINUITY_MS : FRAME_MAX_AGE_MS
+    const grace = this.liveTracking ? continuity : TRACKING_GRACE_MS
+    if ((quiet && gap >= continuity) || (interruption && (receivedAt - interruption.receivedAt >= grace
       || frame.capturedAt - interruption.capturedAt >= grace))) this.loseTracking()
+    const previousCapture = this.lastCapture
+    const previousReceipt = this.lastReceivedAt
     this.lastSequence = frame.sequence
     this.lastCapture = frame.capturedAt
     this.lastReceivedAt = receivedAt
     const hands = frame.hands.filter(isUsableHand)
-    if (frame.tracking === 'lost' || frame.tracking === 'ambiguous' || frame.hands.length > 2
-      || new Set(frame.hands.map(hand => hand.id)).size !== frame.hands.length) {
-      this.interruptTracking()
+    const ambiguous = frame.tracking === 'ambiguous' || frame.hands.length > 2
+      || new Set(frame.hands.map(hand => hand.id)).size !== frame.hands.length
+    if (frame.tracking === 'lost' || ambiguous) {
+      this.interruptTracking(previousCapture, previousReceipt, ambiguous)
       return
     }
 
@@ -249,10 +263,12 @@ export class GestureController {
 
     const grip = this.grip
     if (grip) {
+      const pending = grip.secondaryGrip
+      if (pending && hands.some(hand => hand.id === pending.id && !matchesGrip(grip, hand))) grip.secondaryGrip = null
       const first = hands.find(hand => hand.id === grip.first.id)
       const second = grip.second && hands.find(hand => hand.id === grip.second?.id)
-      if (this.interruption || !first || (grip.second && !second)) {
-        if ((first && isNeutral(first)) || (second && isNeutral(second))) {
+      if (this.interruption || quiet || !first || (grip.second && !second)) {
+        if ((first && !matchesGrip(grip, first)) || (second && !matchesGrip(grip, second))) {
           const remaining = [first, second].find(hand => hand && matchesGrip(grip, hand))
           this.interruption = null
           if (remaining) this.rebase(grip, remaining, null)
@@ -266,21 +282,40 @@ export class GestureController {
           && (!grip.second || (second && matchesGrip(grip, second)))) {
           this.interruption = null
           this.rebase(grip, first, second || null)
+          if (!grip.second) {
+            if (grip.secondaryGrip) grip.secondaryGrip.missing = true
+            this.tryJoin(grip, hands, [])
+          }
           this.updateState(hands)
           return
         }
-        if (this.liveTracking && grip.second && interruption
-          && (receivedAt - interruption.receivedAt >= PAIR_RECOVERY_MS
-            || frame.capturedAt - interruption.capturedAt >= PAIR_RECOVERY_MS)) {
+        if (grip.second && (this.liveTracking || !grip.part)) {
           const remaining = [first, second].find(hand => hand && matchesGrip(grip, hand))
           if (remaining) {
+            const missing = first ? grip.second : grip.first
+            grip.secondaryGrip = {
+              id: missing.id, observedAt: interruption?.capturedAt ?? previousCapture,
+              heldMs: CLOSED_GRIP_CONFIRM_MS, missing: true,
+            }
             this.interruption = null
             this.rebase(grip, remaining, null)
             this.updateState(hands)
             return
           }
         }
-        this.interruptTracking()
+        if (this.liveTracking && grip.part && !grip.second && !first && interruption?.allowNewId !== false
+          && frame.capturedAt - (interruption?.capturedAt ?? previousCapture) < LIVE_PINCH_CONTINUITY_MS) {
+          const knownIds = interruption?.knownIds ?? new Set(this.state.hands.map(hand => hand.id))
+          const nearby = hands.filter(hand => hand.id !== grip.secondaryGrip?.id && !knownIds.has(hand.id)
+            && hand.pinched && this.handAxis(grip.first, hand).lengthSq() <= PINCH_REIDENTIFY_DISTANCE ** 2)
+          if (nearby.length === 1) {
+            this.interruption = null
+            this.rebase(grip, nearby[0], null)
+            this.updateState(hands)
+            return
+          }
+        }
+        this.interruptTracking(previousCapture, previousReceipt)
         return
       }
     }
@@ -316,7 +351,7 @@ export class GestureController {
       this.updateGrip(hands, fresh)
     } else {
       for (const hand of fresh) {
-        if (this.startGrip(hand)) break
+        if (this.startGrip(hand, hands, fresh)) break
         if (this.liveTracking && hand.pinched && fresh.length === 1 && this.closedCandidate === null) this.retryPinch = hand.id
       }
       if (!this.grip && (this.recoverClosed || this.retryPinch !== null)) this.tryClosedRecovery(hands)
@@ -325,15 +360,16 @@ export class GestureController {
   }
 
   private checkTimeout() {
+    const continuity = this.liveTracking && this.grip?.part ? LIVE_PINCH_CONTINUITY_MS : FRAME_MAX_AGE_MS
     const deadline = this.interruption
-      ? this.interruption.receivedAt + (this.liveTracking ? FRAME_MAX_AGE_MS : TRACKING_GRACE_MS)
-      : this.lastReceivedAt + FRAME_MAX_AGE_MS
+      ? this.interruption.receivedAt + (this.liveTracking ? continuity : TRACKING_GRACE_MS)
+      : this.lastReceivedAt + continuity
     const remaining = deadline - performance.now()
     if (remaining <= 0) {
       this.loseTracking()
       return
     }
-    this.timeout = setTimeout(() => this.checkTimeout(), remaining)
+    this.timeout = setTimeout(() => this.checkTimeout(), Math.min(remaining, FRAME_MAX_AGE_MS))
   }
 
   private loseTracking(allowClosedRecovery = true) {
@@ -350,22 +386,27 @@ export class GestureController {
     this.updateState([])
   }
 
-  private interruptTracking() {
+  private interruptTracking(previousCapture: number, previousReceipt: number, ambiguous = false) {
     this.resetCandidate = null
     if (!this.grip) {
       this.loseTracking()
       return
     }
     if (!this.interruption) {
-      // Camera processing can delay a report. The browser gives it a full
-      // grace period while capture timestamps still bound the physical gap.
-      this.interruption = { capturedAt: this.lastCapture, receivedAt: this.lastReceivedAt }
+      // Live part grips keep their original deadline across repeated misses.
+      const livePart = this.liveTracking && this.grip.part !== null
+      this.interruption = {
+        capturedAt: livePart ? previousCapture : this.lastCapture,
+        receivedAt: livePart ? previousReceipt : this.lastReceivedAt,
+        knownIds: new Set(this.state.hands.map(hand => hand.id)), allowNewId: !ambiguous,
+      }
       clearTimeout(this.timeout)
       this.timeout = undefined
-    }
+    } else if (ambiguous) this.interruption.allowNewId = false
     this.armed.clear()
     this.hoverCandidates.clear()
     this.closedCandidate = null
+    if (this.grip.secondaryGrip) this.grip.secondaryGrip.missing = true
     if (this.timeout === undefined) this.checkTimeout()
     this.updateState([])
   }
@@ -411,7 +452,7 @@ export class GestureController {
     return true
   }
 
-  private startGrip(first: HandPose) {
+  private startGrip(first: HandPose, hands: readonly HandPose[], fresh: readonly HandPose[] = []) {
     let part: PartGrip | null = null
     if (first.pinched) {
       // Closing the fingers can move the aim just beyond the highlighted surface.
@@ -419,12 +460,12 @@ export class GestureController {
       if (!id) return false
       const pose = this.scene.getPose(id)
       if (!pose) return false
-      part = { id, original: pose, base: pose, startFirst: this.worldPoint(first, pose), startSecond: null }
+      part = { id, original: pose, base: pose, startFirst: this.worldPoint(first, pose), pair: null }
       this.scene.select(id)
     }
 
     this.grip = {
-      first, second: null, viewAnchor: { x: first.x, y: first.y, depth: first.depth },
+      first, second: null, secondaryGrip: null, viewAnchor: { x: first.x, y: first.y, depth: first.depth },
       joinSide: first.x <= 0.64 ? 1 : -1, joinVertical: first.y <= 0.5 ? 1 : -1,
       pairBlocked: false, part,
     }
@@ -433,13 +474,13 @@ export class GestureController {
     this.retryPinch = null
     this.recovering = false
     this.closedCandidate = null
+    this.tryJoin(this.grip, hands, fresh)
     return true
   }
 
-  private matchesClosedCandidate(hand: HandPose, target: string | null, requireSteadyAim: boolean) {
+  private matchesClosedCandidate(hand: HandPose, target: string | null) {
     const candidate = this.closedCandidate
     if (!candidate || candidate.hand.id !== hand.id || candidate.hand.pinched !== hand.pinched || candidate.target !== target) return false
-    if (!requireSteadyAim) return true
     const travel = Math.hypot(
       (hand.x - candidate.hand.x) * this.viewportWidth,
       (hand.y - candidate.hand.y) * this.viewportHeight,
@@ -448,9 +489,9 @@ export class GestureController {
     return travel <= TARGET_GRACE_PX && steadyDepth
   }
 
-  private confirmClosed(hand: HandPose, target: string | null, requireSteadyAim: boolean) {
-    if (!this.matchesClosedCandidate(hand, target, requireSteadyAim)) {
-      this.closedCandidate = { hand, target, capturedAt: this.lastCapture }
+  private confirmClosed(hand: HandPose, target: string | null, second?: HandPose) {
+    if (!this.matchesClosedCandidate(hand, target) || this.closedCandidate?.secondId !== second?.id) {
+      this.closedCandidate = { hand, target, secondId: second?.id, capturedAt: this.lastCapture }
       return false
     }
     return this.lastCapture - this.closedCandidate!.capturedAt >= CLOSED_GRIP_CONFIRM_MS
@@ -459,23 +500,24 @@ export class GestureController {
   private tryClosedRecovery(hands: readonly HandPose[]) {
     const closed = hands.filter(hand => this.retryPinch !== null
       ? hand.id === this.retryPinch && hand.pinched : this.recoverClosed && (hand.pinched || hand.fist))
-    if (closed.length > 1 && closed.some(hand => hand.fist)) {
+    if (closed.some(hand => hand.fist) && closed.some(hand => hand.pinched)) {
       this.closedCandidate = null
       return
     }
     const candidates = closed.map(hand => ({
       hand, target: hand.pinched ? this.scene.pick(hand.x, hand.y) : null,
     })).filter(({ hand, target }) => target !== null || hand.fist)
-    const existing = candidates.find(({ hand, target }) => this.matchesClosedCandidate(hand, target, true))
-    const sharedPart = candidates.length > 0 && candidates.every(({ hand, target }) => hand.pinched && target === candidates[0].target)
-    const selected = existing ?? (candidates.length === 1 || sharedPart
+    const existing = candidates.find(({ hand, target }) => this.matchesClosedCandidate(hand, target))
+    const sharedTarget = candidates.length > 0 && candidates.every(({ target }) => target === candidates[0].target)
+    const selected = existing ?? (sharedTarget
       ? candidates.sort((left, right) => left.hand.id.localeCompare(right.hand.id))[0] : undefined)
     if (!selected) {
       this.closedCandidate = null
       return
     }
     const { hand, target } = selected
-    if (this.confirmClosed(hand, target, true)) this.startGrip(hand)
+    const second = hand.fist ? closed.find(other => other.id !== hand.id && other.fist) : undefined
+    if (this.confirmClosed(hand, target, second)) this.startGrip(hand, hands, second ? [second] : [])
   }
 
   private updateGrip(hands: readonly HandPose[], fresh: readonly HandPose[]) {
@@ -498,8 +540,9 @@ export class GestureController {
       return
     }
 
-    const useDepth = hasDepth(first, second)
-    if (useDepth !== hasDepth(grip.first, grip.second)) {
+    const panning = second !== null && !grip.part
+    const useDepth = !panning && hasDepth(first, second)
+    if (!panning && useDepth !== hasDepth(grip.first, grip.second)) {
       if (grip.part) {
         // Keep the old XY anchors so this frame still moves in the screen plane.
         // Anchor depth to this sample so its change in availability adds no motion.
@@ -516,10 +559,17 @@ export class GestureController {
     }
 
     if (!samePosition(grip.first, first, useDepth) || (grip.second && second && !samePosition(grip.second, second, useDepth))) {
-      if (second) {
+      if (second && grip.part) {
         this.updatePair(grip, first, second)
       } else if (grip.part) {
         this.movePart(grip.part, first, null)
+      } else if (second) {
+        const anchor = grip.viewAnchor
+        const x = (first.x + second.x) / 2
+        const y = (first.y + second.y) / 2
+        if (x !== anchor.x || y !== anchor.y) this.scene.pan(x - anchor.x, y - anchor.y)
+        anchor.x = x
+        anchor.y = y
       } else {
         const anchor = grip.viewAnchor
         const dx = first.x - anchor.x
@@ -545,17 +595,39 @@ export class GestureController {
 
     grip.first = first
     grip.second = second
-    if (grip.part && !second) {
-      const join = this.joinTarget(grip)
-      const joining = hands.find(hand => hand.id !== first.id && hand.pinched)
-      if (!joining) {
-        this.closedCandidate = null
-        return
+    if (!second) this.tryJoin(grip, hands, fresh)
+  }
+
+  private tryJoin(grip: ActiveGrip, hands: readonly HandPose[], fresh: readonly HandPose[]) {
+    const first = grip.first
+    const second = hands.find(hand => hand.id !== first.id)
+    const candidate = grip.secondaryGrip
+    const grace = grip.part ? LIVE_PINCH_CONTINUITY_MS : this.liveTracking ? FRAME_MAX_AGE_MS : TRACKING_GRACE_MS
+    const recent = candidate && this.lastCapture - candidate.observedAt < grace ? candidate : null
+    if (!second || !matchesGrip(grip, second)) {
+      if (recent && (!second || second.id !== recent.id)) {
+        recent.missing = true
+        grip.secondaryGrip = recent
+      } else grip.secondaryGrip = null
+      return
+    }
+
+    let confirmed = fresh.includes(second) || (recent?.id === second.id && recent.heldMs >= CLOSED_GRIP_CONFIRM_MS)
+    if (this.liveTracking) {
+      if (!confirmed && recent?.missing && recent.heldMs >= CLOSED_GRIP_CONFIRM_MS && recent.id !== second.id) return
+      const heldMs = recent?.id === second.id
+        ? recent.heldMs + (recent.missing ? 0 : this.lastCapture - recent.observedAt) : 0
+      confirmed ||= heldMs >= CLOSED_GRIP_CONFIRM_MS
+      grip.secondaryGrip = {
+        id: second.id, observedAt: this.lastCapture,
+        heldMs: confirmed ? CLOSED_GRIP_CONFIRM_MS : heldMs, missing: false,
       }
-      const confirmed = this.liveTracking && this.confirmClosed(joining, grip.part.id, false)
-      if ((fresh.includes(joining) || confirmed)
-        && this.handAxis(first, joining).lengthSq() >= MIN_HAND_SEPARATION ** 2
-        && (this.joinAnywhere || isInsideJoin(join, joining.x, joining.y))) this.rebase(grip, first, joining)
+    }
+    const canJoin = !grip.part || (this.handAxis(first, second).lengthSq() >= MIN_HAND_SEPARATION ** 2
+      && (this.joinAnywhere || isInsideJoin(this.joinTarget(grip), second.x, second.y)))
+    if (confirmed && canJoin) {
+      grip.secondaryGrip = null
+      this.rebase(grip, first, second)
     }
   }
 
@@ -586,8 +658,12 @@ export class GestureController {
     this.closedCandidate = null
     grip.first = first
     grip.second = second
-    grip.viewAnchor = { x: first.x, y: first.y, depth: first.depth }
-    grip.pairBlocked = second !== null && this.handAxis(first, second).lengthSq() < MIN_HAND_SEPARATION ** 2
+    grip.viewAnchor = {
+      x: second ? (first.x + second.x) / 2 : first.x,
+      y: second ? (first.y + second.y) / 2 : first.y,
+      depth: first.depth,
+    }
+    grip.pairBlocked = grip.part !== null && second !== null && this.handAxis(first, second).lengthSq() < MIN_HAND_SEPARATION ** 2
     if (!second) {
       grip.joinSide = first.x <= 0.64 ? 1 : -1
       grip.joinVertical = first.y <= 0.5 ? 1 : -1
@@ -604,7 +680,12 @@ export class GestureController {
     const useDepth = hasDepth(first, second)
     part.base = pose
     part.startFirst = this.worldPoint(first, pose, useDepth)
-    part.startSecond = second && this.worldPoint(second, pose, useDepth)
+    const startSecond = second && this.worldPoint(second, pose, useDepth)
+    part.pair = startSecond && {
+      startSecond,
+      direction: startSecond.clone().sub(part.startFirst).normalize(),
+      rotation: pose.rotation,
+    }
     return true
   }
 
@@ -615,13 +696,14 @@ export class GestureController {
   private movePart(part: PartGrip, first: HandPose, second: HandPose | null, preserveOrientation = false) {
     const useDepth = hasDepth(first, second)
     const point = this.worldPoint(first, part.base, useDepth)
-    if (!second || !part.startSecond) {
+    const pair = part.pair
+    if (!second || !pair) {
       this.scene.setPose(part.id, { ...part.base, position: point.sub(part.startFirst).add(part.base.position) })
       return
     }
 
     const secondPoint = this.worldPoint(second, part.base, useDepth)
-    const midpointOffset = point.clone().add(secondPoint).sub(part.startFirst).sub(part.startSecond).multiplyScalar(0.5)
+    const midpointOffset = point.clone().add(secondPoint).sub(part.startFirst).sub(pair.startSecond).multiplyScalar(0.5)
     const position = part.base.position.clone().add(midpointOffset)
     if (preserveOrientation) {
       const current = this.scene.getPose(part.id)
@@ -629,14 +711,18 @@ export class GestureController {
       return
     }
 
-    const startAxis = part.startSecond.clone().sub(part.startFirst)
     const axis = secondPoint.sub(point)
-    const startLength = startAxis.length()
+    const startLength = pair.startSecond.distanceTo(part.startFirst)
     const length = axis.length()
     if (startLength <= 1e-8 || length <= 1e-8) return
     const scale = clamp(part.base.scale * length / startLength, Math.min(0.2, part.base.scale), Math.max(5, part.base.scale))
-    const rotation = new Quaternion().setFromUnitVectors(startAxis.divideScalar(startLength), axis.divideScalar(length))
-      .multiply(part.base.rotation)
+    // The original direction becomes ambiguous at a half turn. Compose the
+    // rotation between consecutive valid directions to carry the turn through it.
+    const direction = axis.divideScalar(length)
+    const rotation = new Quaternion().setFromUnitVectors(pair.direction, direction)
+      .multiply(pair.rotation).normalize()
+    pair.direction = direction
+    pair.rotation = rotation
     this.scene.setPose(part.id, { position, rotation, scale })
   }
 

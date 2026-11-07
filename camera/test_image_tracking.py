@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from calibration import Pose
 from realsense import CameraFeed, fuse_hand
-from tracking import Candidate, GripFeatures, Hand, HandTracker
+from tracking import Candidate, GripFeatures, Hand, HandTracker, classify_grip
 
 OPEN = GripFeatures(0.8, 0, 0)
 PINCH = GripFeatures(0.2, 1, 2)
@@ -135,6 +135,39 @@ class FusedImageTests(TestCase):
         with patch('realsense.grip_features', return_value=PINCH), patch('realsense.locate_depth', return_value=(0,.02,.7)):
             hand = fuse_hand(None, self.np, self.landmarks, [], [], self.depth)
         self.assertIsNone(hand.optical_pinch_ratio)
+
+    def test_pinch_remains_detectable_with_a_sideways_palm_on_either_hand(self):
+        for index, x, y in ((5, .49, .55), (17, .51, .55), (4, .385, .25)):
+            self.landmarks[index] = SimpleNamespace(x=x, y=y, z=0)
+        mirrored = [SimpleNamespace(x=1 - point.x, y=point.y, z=0) for point in self.landmarks]
+        for landmarks in (self.landmarks, mirrored):
+            with patch('realsense.locate_depth', return_value=None):
+                closed = fuse_hand(None, self.np, landmarks, [], [], self.depth, PINCH)
+                self.assertIsNone(closed.pose)
+                self.assertEqual(classify_grip(closed), 'pinch')
+
+                separated = list(landmarks)
+                separated[4] = SimpleNamespace(x=landmarks[4].x + .12, y=.25, z=0)
+                opened = fuse_hand(None, self.np, separated, [], [], self.depth, OPEN)
+                self.assertEqual(classify_grip(opened, 'pinch'), 'open')
+
+    def test_background_depth_at_fingertip_does_not_veto_a_visible_pinch(self):
+        self.landmarks[4] = SimpleNamespace(x=.38, y=.25, z=0)
+        palm = (0, .02, .70)
+        index = (0, .03, .70)
+        thumb_background = (.005, .03, .81)
+        thumb_pad = (.005, .03, .70)
+        for inward_thumb, expected in ((thumb_pad, 'pinch'), (thumb_background, 'open')):
+            with self.subTest(expected=expected), patch('realsense.locate_depth', side_effect=[
+                palm, palm, palm, index, thumb_background, index, inward_thumb,
+            ]):
+                hand = fuse_hand(None, self.np, self.landmarks, [], [], self.depth, PINCH)
+                self.assertEqual(classify_grip(hand), expected)
+                self.assertEqual(hand.pose.palm, palm)
+                if expected == 'pinch':
+                    self.assertIsNone(hand.pinch_gap)
+                else:
+                    self.assertGreater(hand.pinch_gap, .10)
 
     def test_missing_finger_depth_preserves_optical_aim_and_measured_palm(self):
         palm = (0,.02,.7)

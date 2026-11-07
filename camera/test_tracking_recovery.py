@@ -105,8 +105,25 @@ class TrackingRecoveryTests(TestCase):
 
     def test_partial_frame_with_ambiguous_identity_still_pauses_every_hand(self):
         tracker = HandTracker()
-        tracker.update([candidate(-.08), candidate(.08)], 1)
+        left, right = candidate(-.08), candidate(.08)
+        _, before = tracker.update([left, right], 1.00)
         self.assertEqual(tracker.update([candidate(0), None], 1.04), ('ambiguous', ()))
+        _, after = tracker.update([right, left], 1.08)
+        self.assertEqual([(hand.id, hand.grip) for hand in after], [(hand.id, 'pinch') for hand in before])
+
+    def test_overlapping_palms_pause_then_recover_both_pinches_only_within_identity_timeout(self):
+        tracker = HandTracker()
+        separated = [candidate(-.06, side='Left'), candidate(.06, side='Right')]
+        overlapping = [candidate(-.01, side='Left'), candidate(.01, side='Right')]
+        _, before = tracker.update(separated, 1.00)
+        self.assertEqual(tracker.update(overlapping, 1.04), ('ambiguous', ()))
+        _, recovered = tracker.update(separated[::-1], 1.08)
+        self.assertEqual([(hand.id, hand.grip) for hand in recovered], [(hand.id, 'pinch') for hand in before])
+
+        for at in (1.16, 1.24, 1.33):
+            self.assertEqual(tracker.update(overlapping, at), ('ambiguous', ()))
+        _, after_timeout = tracker.update(separated, 1.36)
+        self.assertTrue({hand.id for hand in before}.isdisjoint(hand.id for hand in after_timeout))
 
     def test_two_missing_frames_at_a_slower_camera_rate_can_recover_identity(self):
         tracker = HandTracker()

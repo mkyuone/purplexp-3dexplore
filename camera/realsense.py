@@ -14,7 +14,10 @@ import logging
 from calibration import MAX_DEPTH_M, MIN_DEPTH_M, Pose, Vec3, median_point, valid_point
 from estimators import is_thumbs_up
 from options import CameraOptions
-from tracking import Candidate, Hand, HandTracker, Track, Tracking, Vec2, grip_features, valid_image
+from tracking import (
+    OPTICAL_WORLD_START_RATIO, Candidate, Hand, HandTracker, Track, Tracking, Vec2,
+    grip_features, valid_image,
+)
 
 FRAME_MAX_AGE = 0.22
 CALIBRATION_WINDOW = 0.7
@@ -22,6 +25,10 @@ LEASE_SECONDS = 6.0
 PREVIEW_LEASE = 0.60
 PREVIEW_INTERVAL = 1 / 6
 RGB_SIZE = (640, 480)
+FINGERTIP_DEPTH_DISAGREEMENT_M = 0.035
+FINGERTIP_GAP_CHECK_M = 0.032
+FINGERTIP_GAP_CHECK_OPTICAL_RATIO = 0.28
+PALM_LENGTH_SCALE = 0.65
 
 
 class CameraError(RuntimeError):
@@ -175,9 +182,14 @@ def fuse_hand(rs, np, image_landmarks, world_landmarks, handedness, aligned_dept
     optical_ratio = None
     if all(0 <= image_landmarks[i].x < 1 and 0 <= image_landmarks[i].y < 1 for i in (4, 8, 5, 17)):
         thumb, finger, index_base, pinky_base = optical_points
-        palm_width = hypot(index_base[0] - pinky_base[0], index_base[1] - pinky_base[1])
-        if palm_width >= 8:
-            ratio = hypot(thumb[0] - finger[0], thumb[1] - finger[1]) / palm_width
+        palm_scale = hypot(index_base[0] - pinky_base[0], index_base[1] - pinky_base[1])
+        middle_base = image_landmarks[9]
+        if valid_image((wrist.x, wrist.y)) and valid_image((middle_base.x, middle_base.y)):
+            # The palm's width can nearly vanish when the hand turns sideways.
+            palm_length = hypot((middle_base.x - wrist.x) * width, (middle_base.y - wrist.y) * height)
+            palm_scale = max(palm_scale, palm_length * PALM_LENGTH_SCALE)
+        if palm_scale >= 8:
+            ratio = hypot(thumb[0] - finger[0], thumb[1] - finger[1]) / palm_scale
             optical_ratio = ratio if isfinite(ratio) else None
     sample = Candidate(
         None, side, features, None, False,
@@ -202,20 +214,34 @@ def fuse_hand(rs, np, image_landmarks, world_landmarks, handedness, aligned_dept
     if sum(abs(point[2] - palm[2]) <= 0.055 for point in palm_points) < 2:
         return optical_sample
 
+    def fingertip_pad(tip_index: int, joint_index: int) -> Vec3 | None:
+        target, joint = image_landmarks[tip_index], image_landmarks[joint_index]
+        inner = ((target.x + joint.x) / 2, (target.y + joint.y) / 2)
+        return locate_depth(rs, np, depth, intrinsics, units, target.x, target.y, palm[2], inner)
+
     def fingertip(tip_index: int, joint_index: int) -> Vec3 | None:
         target = image_landmarks[tip_index]
         point = locate(target.x, target.y, palm[2])
         if point is None and features.folded < 4:
             # Stereo depth is sparse at a fingertip's outline. Use measured
             # depth inside its distal segment on the same fingertip color ray.
-            joint = image_landmarks[joint_index]
-            inner = ((target.x + joint.x) / 2, (target.y + joint.y) / 2)
-            point = locate_depth(rs, np, depth, intrinsics, units, target.x, target.y, palm[2], inner)
+            return fingertip_pad(tip_index, joint_index)
         return point
 
     tip = fingertip(8, 7)
     thumb_tip = fingertip(4, 3) if tip is not None else None
     gap = dist(thumb_tip, tip) if tip is not None and thumb_tip is not None else None
+    if (tip is not None and thumb_tip is not None and gap > FINGERTIP_GAP_CHECK_M and features.loosely_folded < 4
+            and optical_ratio is not None and optical_ratio <= FINGERTIP_GAP_CHECK_OPTICAL_RATIO
+            and features.pinch_ratio <= OPTICAL_WORLD_START_RATIO):
+        # A fingertip patch can contain a coherent background surface. Only
+        # defer to RGB when a sample inside the same finger contradicts it.
+        index_pad = fingertip_pad(8, 7)
+        thumb_pad = fingertip_pad(4, 3)
+        if index_pad is not None and abs(tip[2] - index_pad[2]) > FINGERTIP_DEPTH_DISAGREEMENT_M:
+            tip, gap = index_pad, None
+        if thumb_pad is not None and abs(thumb_tip[2] - thumb_pad[2]) > FINGERTIP_DEPTH_DISAGREEMENT_M:
+            gap = None
     return replace(
         sample, pose=Pose(tip or palm, palm), pinch_gap=gap, pointing=tip is not None,
         thumbs_up=is_thumbs_up(image_landmarks, width, height, features),

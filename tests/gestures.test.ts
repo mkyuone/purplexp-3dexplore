@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { Quaternion, Vector3 } from 'three'
-import { FRAME_MAX_AGE_MS, GestureController, isInsideJoin, RESET_HOLD_MS } from '../src/gestures.ts'
+import { FRAME_MAX_AGE_MS, GestureController, isInsideJoin, LIVE_PINCH_CONTINUITY_MS, RESET_HOLD_MS } from '../src/gestures.ts'
 import type { GestureState, HandPose, ObjectPose } from '../src/gestures.ts'
 import { CALIBRATION_INSET_X, CALIBRATION_INSET_Y } from '../src/reach.ts'
 
@@ -27,7 +27,7 @@ function harness(t: { after: (cleanup: () => void) => void }, options: {
   let selected = 'assembly'
   let hover: string[] = []
   const edits: { id: string; before: ObjectPose }[] = []
-  const camera = { orbit: new Vector3(), zoom: 1 }
+  const camera = { orbit: new Vector3(), pan: new Vector3(), zoom: 1 }
   const controller = new GestureController({
     pick: options.pick ?? ((x) => x < 0.85 ? 'wheel' : null),
     select: (id) => { selected = id ?? '' },
@@ -36,6 +36,7 @@ function harness(t: { after: (cleanup: () => void) => void }, options: {
     setPose: (_id, value) => { pose = value },
     screenPoint: (x, y, reference, depth = 0) => new Vector3(x, -y, depth).add(reference),
     orbit: (dx, dy) => camera.orbit.add(new Vector3(dx, dy, 0)),
+    pan: (dx, dy) => camera.pan.add(new Vector3(dx, dy, 0)),
     zoom: (factor) => { camera.zoom *= factor },
     commitGrip: (id, before) => { edits.push({ id, before }) },
   }, value => { state = value }, options)
@@ -280,7 +281,7 @@ test('recent target acquisition clears on cancellation, replacement, loss and le
   }
 })
 
-test('one fist orbits and zooms while a second fist leaves ownership alone', t => {
+test('one fist orbits and zooms while an unarmed second fist leaves ownership alone', t => {
   const h = harness(t)
   const first = hand('first', 0.3, 0.4)
   h.send(first)
@@ -312,6 +313,97 @@ test('one fist orbits and zooms while a second fist leaves ownership alone', t =
   h.send(second)
   assert.equal(h.state().target, null)
   assert.deepEqual(h.pose(), h.initial)
+})
+
+test('two fists pan by their midpoint and one fist resumes orbit and zoom without jumping', t => {
+  const h = harness(t)
+  const first = hand('first', 0.25, 0.4)
+  const second = hand('second', 0.65, 0.4)
+  h.send(first, second)
+  const left = { ...first, fist: true }
+  const right = { ...second, fist: true }
+  h.send(left, right)
+  assert.equal(h.state().status, 'both')
+  assert.equal(h.state().target, 'view')
+  assert.deepEqual(h.state().activeHands, ['first', 'second'])
+
+  h.send({ ...left, x: 0.2, depth: 0.4 }, { ...right, x: 0.7, depth: -0.4 })
+  assertVector(h.camera.pan, new Vector3())
+  h.send({ ...left, x: 0.3, y: 0.32, depth: 0.4 }, { ...right, x: 0.8, y: 0.32, depth: 0.3 })
+  assertVector(h.camera.pan, new Vector3(0.1, -0.08, 0))
+  assertVector(h.camera.orbit, new Vector3())
+  assert.equal(h.camera.zoom, 1)
+
+  const remaining = { ...left, x: 0.5, y: 0.32, depth: 0.2 }
+  h.send(remaining, { ...right, fist: false, pinched: true })
+  assert.equal(h.state().status, 'holding')
+  assert.equal(h.state().target, 'view')
+  assert.deepEqual(h.state().activeHands, ['first'])
+  assertVector(h.camera.orbit, new Vector3())
+  assert.equal(h.camera.zoom, 1)
+  h.send({ ...remaining, x: 0.58, depth: 0.306 })
+  assertVector(h.camera.orbit, new Vector3(0.075, 0, 0))
+  assert.ok(Math.abs(h.camera.zoom - Math.exp(0.2)) < 1e-8)
+  assertVector(h.camera.pan, new Vector3(0.1, -0.08, 0))
+  h.send({ ...remaining, fist: false, pinched: true })
+  assert.equal(h.state().target, null)
+  assert.deepEqual(h.pose(), h.initial)
+})
+
+test('a live second fist confirms, drops out, and rejoins an RGB-only first fist without a camera jump', t => {
+  let now = 1000
+  t.mock.method(performance, 'now', () => now)
+  const h = harness(t, { liveTracking: true })
+  const open = { ...hand('first', 0.3, 0.4), depthValid: false }
+  const first = { ...open, fist: true }
+  const second = { ...hand('second', 0.65, 0.4, false, 0.4), fist: true }
+  h.send(open)
+  h.send(first)
+  h.send(first, second)
+  now += 99
+  h.send(first, second)
+  assert.equal(h.state().status, 'holding')
+  now += 1
+  h.send(first, second)
+  assert.equal(h.state().status, 'both')
+  h.send({ ...first, x: 0.35 }, { ...second, x: 0.7, depth: -0.4 })
+  assertVector(h.camera.pan, new Vector3(0.05, 0, 0))
+  assert.equal(h.camera.zoom, 1)
+
+  const survivor = { ...first, x: 0.45 }
+  h.send(survivor)
+  assert.deepEqual(h.state().activeHands, ['first'])
+  assertVector(h.camera.orbit, new Vector3())
+  const moved = { ...survivor, x: 0.5 }
+  h.send(moved)
+  assertVector(h.camera.orbit, new Vector3(0.045, 0, 0))
+  now += 50
+  h.send(moved, second)
+  assert.deepEqual(h.state().activeHands, ['first', 'second'])
+  assertVector(h.camera.pan, new Vector3(0.05, 0, 0))
+  assertVector(h.camera.orbit, new Vector3(0.045, 0, 0))
+  h.send({ ...moved, y: 0.5 }, { ...second, y: 0.5 })
+  assertVector(h.camera.pan, new Vector3(0.05, 0.1, 0))
+  assert.equal(h.camera.zoom, 1)
+})
+
+test('two already-closed fists confirm together when live tracking starts', t => {
+  let now = 1000
+  t.mock.method(performance, 'now', () => now)
+  const h = harness(t, { liveTracking: true })
+  const first = { ...hand('first', 0.3, 0.4), fist: true }
+  const second = { ...hand('second', 0.7, 0.4), fist: true }
+  h.send(second, first)
+  now += 99
+  h.send(first, second)
+  assert.equal(h.state().target, null)
+  now += 1
+  h.send(second, first)
+  assert.equal(h.state().status, 'both')
+  assert.equal(h.state().target, 'view')
+  assert.deepEqual(h.state().activeHands, ['second', 'first'])
+  assertVector(h.camera.pan, new Vector3())
+  assertVector(h.camera.orbit, new Vector3())
 })
 
 test('a delayed camera loss report leaves time to rebase at the frozen view', t => {
@@ -526,6 +618,73 @@ test('a live hand returning with the same ID can resume past the simulator grace
   assertVector(h.pose().position, frozen.position.clone().add(new Vector3(0.05, 0, 0)))
 })
 
+test('a nearby renamed pinch survives a quiet 260 ms gap and keeps the part outside its hit target', t => {
+  let now = 1000
+  t.mock.method(performance, 'now', () => now)
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const h = harness(t, { liveTracking: true })
+  const open = hand('first', 0.8, 0.4)
+  const pinch = { ...open, pinched: true }
+  h.send(open)
+  h.send(pinch)
+  h.send({ ...pinch, x: 0.84 })
+  const frozen = h.pose()
+
+  now += 260
+  t.mock.timers.tick(260)
+  assert.equal(h.state().held, 'wheel')
+  assert.equal(h.edits.length, 0)
+  const renamed = { ...pinch, id: 'new', x: 0.88, depthValid: false }
+  h.send(renamed)
+  assert.deepEqual(h.state().activeHands, ['new'])
+  assert.deepEqual(h.pose(), frozen)
+  h.send({ ...renamed, x: 0.93 })
+  assertVector(h.pose().position, frozen.position.clone().add(new Vector3(0.05, 0, 0)))
+  h.send({ ...renamed, pinched: false })
+  assert.equal(h.state().held, null)
+  assert.equal(h.edits.length, 1)
+})
+
+test('a late loss report cannot extend the live pinch beyond its last reliable capture', t => {
+  let now = 1000
+  t.mock.method(performance, 'now', () => now)
+  const h = harness(t, { liveTracking: true })
+  const open = hand('first', 0.8, 0.4)
+  const pinch = { ...open, pinched: true }
+  h.sendAged(170, open)
+  h.sendAged(170, pinch)
+  now += 100
+  h.sendLost()
+  assert.equal(h.state().held, 'wheel')
+  now += LIVE_PINCH_CONTINUITY_MS - 270
+  h.send({ ...pinch, x: 0.86 })
+  assert.equal(h.state().held, null)
+  assert.equal(h.edits.length, 1)
+  assert.deepEqual(h.pose(), h.initial)
+})
+
+test('a known nearby hand or two competing new IDs cannot take over a lost pinch', t => {
+  let now = 1000
+  t.mock.method(performance, 'now', () => now)
+  const h = harness(t, { liveTracking: true, joinAnywhere: true })
+  const open = hand('first', 0.4, 0.4)
+  const other = hand('other', 0.45, 0.4)
+  const pinch = { ...open, pinched: true }
+  h.send(open, other)
+  h.send(pinch, other)
+  now += 40
+  h.sendLost()
+  h.send({ ...other, pinched: true })
+  assert.deepEqual(h.state().activeHands, [])
+  now += 40
+  h.send({ ...pinch, id: 'new-one', x: 0.37 }, { ...pinch, id: 'new-two', x: 0.44 })
+  assert.deepEqual(h.state().activeHands, [])
+  assert.equal(h.state().held, 'wheel')
+  h.send(open)
+  assert.equal(h.state().held, null)
+  assert.equal(h.edits.length, 1)
+})
+
 test('a fresh live connection confirms a closed exact target and a reconnect rebases with a new ID', t => {
   let now = 1000
   t.mock.method(performance, 'now', () => now)
@@ -611,7 +770,7 @@ test('a closed hand after a live tracking loss has to confirm a fresh exact targ
   h.send({ ...closed, x: 0.4 })
   const frozen = h.pose()
   h.sendLost()
-  now += FRAME_MAX_AGE_MS + 1
+  now += LIVE_PINCH_CONTINUITY_MS + 1
   const returned = hand('new-id', 0.9, 0.4, true)
   const otherOpen = hand('other', 0.92, 0.4)
   h.send(returned, otherOpen)
@@ -642,7 +801,7 @@ test('a neutral survivor does not prevent a privately confirming pinch from retu
   h.send(open)
   h.send({ ...open, pinched: true })
   h.sendLost()
-  now += FRAME_MAX_AGE_MS + 1
+  now += LIVE_PINCH_CONTINUITY_MS + 1
   const survivor = hand('other', 0.95, 0.4)
   h.send(survivor)
   const returned = hand('new-id', 0.6, 0.4, true)
@@ -742,21 +901,69 @@ test('live secondary pinches can join after separating and recover without resta
 
   const moved = { ...first, x: 0.4 }
   h.send(moved)
-  assert.deepEqual(h.state().activeHands, [])
+  assert.deepEqual(h.state().activeHands, ['first'])
+  assert.deepEqual(h.pose(), h.initial)
+  now += 25
+  const stillMoving = { ...moved, x: 0.45 }
+  h.send(stillMoving)
+  const translated = h.pose()
+  assertVector(translated.position, h.initial.position.clone().add(new Vector3(0.05, 0, 0)))
   now += 50
-  h.send(moved, second)
+  h.send(stillMoving, second)
+  assert.equal(h.state().status, 'both')
+  assert.deepEqual(h.pose(), translated)
+
+  h.send(stillMoving)
+  now += 100
+  h.send(stillMoving)
+  assert.equal(h.state().status, 'holding')
+  assert.deepEqual(h.state().activeHands, ['first'])
+  assert.deepEqual(h.pose(), translated)
+  h.send({ ...stillMoving, x: 0.5 })
+  assertVector(h.pose().position, h.initial.position.clone().add(new Vector3(0.1, 0, 0)))
+  assert.equal(h.edits.length, 0)
+})
+
+test('a live second pinch retains confirmation across a missing frame without counting that gap', t => {
+  let now = 1000
+  t.mock.method(performance, 'now', () => now)
+  const h = harness(t, { liveTracking: true, joinAnywhere: true })
+  const open = hand('first', 0.3, 0.4)
+  const first = { ...open, pinched: true }
+  const second = { ...hand('second', 0.65, 0.4, true), depthValid: false }
+  h.send(open)
+  h.send(first, second)
+  now += 60
+  h.send(first, second)
+  now += 40
+  h.send(first)
+  now += 100
+  h.send(first, second)
+  assert.equal(h.state().status, 'holding')
+  now += 39
+  h.send(first, second)
+  assert.equal(h.state().status, 'holding')
+  now += 1
+  h.send(first, second)
   assert.equal(h.state().status, 'both')
   assert.deepEqual(h.pose(), h.initial)
 
-  h.send(moved)
-  now += 100
-  h.send(moved)
-  assert.equal(h.state().status, 'holding')
+  h.send(first)
+  h.send({ ...second, pinched: false })
+  h.send(first, second)
   assert.deepEqual(h.state().activeHands, ['first'])
-  assert.deepEqual(h.pose(), h.initial)
-  h.send({ ...moved, x: 0.45 })
-  assertVector(h.pose().position, h.initial.position.clone().add(new Vector3(0.05, 0, 0)))
   assert.equal(h.edits.length, 0)
+})
+
+test('two fresh live pinches join on the same frame', t => {
+  const h = harness(t, { liveTracking: true, joinAnywhere: true })
+  const first = hand('first', 0.3, 0.4)
+  const second = hand('second', 0.65, 0.4)
+  h.send(first, second)
+  h.send({ ...first, pinched: true }, { ...second, pinched: true })
+  assert.deepEqual(h.state().activeHands, ['first', 'second'])
+  assert.equal(h.state().status, 'both')
+  assert.deepEqual(h.pose(), h.initial)
 })
 
 test('reports arriving close together cannot extend a long interruption in camera time', t => {
@@ -934,6 +1141,32 @@ test('the join ring fits and can be held at each calibrated corner', t => {
         assert.equal(h.state().status, 'both')
       }
     }
+  }
+})
+
+test('a two-hand depth rotation makes a full turn through the opposite direction without snapping', t => {
+  const h = harness(t, { liveTracking: true, joinAnywhere: true })
+  const turnAxis = new Vector3(0, 1, 1).normalize()
+  const first = hand('first', 0.32, 0.5)
+  const second = hand('second', 0.68, 0.5)
+  h.send(first, second)
+  h.send({ ...first, pinched: true }, { ...second, pinched: true })
+  assert.equal(h.state().status, 'both')
+
+  const step = Math.PI / 12
+  for (let index = 1; index <= 24; index++) {
+    const before = h.pose().rotation
+    const expected = new Quaternion().setFromAxisAngle(turnAxis, index * step)
+    const span = new Vector3(0.18, 0, 0).applyQuaternion(expected)
+    h.send(
+      hand('first', 0.5 - span.x, 0.5 + span.y, true, -span.z),
+      hand('second', 0.5 + span.x, 0.5 - span.y, true, span.z),
+    )
+    const pose = h.pose()
+    assert.ok(pose.rotation.angleTo(expected) < 1e-6, `incorrect orientation at step ${index}`)
+    assert.ok(Math.abs(pose.rotation.angleTo(before) - step) < 1e-6, `rotation jumped at step ${index}`)
+    assertVector(pose.position, h.initial.position)
+    assert.ok(Math.abs(pose.scale - 1) < 1e-8)
   }
 })
 

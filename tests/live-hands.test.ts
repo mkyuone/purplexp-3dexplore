@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test, type TestContext } from 'node:test'
-import { applyHandCameraSettings, fetchHandCameraSettings } from '../src/live-hands.ts'
+import { applyHandCameraSettings, connectLiveHands, fetchHandCameraSettings } from '../src/live-hands.ts'
+import type { PoseFrame } from '../src/gestures.ts'
 
 const settings = {
   fps: 60, applying: false,
@@ -12,7 +13,10 @@ const settings = {
 
 function withWindow(t: TestContext) {
   const previous = Object.getOwnPropertyDescriptor(globalThis, 'window')
-  Object.defineProperty(globalThis, 'window', { configurable: true, value: { location: { href: 'http://localhost:4180/?operator=1' } } })
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: {
+    location: { href: 'http://localhost:4180/?operator=1' }, innerWidth: 1280, innerHeight: 720,
+    screen: { width: 1920, height: 1080 }, devicePixelRatio: 1, screenX: 0, screenY: 0,
+  } })
   t.after(() => {
     if (previous) Object.defineProperty(globalThis, 'window', previous)
     else Reflect.deleteProperty(globalThis, 'window')
@@ -71,4 +75,61 @@ test('camera hand counts accept zero and omit invalid or missing counts', async 
   assert.equal(result.diagnostics?.estimatedHands, 1)
   assert.equal(result.diagnostics?.depthHands, 0)
   assert.equal(result.diagnostics?.trackedHands, undefined)
+})
+
+test('a missed pose request and timestamp jitter preserve the active camera stream', { timeout: 1500 }, async t => {
+  withWindow(t)
+  let now = 100
+  let requests = 0
+  let resets = 0
+  let initialResets = 0
+  const frames: PoseFrame[] = []
+  const states: string[] = []
+  const received = Promise.withResolvers<void>()
+  t.mock.method(performance, 'now', () => now)
+  t.mock.method(globalThis, 'fetch', async () => {
+    requests++
+    now += 15
+    if (requests === 2) return new Response(null, { status: 503 })
+    return Response.json({
+      status: 'ready', session: 'same-camera', sequence: requests, ageMs: requests === 1 ? 5 : 60,
+      tracking: 'tracking', hands: [{ id: 'pinching', x: .5, y: .5, depth: 0, depthValid: false, pinched: true }],
+    })
+  })
+  t.after(connectLiveHands({
+    navigation: 'fuzzy', reset: () => { resets++ }, status: value => states.push(value.phase),
+    receive: frame => {
+      frames.push(frame)
+      if (frames.length === 1) initialResets = resets
+      else received.resolve()
+    },
+  }))
+  await received.promise
+  assert.deepEqual(frames.map(frame => frame.sequence), [1, 3])
+  assert.equal(frames[1].capturedAt, frames[0].capturedAt)
+  assert.equal(resets, initialResets)
+  assert.deepEqual(states, ['ready'])
+})
+
+test('a sustained request failure marks a connected camera offline and resets its stream', { timeout: 1500 }, async t => {
+  withWindow(t)
+  let now = 100
+  let requests = 0
+  let resets = 0
+  let initialResets = 0
+  const offline = Promise.withResolvers<void>()
+  t.mock.method(performance, 'now', () => now)
+  t.mock.method(globalThis, 'fetch', async () => {
+    if (requests++ === 0) return Response.json({
+      status: 'ready', session: 'same-camera', sequence: 1, ageMs: 0, tracking: 'lost', hands: [],
+    })
+    now += 600
+    throw new Error('Camera unavailable')
+  })
+  t.after(connectLiveHands({
+    navigation: 'fuzzy', reset: () => { resets++ }, receive: () => { initialResets = resets },
+    status: value => { if (value.phase === 'offline') offline.resolve() },
+  }))
+  await offline.promise
+  assert.equal(resets, initialResets + 1)
 })

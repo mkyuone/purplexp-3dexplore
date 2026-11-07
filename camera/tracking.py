@@ -20,14 +20,14 @@ MAX_IMAGE_TRAVEL = 0.10
 REACQUIRE_IMAGE_TRAVEL = 0.055
 MIN_IMAGE_PALM_SEPARATION = 0.06
 IMAGE_MATCH_PENALTY = 0.03
-PINCH_START_GAP_M = 0.032
+PINCH_START_GAP_M = 0.024
 PINCH_END_GAP_M = 0.052
 PINCH_START_RATIO = 0.42
 PINCH_END_RATIO = 0.64
 PINCH_CONFIRM_SECONDS = 0.035
 PINCH_CONFIRM_MAX_INTERVAL = TRACK_TIMEOUT
 PINCH_EVIDENCE_GRACE = 0.12
-OPTICAL_PINCH_START_RATIO = 0.28
+OPTICAL_PINCH_START_RATIO = 0.24
 OPTICAL_PINCH_HOLD_RATIO = 0.38
 OPTICAL_PINCH_OPEN_RATIO = 0.50
 OPTICAL_WORLD_START_RATIO = 0.34
@@ -144,15 +144,40 @@ def uncertain_release(candidate: Candidate, previous: Grip) -> bool:
     features = candidate.features
     if previous == 'fist':
         return features.loosely_folded == 2
-    gap = candidate.pinch_gap
-    if (previous != 'pinch' or candidate.pose is None or gap is None or not candidate.pointing
-            or features.folded == 4 or clear_pinch_opening(candidate)):
+    if previous != 'pinch' or features.folded == 4 or clear_pinch_opening(candidate):
         return False
-    if gap >= PINCH_CLEAR_OPEN_GAP_M or features.pinch_ratio >= PINCH_CLEAR_OPEN_RATIO:
+    ratio = valid_optical_ratio(candidate)
+    gap = candidate.pinch_gap if candidate.pose is not None and candidate.pointing else None
+    if features.pinch_ratio >= PINCH_CLEAR_OPEN_RATIO:
         return False
+    if gap is None:
+        # A change just outside the optical hold band can be landmark jitter.
+        # Without a usable ratio, the separate missing-evidence timer applies.
+        return ratio is not None and ratio < OPTICAL_CLEAR_OPEN_RATIO
+    if gap >= PINCH_CLEAR_OPEN_GAP_M:
+        # A fingertip depth patch can momentarily land on another surface.
+        return (ratio is not None and ratio <= OPTICAL_PINCH_HOLD_RATIO
+                and 0 <= features.pinch_ratio <= OPTICAL_WORLD_HOLD_RATIO)
     gap_closed = gap < PINCH_END_GAP_M
     ratio_closed = features.pinch_ratio < PINCH_END_RATIO
     return gap_closed != ratio_closed
+
+
+def supports_pinch_opening(features: GripFeatures, gap: float | None, optical_ratio: float | None) -> bool:
+    if features.folded == 4:
+        return False
+    measured_open = gap is not None and gap >= PINCH_END_GAP_M
+    model_open = features.pinch_ratio >= PINCH_END_RATIO
+    if optical_ratio is None:
+        return measured_open or model_open
+    # Corroborate moderate separation when RGB is available. A large gap
+    # alone can be a bad depth patch while the observed fingers stay closed.
+    return (
+        (optical_ratio >= OPTICAL_CLEAR_OPEN_RATIO and features.loosely_folded < 4)
+        or (measured_open and model_open)
+        or (optical_ratio >= OPTICAL_PINCH_OPEN_RATIO
+            and (measured_open or features.pinch_ratio > OPTICAL_WORLD_HOLD_RATIO))
+    )
 
 
 def blend(start: Vec3, end: Vec3, alpha: float) -> Vec3:
@@ -271,8 +296,7 @@ class HandTracker:
                 separated = (valid_image(first.image_palm) and valid_image(second.image_palm)
                              and dist(first.image_palm, second.image_palm) >= MIN_IMAGE_PALM_SEPARATION)
             if not separated:
-                self.reset()
-                return 'ambiguous', ()
+                return self.pause(at, 'ambiguous')
         if self.last_at is not None and at - self.last_at >= TRACK_TIMEOUT:
             self.reset()
         self.tracks = tuple(
@@ -282,9 +306,9 @@ class HandTracker:
 
         assignment = self.assignments(observed)
         if assignment is None:
-            self.reset()
-            return 'ambiguous', ()
+            return self.pause(at, 'ambiguous')
         next_tracks = []
+        suspended_pinches = []
         for sample, index in zip(observed, assignment):
             previous = self.tracks[index] if index >= 0 else None
             resuming = previous is not None and previous.interrupted
@@ -305,18 +329,21 @@ class HandTracker:
             pinch_since = None
             pinch_evidence_at = None
             release_since = None
+            recent_pinch = (
+                previous is not None and previous.pinch_evidence_at is not None
+                and at - previous.pinch_evidence_at <= PINCH_EVIDENCE_GRACE
+            )
             pinch_without_gap = (
-                measured is not None and previous_grip == 'pinch' and gap is None and features.folded < 4
-                and not optical_pinch and not optically_open and not thumbs_up
+                previous_grip == 'pinch' and gap is None and optical_ratio is None
+                and features.folded < 4 and not thumbs_up
                 and (features.pinch_ratio < PINCH_END_RATIO if pointing
                      else optical_aim and features.pinch_ratio <= PINCH_START_RATIO)
             )
             if pinch_without_gap:
-                if previous.pinch_evidence_at is None or at - previous.pinch_evidence_at > PINCH_EVIDENCE_GRACE:
+                if not recent_pinch:
                     continue
                 grip = 'pinch'
                 pinch_evidence_at = previous.pinch_evidence_at
-                release_since = previous.release_since
             elif grip == 'pinch':
                 pinch_evidence_at = at
                 if (previous is not None or optical_pinch) and previous_grip != 'pinch':
@@ -326,12 +353,22 @@ class HandTracker:
                     if at - pinch_since < PINCH_CONFIRM_SECONDS:
                         grip = 'open'
             if previous is not None and grip == 'open' and uncertain_release(sample, previous_grip):
-                release_since = previous.release_since if previous.release_since is not None else at
-                if at - release_since < GRIP_RELEASE_CONFIRM_SECONDS:
+                release_since = previous.release_since if not resuming and previous.release_since is not None else at
+                if at - release_since < GRIP_RELEASE_CONFIRM_SECONDS and (previous_grip != 'pinch' or recent_pinch):
                     grip = previous_grip
                     pinch_evidence_at = previous.pinch_evidence_at
+            released_pinch = previous is not None and previous_grip == 'pinch' and grip == 'open'
+            opening_supported = supports_pinch_opening(features, gap, optical_ratio)
+            if released_pinch and not (thumbs_up or opening_supported):
+                # The hold grace can expire without evidence that the fingers
+                # opened. Keep the ID privately, requiring fresh grip evidence
+                # to resume. Never publish or refresh the old pose.
+                suspended_pinches.append(replace(previous, interrupted=True, pinch_evidence_at=None))
+                continue
+            known_open = previous is not None and previous.published and previous_grip == 'open'
             clearly_open = grip == 'open' and (
-                clear_pinch_opening(sample) or (features.loosely_folded < 3 and (
+                released_pinch or (known_open and optical_ratio is not None and opening_supported)
+                or clear_pinch_opening(sample) or (features.loosely_folded < 3 and (
                     optically_open or features.pinch_ratio >= PINCH_END_RATIO
                     or gap is not None and gap >= PINCH_CLEAR_OPEN_GAP_M
                 ))
@@ -339,13 +376,14 @@ class HandTracker:
             # A hand first seen already closed has no neutral observation to
             # publish. Keep its identity private until it confirms or opens.
             published = not (private_candidate and grip == 'open' and not (clearly_open or thumbs_up))
-            if published and not pointing and grip != 'fist' and not (optical_pinch or pinch_without_gap or thumbs_up):
-                if not optical_aim or not clearly_open:
-                    continue
+            palm_anchor = grip == 'fist' or thumbs_up
+            if published and not pointing and not palm_anchor and (
+                not optical_aim or (grip == 'open' and not (clearly_open or optical_pinch))
+            ):
+                continue
 
             tip = measured.tip if measured is not None else None
             palm = measured.palm if measured is not None else None
-            palm_anchor = grip == 'fist' or thumbs_up
             image = sample.image_palm if palm_anchor else sample.image_index
             if not valid_image(image):
                 image = None
@@ -374,6 +412,7 @@ class HandTracker:
             ))
 
         hands = tuple(track.hand for track in sorted(next_tracks, key=lambda track: track.hand.id) if track.published)
+        next_tracks.extend(suspended_pinches)
         # A missing hand retains identity for a bounded return, but its old
         # position never appears in this frame or refreshes its observation time.
         if all(index >= 0 for index in assignment):

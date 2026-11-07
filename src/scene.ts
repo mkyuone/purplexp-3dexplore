@@ -383,6 +383,19 @@ export class CadScene {
     this.requestRender(true);
   }
 
+  pan(dx: number, dy: number) {
+    if (!Number.isFinite(dx) || !Number.isFinite(dy) || (dx === 0 && dy === 0)) return;
+    const distance = this.camera.position.distanceTo(this.target);
+    const size = this.camera.getViewSize(distance, new Vector2());
+    // Move the camera opposite the drag in screen coordinates, where y points down.
+    const offset = new Vector3(-dx * size.x, dy * size.y, 0).applyQuaternion(this.camera.quaternion);
+    this.camera.position.add(offset);
+    this.target.add(offset);
+    this.fitOnResize = false;
+    this.aimCamera();
+    this.requestRender(true);
+  }
+
   zoom(factor: number) {
     if (!(factor > 0) || !Number.isFinite(factor)) return;
     const offset = this.camera.position.clone().sub(this.target);
