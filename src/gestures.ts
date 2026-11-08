@@ -74,11 +74,17 @@ interface SecondaryGrip {
   missing: boolean
 }
 
+interface ViewPairAnchor {
+  angle: number
+  logSeparation: number
+}
+
 interface ActiveGrip {
   first: HandPose
   second: HandPose | null
   secondaryGrip: SecondaryGrip | null
   viewAnchor: { x: number; y: number; depth: number }
+  viewPair: ViewPairAnchor | null
   joinSide: number
   joinVertical: number
   pairBlocked: boolean
@@ -98,6 +104,9 @@ const PINCH_REIDENTIFY_DISTANCE = 0.08
 const VIEW_ORBIT_DEADZONE = 0.005
 const VIEW_DEPTH_DEADZONE = 0.006
 const VIEW_DEPTH_ZOOM_GAIN = 2
+const VIEW_PAIR_TURN_DEADZONE = 0.06
+const VIEW_PAIR_SPREAD_DEADZONE = 0.045
+const VIEW_PAIR_ORBIT_GAIN = 0.3
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value))
@@ -466,7 +475,7 @@ export class GestureController {
 
     this.grip = {
       first, second: null, secondaryGrip: null, viewAnchor: { x: first.x, y: first.y, depth: first.depth },
-      joinSide: first.x <= 0.64 ? 1 : -1, joinVertical: first.y <= 0.5 ? 1 : -1,
+      viewPair: null, joinSide: first.x <= 0.64 ? 1 : -1, joinVertical: first.y <= 0.5 ? 1 : -1,
       pairBlocked: false, part,
     }
     this.hoverCandidates.clear()
@@ -540,9 +549,14 @@ export class GestureController {
       return
     }
 
-    const panning = second !== null && !grip.part
-    const useDepth = !panning && hasDepth(first, second)
-    if (!panning && useDepth !== hasDepth(grip.first, grip.second)) {
+    if (!grip.part && !second) {
+      this.tryJoin(grip, hands, fresh, first)
+      if (grip.second) return
+    }
+
+    const dualView = second !== null && !grip.part
+    const useDepth = !dualView && hasDepth(first, second)
+    if (!dualView && useDepth !== hasDepth(grip.first, grip.second)) {
       if (grip.part) {
         // Keep the old XY anchors so this frame still moves in the screen plane.
         // Anchor depth to this sample so its change in availability adds no motion.
@@ -564,12 +578,7 @@ export class GestureController {
       } else if (grip.part) {
         this.movePart(grip.part, first, null)
       } else if (second) {
-        const anchor = grip.viewAnchor
-        const x = (first.x + second.x) / 2
-        const y = (first.y + second.y) / 2
-        if (x !== anchor.x || y !== anchor.y) this.scene.pan(x - anchor.x, y - anchor.y)
-        anchor.x = x
-        anchor.y = y
+        this.updateViewPair(grip, first, second)
       } else {
         const anchor = grip.viewAnchor
         const dx = first.x - anchor.x
@@ -595,11 +604,10 @@ export class GestureController {
 
     grip.first = first
     grip.second = second
-    if (!second) this.tryJoin(grip, hands, fresh)
+    if (grip.part && !second) this.tryJoin(grip, hands, fresh)
   }
 
-  private tryJoin(grip: ActiveGrip, hands: readonly HandPose[], fresh: readonly HandPose[]) {
-    const first = grip.first
+  private tryJoin(grip: ActiveGrip, hands: readonly HandPose[], fresh: readonly HandPose[], first = grip.first) {
     const second = hands.find(hand => hand.id !== first.id)
     const candidate = grip.secondaryGrip
     const grace = grip.part ? LIVE_PINCH_CONTINUITY_MS : this.liveTracking ? FRAME_MAX_AGE_MS : TRACKING_GRACE_MS
@@ -631,13 +639,48 @@ export class GestureController {
     }
   }
 
-  private handAxis(first: HandPose, second: HandPose) {
+  private handAxis(first: HandPose, second: HandPose, useDepth = hasDepth(first, second)) {
     // Depth and both screen axes are expressed in viewport widths.
     return new Vector3(
       second.x - first.x,
       (second.y - first.y) * this.viewportHeight / this.viewportWidth,
-      hasDepth(first, second) ? second.depth - first.depth : 0,
+      useDepth ? second.depth - first.depth : 0,
     )
+  }
+
+  private updateViewPair(grip: ActiveGrip, first: HandPose, second: HandPose) {
+    const axis = this.handAxis(first, second, false)
+    const separation = axis.length()
+    const pair = grip.viewPair
+    const minimum = pair ? MIN_HAND_SEPARATION : RESUME_HAND_SEPARATION
+    if (separation < minimum) {
+      grip.viewPair = null
+    } else {
+      const angle = Math.atan2(axis.y, axis.x)
+      const logSeparation = Math.log(separation)
+      const previous = this.handAxis(grip.first, grip.second!, false)
+      // A near overlap or sudden crossing can flip the angle without an intentional turn.
+      if (!pair || crossedBetweenFrames(previous, axis)) {
+        grip.viewPair = { angle, logSeparation }
+      } else {
+        const difference = angle - pair.angle
+        const angleDelta = Math.atan2(Math.sin(difference), Math.cos(difference))
+        const turn = angleDelta - clamp(angleDelta, -VIEW_PAIR_TURN_DEADZONE, VIEW_PAIR_TURN_DEADZONE)
+        const spreadDelta = logSeparation - pair.logSeparation
+        const spread = spreadDelta - clamp(spreadDelta, -VIEW_PAIR_SPREAD_DEADZONE, VIEW_PAIR_SPREAD_DEADZONE)
+        if (turn) this.scene.orbit(clamp(turn, -0.25, 0.25) * VIEW_PAIR_ORBIT_GAIN, 0)
+        if (spread) this.scene.zoom(Math.exp(clamp(spread, -0.2, 0.2)))
+        pair.angle += turn
+        pair.logSeparation += spread
+      }
+    }
+
+    const anchor = grip.viewAnchor
+    const x = (first.x + second.x) / 2
+    const y = (first.y + second.y) / 2
+    if (x !== anchor.x || y !== anchor.y) this.scene.pan(x - anchor.x, y - anchor.y)
+    anchor.x = x
+    anchor.y = y
   }
 
   private updatePair(grip: ActiveGrip, first: HandPose, second: HandPose) {
@@ -662,6 +705,14 @@ export class GestureController {
       x: second ? (first.x + second.x) / 2 : first.x,
       y: second ? (first.y + second.y) / 2 : first.y,
       depth: first.depth,
+    }
+    grip.viewPair = null
+    if (!grip.part && second) {
+      const axis = this.handAxis(first, second, false)
+      const separation = axis.length()
+      if (separation >= RESUME_HAND_SEPARATION) {
+        grip.viewPair = { angle: Math.atan2(axis.y, axis.x), logSeparation: Math.log(separation) }
+      }
     }
     grip.pairBlocked = grip.part !== null && second !== null && this.handAxis(first, second).lengthSq() < MIN_HAND_SEPARATION ** 2
     if (!second) {

@@ -327,9 +327,9 @@ test('two fists pan by their midpoint and one fist resumes orbit and zoom withou
   assert.equal(h.state().target, 'view')
   assert.deepEqual(h.state().activeHands, ['first', 'second'])
 
-  h.send({ ...left, x: 0.2, depth: 0.4 }, { ...right, x: 0.7, depth: -0.4 })
+  h.send({ ...left, depth: 0.4 }, { ...right, depth: -0.4 })
   assertVector(h.camera.pan, new Vector3())
-  h.send({ ...left, x: 0.3, y: 0.32, depth: 0.4 }, { ...right, x: 0.8, y: 0.32, depth: 0.3 })
+  h.send({ ...left, x: 0.35, y: 0.32, depth: 0.4 }, { ...right, x: 0.75, y: 0.32, depth: 0.3 })
   assertVector(h.camera.pan, new Vector3(0.1, -0.08, 0))
   assertVector(h.camera.orbit, new Vector3())
   assert.equal(h.camera.zoom, 1)
@@ -350,6 +350,63 @@ test('two fists pan by their midpoint and one fist resumes orbit and zoom withou
   assert.deepEqual(h.pose(), h.initial)
 })
 
+test('two fists orbit by tilt and zoom by spread independently without depth', t => {
+  const h = harness(t)
+  h.controller.setViewport(1200, 600)
+  const left = { ...hand('first', 0.3, 0.5), depthValid: false }
+  const right = { ...hand('second', 0.7, 0.5), depthValid: false }
+  h.send(left, right)
+  h.send({ ...left, fist: true }, { ...right, fist: true })
+
+  const sendPair = (tilt: number, radius: number, x = 0.5, y = 0.5) => {
+    const dx = radius * Math.cos(tilt)
+    const dy = radius * Math.sin(tilt) * 2
+    h.send({ ...left, x: x - dx, y: y - dy, fist: true }, { ...right, x: x + dx, y: y + dy, fist: true })
+  }
+  sendPair(0.015, 0.202)
+  assertVector(h.camera.orbit, new Vector3())
+  assert.equal(h.camera.zoom, 1)
+
+  sendPair(0.2, 0.2)
+  assert.ok(h.camera.orbit.x > 0.03)
+  assert.equal(h.camera.orbit.y, 0)
+  assert.equal(h.camera.zoom, 1)
+  assertVector(h.camera.pan, new Vector3())
+  const orbit = h.camera.orbit.clone()
+
+  sendPair(0.2, 0.24)
+  assert.ok(h.camera.zoom > 1.1)
+  const zoom = h.camera.zoom
+  sendPair(0.2, 0.24, 0.55, 0.46)
+  assertVector(h.camera.pan, new Vector3(0.05, -0.04, 0))
+  assertVector(h.camera.orbit, orbit)
+  assert.equal(h.camera.zoom, zoom)
+
+  sendPair(0.2, 0.2, 0.55, 0.46)
+  assert.ok(h.camera.zoom < zoom)
+  assertVector(h.camera.orbit, orbit)
+})
+
+test('two fists rebase turn and spread after close or crossed positions', t => {
+  const h = harness(t)
+  const left = hand('first', 0.3, 0.5)
+  const right = hand('second', 0.7, 0.5)
+  h.send(left, right)
+  const sendPair = (leftX: number, rightX: number) => {
+    h.send({ ...left, x: leftX, fist: true }, { ...right, x: rightX, fist: true })
+  }
+  sendPair(0.3, 0.7)
+  sendPair(0.48, 0.52)
+  sendPair(0.53, 0.47)
+  sendPair(0.66, 0.34)
+  sendPair(0.28, 0.72)
+  assertVector(h.camera.orbit, new Vector3())
+  assertVector(h.camera.pan, new Vector3())
+  assert.equal(h.camera.zoom, 1)
+  sendPair(0.25, 0.75)
+  assert.ok(h.camera.zoom > 1)
+})
+
 test('a live second fist confirms, drops out, and rejoins an RGB-only first fist without a camera jump', t => {
   let now = 1000
   t.mock.method(performance, 'now', () => now)
@@ -364,9 +421,10 @@ test('a live second fist confirms, drops out, and rejoins an RGB-only first fist
   h.send(first, second)
   assert.equal(h.state().status, 'holding')
   now += 1
-  h.send(first, second)
+  h.send({ ...first, x: 0.35 }, second)
   assert.equal(h.state().status, 'both')
-  h.send({ ...first, x: 0.35 }, { ...second, x: 0.7, depth: -0.4 })
+  assertVector(h.camera.orbit, new Vector3())
+  h.send({ ...first, x: 0.4 }, { ...second, x: 0.7, depth: -0.4 })
   assertVector(h.camera.pan, new Vector3(0.05, 0, 0))
   assert.equal(h.camera.zoom, 1)
 
@@ -378,11 +436,12 @@ test('a live second fist confirms, drops out, and rejoins an RGB-only first fist
   h.send(moved)
   assertVector(h.camera.orbit, new Vector3(0.045, 0, 0))
   now += 50
-  h.send(moved, second)
+  const rejoined = { ...moved, x: 0.52 }
+  h.send(rejoined, second)
   assert.deepEqual(h.state().activeHands, ['first', 'second'])
   assertVector(h.camera.pan, new Vector3(0.05, 0, 0))
   assertVector(h.camera.orbit, new Vector3(0.045, 0, 0))
-  h.send({ ...moved, y: 0.5 }, { ...second, y: 0.5 })
+  h.send({ ...rejoined, y: 0.5 }, { ...second, y: 0.5 })
   assertVector(h.camera.pan, new Vector3(0.05, 0.1, 0))
   assert.equal(h.camera.zoom, 1)
 })

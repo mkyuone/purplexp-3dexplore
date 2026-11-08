@@ -55,7 +55,7 @@ const cameraDirections: Record<CameraView, Vector3> = {
 };
 const HEAD_SCREEN_FIT_RATIO = 0.58;
 const HEAD_RELEASE_MS = 160;
-const HEAD_RENDER_DELTA_SQ = 0.0005 ** 2;
+const HEAD_RENDER_DELTA_SQ = 0.0025 ** 2;
 const HEAD_GRID_FLOOR_GAP = 0.012;
 
 function headOffsetChanged({ target, applied }: HeadView) {

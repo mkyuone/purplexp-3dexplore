@@ -39,6 +39,11 @@ const CENTER_RADIUS = 0.035;
 const LOSS_HOLD_MS = 150;
 const LOSS_EASE_MS = 250;
 const VIEWER_LOCK_MS = 500;
+const STILL_SMOOTHING_MS = 95;
+const MOVING_SMOOTHING_MS = 20;
+const RECOVERY_SMOOTHING_MS = 55;
+const STILL_DISTANCE = 0.003;
+const MOVING_DISTANCE = 0.028;
 const ZERO = { x: 0, y: 0 };
 
 function validFace(face: HeadFace): boolean {
@@ -186,7 +191,11 @@ export class HeadPoseTracker {
         x: boundedOffset(viewer.center.x - face.x, 0.18),
         y: boundedOffset(viewer.center.y - face.y, 0.12),
       };
-      const smoothingMs = now < viewer.recoveringUntil || distance(viewer.offset, target) <= 0.012 ? 55 : 20;
+      const travel = distance(viewer.offset, target);
+      const movement = Math.min(1, Math.max(0, (travel - STILL_DISTANCE) / (MOVING_DISTANCE - STILL_DISTANCE)));
+      const smoothingMs = now < viewer.recoveringUntil
+        ? RECOVERY_SMOOTHING_MS
+        : STILL_SMOOTHING_MS + (MOVING_SMOOTHING_MS - STILL_SMOOTHING_MS) * movement;
       const alpha = 1 - Math.exp(-elapsed / smoothingMs);
       const x = viewer.offset.x + (target.x - viewer.offset.x) * alpha;
       const y = viewer.offset.y + (target.y - viewer.offset.y) * alpha;

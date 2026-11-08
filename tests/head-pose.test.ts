@@ -54,6 +54,23 @@ test('mirrors horizontal movement, maps up and smooths and clamps both axes', ()
   assert.ok(tracker.sample(976).x < 0 && tracker.sample(976).y < 0);
 });
 
+test('dampens landmark jitter around an off-center pose and responds on the next frame to movement', () => {
+  const tracker = new HeadPoseTracker();
+  center(tracker);
+  let at = 250;
+  for (let frame = 0; frame < 20; frame += 1) tracker.receive([face(0.45, 0.46)], at += 33);
+  const resting = tracker.sample(at);
+
+  for (const jitter of [0.004, -0.004, 0.003, -0.003, 0.004, -0.004]) {
+    tracker.receive([face(0.45 + jitter, 0.46 - jitter)], at += 33);
+    const pose = tracker.sample(at);
+    assert.ok(Math.hypot(pose.x - resting.x, pose.y - resting.y) < 0.0018);
+  }
+
+  tracker.receive([face(0.4, 0.46)], at += 33);
+  assert.ok(tracker.sample(at).x - resting.x > 0.035);
+});
+
 test('holds the last pose for 150 ms and eases to center for the next 250 ms even if frames stall', () => {
   const tracker = new HeadPoseTracker();
   center(tracker);
