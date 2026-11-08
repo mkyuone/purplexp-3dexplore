@@ -150,7 +150,9 @@ export class CadScene {
   private studioMap: WebGLRenderTarget | null = null;
   private readonly observer: ResizeObserver;
   private model = makeModel();
-  private readonly target = new Vector3();
+  private readonly orbitCenter = new Vector3();
+  private readonly orbitOffset = cameraDirections.isometric.clone().multiplyScalar(12);
+  private readonly panOffset = new Vector2();
   private readonly raycaster = new Raycaster();
   private readonly ndc = new Vector2();
   private readonly interactionSize = new Vector2();
@@ -231,7 +233,6 @@ export class CadScene {
     this.ground.renderOrder = 2;
     this.world.add(this.ambientLight, key, fill, rim, this.floorGlow, this.ground, this.model.root);
 
-    this.camera.position.copy(cameraDirections.isometric).multiplyScalar(12);
     this.aimCamera();
     canvas.addEventListener('webglcontextlost', this.handleContextLost);
     canvas.addEventListener('webglcontextrestored', this.handleContextRestored);
@@ -345,18 +346,18 @@ export class CadScene {
     const aspectChanged = this.camera.aspect !== aspect;
     this.camera.aspect = aspect;
     this.camera.updateProjectionMatrix();
-    if (this.headView) this.headView.layoutDirty = true;
     if (aspectChanged && this.fitOnResize && this.model.meshes.length) {
       this.fit();
       return;
     }
+    this.aimCamera();
     this.requestRender(true);
   }
 
   fit(view?: CameraView) {
     const direction = view
       ? cameraDirections[view]
-      : this.camera.position.clone().sub(this.target).normalize();
+      : this.orbitOffset.clone().normalize();
     const framing = this.frameModel(this.model, direction);
     if (!framing) return;
     this.applyFraming(framing);
@@ -394,18 +395,19 @@ export class CadScene {
   }
 
   private applyFraming({ position, target }: CameraFrame) {
-    this.target.copy(target);
-    this.camera.position.copy(position);
-    this.screenDistance = position.distanceTo(target) * HEAD_SCREEN_FIT_RATIO;
+    this.orbitCenter.copy(target);
+    this.orbitOffset.copy(position).sub(target);
+    this.panOffset.set(0, 0);
+    this.screenDistance = this.orbitOffset.length() * HEAD_SCREEN_FIT_RATIO;
     this.fitOnResize = true;
     this.aimCamera();
   }
 
   orbit(dx: number, dy: number) {
-    const angles = new Spherical().setFromVector3(this.camera.position.clone().sub(this.target));
+    const angles = new Spherical().setFromVector3(this.orbitOffset);
     angles.theta -= dx * Math.PI * 1.7;
     angles.phi = MathUtils.clamp(angles.phi - dy * Math.PI * 1.4, 0.05, Math.PI - 0.05);
-    this.camera.position.setFromSpherical(angles).add(this.target);
+    this.orbitOffset.setFromSpherical(angles);
     this.fitOnResize = false;
     this.aimCamera();
     this.requestRender(true);
@@ -413,12 +415,7 @@ export class CadScene {
 
   pan(dx: number, dy: number) {
     if (!Number.isFinite(dx) || !Number.isFinite(dy) || (dx === 0 && dy === 0)) return;
-    const distance = this.camera.position.distanceTo(this.target);
-    const size = this.camera.getViewSize(distance, new Vector2());
-    // Move the camera opposite the drag in screen coordinates, where y points down.
-    const offset = new Vector3(-dx * size.x, dy * size.y, 0).applyQuaternion(this.camera.quaternion);
-    this.camera.position.add(offset);
-    this.target.add(offset);
+    this.panOffset.set(this.panOffset.x + dx, this.panOffset.y + dy);
     this.fitOnResize = false;
     this.aimCamera();
     this.requestRender(true);
@@ -426,16 +423,21 @@ export class CadScene {
 
   zoom(factor: number) {
     if (!(factor > 0) || !Number.isFinite(factor)) return;
-    const offset = this.camera.position.clone().sub(this.target);
-    offset.setLength(MathUtils.clamp(offset.length() / factor, 1.4, 300));
-    this.camera.position.copy(this.target).add(offset);
+    this.orbitOffset.setLength(MathUtils.clamp(this.orbitOffset.length() / factor, 1.4, 300));
     this.fitOnResize = false;
     this.aimCamera();
     this.requestRender(true);
   }
 
   private aimCamera() {
-    this.camera.lookAt(this.target);
+    this.camera.position.copy(this.orbitCenter).add(this.orbitOffset);
+    this.camera.lookAt(this.orbitCenter);
+    if (this.panOffset.x || this.panOffset.y) {
+      // Apply pan in the camera plane after aiming, so it never moves the orbit pivot.
+      const size = this.camera.getViewSize(this.orbitOffset.length(), this.interactionSize);
+      this.camera.translateX(-this.panOffset.x * size.x);
+      this.camera.translateY(this.panOffset.y * size.y);
+    }
     this.camera.updateMatrixWorld();
     if (this.headView) this.headView.layoutDirty = true;
   }

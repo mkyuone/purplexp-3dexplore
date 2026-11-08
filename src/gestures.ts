@@ -74,17 +74,12 @@ interface SecondaryGrip {
   missing: boolean
 }
 
-interface ViewPairAnchor {
-  angle: number
-  logSeparation: number
-}
-
 interface ActiveGrip {
   first: HandPose
   second: HandPose | null
   secondaryGrip: SecondaryGrip | null
   viewAnchor: { x: number; y: number; depth: number }
-  viewPair: ViewPairAnchor | null
+  viewPairLogSeparation: number | null
   joinSide: number
   joinVertical: number
   pairBlocked: boolean
@@ -104,9 +99,7 @@ const PINCH_REIDENTIFY_DISTANCE = 0.08
 const VIEW_ORBIT_DEADZONE = 0.005
 const VIEW_DEPTH_DEADZONE = 0.006
 const VIEW_DEPTH_ZOOM_GAIN = 2
-const VIEW_PAIR_TURN_DEADZONE = 0.06
 const VIEW_PAIR_SPREAD_DEADZONE = 0.045
-const VIEW_PAIR_ORBIT_GAIN = 0.3
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value))
@@ -475,7 +468,7 @@ export class GestureController {
 
     this.grip = {
       first, second: null, secondaryGrip: null, viewAnchor: { x: first.x, y: first.y, depth: first.depth },
-      viewPair: null, joinSide: first.x <= 0.64 ? 1 : -1, joinVertical: first.y <= 0.5 ? 1 : -1,
+      viewPairLogSeparation: null, joinSide: first.x <= 0.64 ? 1 : -1, joinVertical: first.y <= 0.5 ? 1 : -1,
       pairBlocked: false, part,
     }
     this.hoverCandidates.clear()
@@ -651,27 +644,21 @@ export class GestureController {
   private updateViewPair(grip: ActiveGrip, first: HandPose, second: HandPose) {
     const axis = this.handAxis(first, second, false)
     const separation = axis.length()
-    const pair = grip.viewPair
-    const minimum = pair ? MIN_HAND_SEPARATION : RESUME_HAND_SEPARATION
+    const spreadAnchor = grip.viewPairLogSeparation
+    const minimum = spreadAnchor === null ? RESUME_HAND_SEPARATION : MIN_HAND_SEPARATION
     if (separation < minimum) {
-      grip.viewPair = null
+      grip.viewPairLogSeparation = null
     } else {
-      const angle = Math.atan2(axis.y, axis.x)
       const logSeparation = Math.log(separation)
       const previous = this.handAxis(grip.first, grip.second!, false)
-      // A near overlap or sudden crossing can flip the angle without an intentional turn.
-      if (!pair || crossedBetweenFrames(previous, axis)) {
-        grip.viewPair = { angle, logSeparation }
+      // Re-anchor when the hands cross so the new separation does not jump the zoom.
+      if (spreadAnchor === null || crossedBetweenFrames(previous, axis)) {
+        grip.viewPairLogSeparation = logSeparation
       } else {
-        const difference = angle - pair.angle
-        const angleDelta = Math.atan2(Math.sin(difference), Math.cos(difference))
-        const turn = angleDelta - clamp(angleDelta, -VIEW_PAIR_TURN_DEADZONE, VIEW_PAIR_TURN_DEADZONE)
-        const spreadDelta = logSeparation - pair.logSeparation
+        const spreadDelta = logSeparation - spreadAnchor
         const spread = spreadDelta - clamp(spreadDelta, -VIEW_PAIR_SPREAD_DEADZONE, VIEW_PAIR_SPREAD_DEADZONE)
-        if (turn) this.scene.orbit(clamp(turn, -0.25, 0.25) * VIEW_PAIR_ORBIT_GAIN, 0)
         if (spread) this.scene.zoom(Math.exp(clamp(spread, -0.2, 0.2)))
-        pair.angle += turn
-        pair.logSeparation += spread
+        grip.viewPairLogSeparation = spreadAnchor + spread
       }
     }
 
@@ -706,14 +693,8 @@ export class GestureController {
       y: second ? (first.y + second.y) / 2 : first.y,
       depth: first.depth,
     }
-    grip.viewPair = null
-    if (!grip.part && second) {
-      const axis = this.handAxis(first, second, false)
-      const separation = axis.length()
-      if (separation >= RESUME_HAND_SEPARATION) {
-        grip.viewPair = { angle: Math.atan2(axis.y, axis.x), logSeparation: Math.log(separation) }
-      }
-    }
+    const viewSeparation = !grip.part && second ? this.handAxis(first, second, false).length() : 0
+    grip.viewPairLogSeparation = viewSeparation >= RESUME_HAND_SEPARATION ? Math.log(viewSeparation) : null
     grip.pairBlocked = grip.part !== null && second !== null && this.handAxis(first, second).lengthSq() < MIN_HAND_SEPARATION ** 2
     if (!second) {
       grip.joinSide = first.x <= 0.64 ? 1 : -1

@@ -35,7 +35,7 @@ function visitorCue(state: GestureState | null, simulation: boolean) {
   if (state?.status === 'lost') return simulation
     ? 'Move your hands back into view and start with an open hand.'
     : 'Bring your hands back into view.';
-  if (state?.status === 'both') return state.target === 'view' ? 'Move together to pan, tilt to orbit, or spread and close to zoom.' : 'Move together, spread to resize, or turn to rotate.';
+  if (state?.status === 'both') return state.target === 'view' ? 'Move together to pan, or spread and close to zoom.' : 'Move together, spread to resize, or turn to rotate.';
   if (state?.status === 'holding') return state.target === 'part' ? 'Move the part, or add a second pinch to resize and rotate.' : 'Move your fist to orbit. Pull back to zoom in, push forward to zoom out.';
   return 'Pinch a part to move it. Make a fist to look around.';
 }
@@ -525,7 +525,7 @@ export function App() {
       </div>}
       {!setupOpen && !calibrating && (simulationMode || focusPart || pose?.target === 'view') && <footer className="exhibit-footer">
         {pose?.target === 'view'
-          ? <div className="part-caption">{dualViewGrip ? <Move size={16} /> : <Orbit size={16} />}<span>{dualViewGrip ? 'Pan · Orbit · Zoom' : 'Exhibit view'}</span></div>
+          ? <div className="part-caption">{dualViewGrip ? <Move size={16} /> : <Orbit size={16} />}<span>{dualViewGrip ? 'Pan · Zoom' : 'Exhibit view'}</span></div>
           : focusPart && <div className="part-caption" aria-live="polite"><Box size={16} /><span>{focusPart.name}</span></div>}
         {simulationMode && <span className="input-status" data-active={enabled && pose?.status !== 'lost' && !rendererError}><i />{enabled ? 'Simulated hands' : 'Simulation paused'}</span>}
       </footer>}
@@ -597,11 +597,11 @@ export function App() {
             <div><dt><kbd>Space</kbd></dt><dd>Hold left pinch or click and hold</dd></div>
             <div><dt><kbd>↑ ↓ ← →</kbd></dt><dd>Move right hand</dd></div>
             <div><dt><kbd>Enter</kbd></dt><dd>Hold right pinch to resize and rotate</dd></div>
-            <div><dt><kbd>V</kbd> <kbd>B</kbd></dt><dd>Hold one fist to orbit and zoom with depth. With both, move together to pan, tilt to orbit, or spread and close to zoom.</dd></div>
+            <div><dt><kbd>V</kbd> <kbd>B</kbd></dt><dd>Hold one fist to orbit and zoom with depth. With both, move together to pan, or spread and close to zoom.</dd></div>
             <div><dt><kbd>Q</kbd> <kbd>E</kbd> <span>/</span> <kbd>[</kbd> <kbd>]</kbd></dt><dd>Adjust left / right depth</dd></div>
             <div><dt><kbd>Esc</kbd></dt><dd>Drop tracking</dd></div>
           </dl>
-          <p className="setup-hint">Shift-drag to orbit with the pointer. On touchscreens, drag a part to move it or drag empty space to orbit. Add a second finger to resize a part or pan, orbit, and zoom the view.</p>
+          <p className="setup-hint">Shift-drag to orbit with the pointer. On touchscreens, drag a part to move it or drag empty space to orbit. Add a second finger to resize a part or pan and zoom the view.</p>
         </section>}
       </div>
     </aside>}

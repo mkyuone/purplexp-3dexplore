@@ -350,7 +350,7 @@ test('two fists pan by their midpoint and one fist resumes orbit and zoom withou
   assert.deepEqual(h.pose(), h.initial)
 })
 
-test('two fists orbit by tilt and zoom by spread independently without depth', t => {
+test('two fists zoom by spread and pan by their midpoint without orbiting', t => {
   const h = harness(t)
   h.controller.setViewport(1200, 600)
   const left = { ...hand('first', 0.3, 0.5), depthValid: false }
@@ -368,26 +368,27 @@ test('two fists orbit by tilt and zoom by spread independently without depth', t
   assert.equal(h.camera.zoom, 1)
 
   sendPair(0.2, 0.2)
-  assert.ok(h.camera.orbit.x > 0.03)
-  assert.equal(h.camera.orbit.y, 0)
+  assertVector(h.camera.orbit, new Vector3())
   assert.equal(h.camera.zoom, 1)
   assertVector(h.camera.pan, new Vector3())
-  const orbit = h.camera.orbit.clone()
 
   sendPair(0.2, 0.24)
   assert.ok(h.camera.zoom > 1.1)
   const zoom = h.camera.zoom
-  sendPair(0.2, 0.24, 0.55, 0.46)
+  sendPair(-0.4, 0.24)
+  assertVector(h.camera.pan, new Vector3())
+  assertVector(h.camera.orbit, new Vector3())
+  assert.ok(Math.abs(h.camera.zoom - zoom) < 1e-8)
+  sendPair(-0.4, 0.24, 0.55, 0.46)
   assertVector(h.camera.pan, new Vector3(0.05, -0.04, 0))
-  assertVector(h.camera.orbit, orbit)
-  assert.equal(h.camera.zoom, zoom)
+  assert.ok(Math.abs(h.camera.zoom - zoom) < 1e-8)
 
-  sendPair(0.2, 0.2, 0.55, 0.46)
+  sendPair(-0.4, 0.2, 0.55, 0.46)
   assert.ok(h.camera.zoom < zoom)
-  assertVector(h.camera.orbit, orbit)
+  assertVector(h.camera.orbit, new Vector3())
 })
 
-test('two fists rebase turn and spread after close or crossed positions', t => {
+test('two fists rebase spread after close or crossed positions', t => {
   const h = harness(t)
   const left = hand('first', 0.3, 0.5)
   const right = hand('second', 0.7, 0.5)
