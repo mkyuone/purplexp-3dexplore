@@ -13,9 +13,11 @@ npm run dev
 
 Open [the exhibit](http://localhost:4180/). It starts with Team Arion’s Ultraviolet car. Drag to orbit, scroll or pinch on a touchscreen to zoom, and click or tap a part to inspect it. With the model focused, use the arrow keys to orbit, **+ / −** to zoom, **Enter** to select the center part, or **Home** to fit the view.
 
-Open **Setup → Import STEP** to load a `.step` or `.stp` export. Setup keeps the live preview alongside the assembly tree, view presets, colors, undo, and **Reset exhibit**. Cancel an import to keep the current assembly. Operator edits and files opened through the picker live in the current browser session.
+Open [Operator settings](http://localhost:4180/operator) and choose **Import STEP** to load a `.step` or `.stp` export. The operator page puts the assembly tree, view presets, colors, undo, and **Reset exhibit** alongside a preview. Cancel an import to keep the current assembly. Choose **Open exhibit** to take the current model and edits into the visitor view in the same tab.
 
-The startup mesh is generated from `src/models/ultraviolet-full-car.step` and preserves its assembly and face colors. Run `npm run model:generate` after editing the STEP. `npm run model:check` verifies the source and generated mesh, and the production build runs that check automatically.
+Select a part or assembly to edit its **Display name**. To edit several at once, choose **Export names CSV** in the assembly panel, fill in the **Display Name** column, and save the file as CSV. Use **Import names CSV** with the same model loaded. Blank display names restore the original STEP names. The browser remembers display names for each model.
+
+The startup mesh is generated from `src/models/ultraviolet-full-car.step` and preserves its assembly and face colors. Its default display names come from `src/models/ultraviolet-part-display-names.csv`. Run `npm run model:generate` after editing the STEP. The production build checks that the generated mesh and display names match the assembly.
 
 ## Set up a RealSense hand camera
 
@@ -27,7 +29,7 @@ python camera/download_rgb_models.py
 python -B camera/server.py --model .runtime/camera/hand_landmarker.task
 ```
 
-Open the [operator view](http://localhost:4180/?operator=1), then use **Setup → Hand camera → Connect**. It starts in **Fuzzy · no calibration** mode with a live mirrored camera preview. Use **Show live camera preview** in Setup to hide or show it while navigating. Close Setup and bring one relaxed open hand into view. Move it across the central camera area to aim, pinch to move a part, or make a fist to orbit. With one fist held, pull your hand toward yourself to zoom in and push it toward the camera to zoom out. With two fists, move them together to pan or change the distance between them to zoom. Add a second pinch to resize and rotate a part. The cursor is mirrored and smoothed, with a small dead zone to reduce jitter. Depth adapts while your hands are open and stays fixed during a grip.
+Open [Operator settings](http://localhost:4180/operator) and use **Hand camera → Connect**. It starts in **Fuzzy · no calibration** mode with a live mirrored preview on the operator page. The visitor preview is off by default. Enable **Show hand camera preview in the exhibit** to show it for visitors. The browser remembers that choice. Choose **Open exhibit** and bring one relaxed open hand into view. Move it across the central camera area to aim, pinch to move a part, or make a fist to orbit. With one fist held, pull your hand toward yourself to zoom in and push it toward the camera to zoom out. With two fists, move them together to pan or change the distance between them to zoom. Add a second pinch to resize and rotate a part. The cursor is mirrored and smoothed, with a small dead zone to reduce jitter. Depth adapts while your hands are open and stays fixed during a grip.
 
 A short tracking interruption pauses the held part or view. Returning the same grip resumes from that position. If you move out of frame, come back and hold a pinch over a part to grab it again. When one hand drops out during a two-hand grip, the hand still in view can keep moving the part.
 
@@ -37,17 +39,17 @@ Hold a thumbs-up with either hand for 1.5 seconds to restore the assembly and it
 
 For a fitted reach area, use **Optional reach calibration**. Put the browser on the final exhibit display first, ideally full-screen. Select **Capture** at each target. Use the three-second countdown to move your whole hand toward the ring, then hold your fingertip steady with your palm facing the camera. The mirrored preview marks your fingertip in green when depth is available and amber when only the hand is detected. The corners define the reach area. Once they pass, the center helps refine the resting depth. Check that both hands can reach the car without stretching before opening the exhibit to visitors.
 
-Optional calibration is saved per camera and display. If the camera or display moves, choose fuzzy navigation or recalibrate in the operator view. Open the normal exhibit URL for visitors. The browser remembers the navigation mode and whether the camera is enabled, and offers direct touch, mouse, and keyboard controls while camera input is unavailable. The local service sends hand positions and gestures to the browser. The video preview is available in the operator view and during calibration. Frames stay in memory.
+Optional calibration is saved per camera and display. If the camera or display moves, choose fuzzy navigation or recalibrate on the operator page. The browser remembers the navigation mode and whether the camera is enabled, and offers direct touch, mouse, and keyboard controls while camera input is unavailable. The local service sends hand positions and gestures to the browser. The video preview is also available during calibration. Frames stay in memory.
 
 ### Camera settings
 
-**Operator setup → Hand camera → Camera settings** offers 30 or 60 fps capture. Select **Apply and restart** to activate a choice. The camera uses RGB with the depth projector enabled and MediaPipe Full for hand tracking. Capture settings persist on the local camera service.
+**Operator settings → Hand camera → Camera settings** offers 30 or 60 fps capture. Select **Apply and restart** to activate a choice. The camera uses RGB with the depth projector enabled and MediaPipe Full for hand tracking. Capture settings persist on the local camera service.
 
-Start at 30 fps. The capture setting is the sensor rate, **Pose rate** counts tracker output, and **Browser rate** counts delivered updates. When comparing 60 fps, check pose age and skipped frames as well as how the controls feel. Move a part or the view before reopening Setup to collect render-submission timings. Those timings end when the browser submits the draw, before it reaches the display.
+Start at 30 fps. The capture setting is the sensor rate, **Pose rate** counts tracker output, and **Browser rate** counts delivered updates. When comparing 60 fps, check pose age and skipped frames as well as how the controls feel. Move a part or the view in the exhibit, then use the browser’s Back button to return to the operator page and see render-submission timings. Those timings end when the browser submits the draw, before it reaches the display.
 
 ## Try head-coupled perspective
 
-In [Operator Setup](http://localhost:4180/?operator=1), open **Setup → Head-coupled perspective → Start** and allow camera access. Use the integrated RGB webcam or another webcam separate from the D435i. Face it until the view centers, then close Setup and move your head sideways or up and down. **Recenter** sets a new resting position. The preview and controls are in Setup, and the experiment starts off on reload.
+In [Operator settings](http://localhost:4180/operator), choose **Head-coupled perspective → Start** and allow camera access. Use the integrated RGB webcam or another webcam separate from the D435i. Face it until the view centers, then choose **Open exhibit** and move your head sideways or up and down. **Recenter** sets a new resting position. The preview and controls are on the operator page, and the experiment starts off on reload.
 
 The webcam tracks one viewer locally at a fixed virtual viewing distance. The RealSense hand controls work alongside it. While you pinch and hold a part, the head perspective stays steady and catches up after release. The webcam pauses when you switch away from the tab and centers again when you return.
 

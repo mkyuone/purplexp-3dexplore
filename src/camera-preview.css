@@ -59,8 +59,11 @@
   inline-size: min(240px, 34%);
 }
 
+.explorer:not(.is-operator) .navigation-preview { inset: 16px auto auto 16px; }
+
 @media (max-width: 550px) {
   .navigation-preview { inset: auto auto 10px 10px; inline-size: min(150px, 34%); }
+  .explorer:not(.is-operator) .navigation-preview { inset: 10px auto auto 10px; }
   .navigation-preview figcaption { font-size: 10px; }
   .navigation-preview .preview-legend { display: none; }
 }

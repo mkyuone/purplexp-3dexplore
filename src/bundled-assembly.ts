@@ -1,6 +1,7 @@
 import { decodeAssembly } from "./assembly-binary.ts";
 import bundledAssemblyUrl from "./models/ultraviolet-full-car.cadmesh?url";
-import type { CadAssembly } from "./cad.ts";
+import ultravioletNamesCsv from "./models/ultraviolet-part-display-names.csv?raw";
+import { collectPartNameRows, importPartNames } from "./part-names.ts";
 import type { SurfaceFinishes } from "./scene.ts";
 
 // Match the finishes to the authored sRGB swatches of the bundled car.
@@ -13,12 +14,13 @@ export const ultravioletFinishes: SurfaceFinishes = {
   '55565a': { roughness: 0.4, metalness: 0.25 }, // Wheel caps
 };
 
-export async function loadBundledAssembly(signal?: AbortSignal): Promise<CadAssembly> {
+export async function loadBundledAssembly(signal?: AbortSignal) {
   const response = await fetch(bundledAssemblyUrl, { signal });
   if (!response.ok) throw new Error("The starting model could not be opened.");
   const bytes = await response.arrayBuffer();
   signal?.throwIfAborted();
-  const { assembly } = await decodeAssembly(bytes);
+  const decoded = await decodeAssembly(bytes);
   signal?.throwIfAborted();
-  return assembly;
+  const defaultDisplayNames = importPartNames(ultravioletNamesCsv, collectPartNameRows(decoded.assembly.roots, {}));
+  return { ...decoded, defaultDisplayNames };
 }

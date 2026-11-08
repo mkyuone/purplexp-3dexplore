@@ -14,7 +14,7 @@ const statusText = {
 type TrackingPhase = 'centering' | 'tracking' | 'lost';
 const trackingText: Record<TrackingPhase, string> = {
   centering: 'Face the webcam and hold still briefly to center the view.',
-  tracking: 'Tracking. Close Setup, then move your head sideways or up and down.',
+  tracking: 'Tracking. Open the exhibit, then move your head sideways or up and down.',
   lost: 'Face lost. Look toward the webcam to resume.',
 };
 

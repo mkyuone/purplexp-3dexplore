@@ -1,6 +1,7 @@
 import { Box, Expand, Hand, LoaderCircle, Move, Orbit, Settings, ThumbsUp, TriangleAlert, Upload, X } from 'lucide-react';
-import { memo, useEffect, useImperativeHandle, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type Ref } from 'react';
-import { importStep, readStepFile, type CadAssembly } from './cad';
+import { memo, useEffect, useImperativeHandle, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type MouseEvent, type Ref } from 'react';
+import { importStep, readStepFile, type CadAssembly, type CadOccurrence } from './cad';
+import { sha256 } from './assembly-binary';
 import { loadBundledAssembly, ultravioletFinishes } from './bundled-assembly';
 import { CadScene, type SurfaceFinishes } from './scene';
 import { GestureController, RESET_HOLD_MS, type GestureState } from './gestures';
@@ -12,14 +13,49 @@ import { CalibrationPanel } from './calibration-panel';
 import { CameraPreview } from './camera-preview';
 import { HeadPerspectivePanel, useHeadPerspective } from './head-perspective-panel';
 import { HandPerformance } from './hand-performance';
+import { collectPartNameRows, exportPartNames, importPartNames } from './part-names';
 
 const startingModelName = 'Ultraviolet Full Car.step';
 const query = new URLSearchParams(window.location.search);
 const simulationMode = import.meta.env.DEV && query.get('simulate') === '1';
-const operatorMode = !simulationMode && query.get('operator') === '1';
+const operatorPath = '/operator';
 const cameraPreference = 'spatial-cad-explorer.hand-camera';
 const navigationPreference = 'spatial-cad-explorer.hand-navigation';
+const previewPreference = 'spatial-cad-explorer.visitor-camera-preview';
+const partNamesPrefix = 'spatial-cad-explorer.part-names.';
 const emptyRoots: CadAssembly['roots'] = [];
+
+function legacyOperatorUrl(url: URL) {
+  return url.pathname === '/' && url.searchParams.get('operator') === '1';
+}
+
+function isOperatorPage() {
+  const url = new URL(window.location.href);
+  return !simulationMode && (url.pathname.replace(/\/$/, '') === operatorPath || legacyOperatorUrl(url));
+}
+
+function readPreviewPreference() {
+  try { return localStorage.getItem(previewPreference) === 'on'; }
+  catch { return false; }
+}
+
+function partNamesKey(sourceHash: Uint8Array | null) {
+  if (!sourceHash) return null;
+  const hex = Array.from(sourceHash, byte => byte.toString(16).padStart(2, '0')).join('');
+  return partNamesPrefix + hex;
+}
+
+function readPartNames(key: string | null): Record<string, string> | undefined {
+  if (!key) return undefined;
+  try {
+    const value = JSON.parse(localStorage.getItem(key) ?? '{}') as unknown;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    return Object.fromEntries(Object.entries(value).filter(([, name]) => typeof name === 'string' && (name === '' || name.trim())));
+  } catch {
+    return undefined;
+  }
+}
+
 type Runtime = {
   scene: CadScene;
   gestures: GestureController;
@@ -30,7 +66,20 @@ type Runtime = {
   hasModel: boolean;
   nativeUntil: number;
 };
-type Exhibit = { name: string; roots: CadAssembly['roots']; revision: number };
+type CalibrationAttempt = { display: string; previousNavigation: HandNavigation; pending: boolean; abandoned: boolean };
+type Exhibit = {
+  name: string;
+  roots: CadAssembly['roots'];
+  revision: number;
+  namesKey: string | null;
+  defaultDisplayNames: Readonly<Record<string, string>>;
+  displayNames: Readonly<Record<string, string>>;
+};
+type LoadedAssembly = {
+  assembly: CadAssembly;
+  sourceSha256: Uint8Array | null;
+  defaultDisplayNames?: Readonly<Record<string, string>>;
+};
 type GestureFeedback = Pick<GestureState, 'status' | 'target' | 'held' | 'hovered' | 'resetProgress'>;
 type CursorControls = { update: (state: GestureState) => void };
 
@@ -189,21 +238,26 @@ function CameraSettings({ navigation, performance }: { navigation: HandNavigatio
 export function App() {
   const viewport = useRef<HTMLElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
-  const setupTrigger = useRef<HTMLButtonElement>(null);
   const setupClose = useRef<HTMLButtonElement>(null);
+  const operatorTitle = useRef<HTMLHeadingElement>(null);
   const picker = useRef<HTMLInputElement>(null);
   const runtime = useRef<Runtime | null>(null);
   const cursorControls = useRef<CursorControls>(null);
   const [handPerformance] = useState(() => new HandPerformance());
   const importAbort = useRef<AbortController | null>(null);
-  const calibrationDisplay = useRef<string | null>(null);
+  const calibrationAttempt = useRef<CalibrationAttempt | null>(null);
   const modelRevision = useRef(0);
+  const currentExhibit = useRef<Exhibit | null>(null);
+  const csvRequest = useRef(0);
   const [exhibit, setExhibit] = useState<Exhibit | null>(null);
+  const [namesMessage, setNamesMessage] = useState<{ text: string; error?: boolean } | null>(null);
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [rendererError, setRendererError] = useState<string | null>(null);
   const [contextLost, setContextLost] = useState(false);
-  const [setupOpen, setSetupOpen] = useState(false);
+  const [operatorMode, setOperatorMode] = useState(isOperatorPage);
+  const operatorSession = useRef(operatorMode);
+  const [simulatorSetupOpen, setSimulatorSetupOpen] = useState(false);
   const [enabled, setEnabled] = useState(simulationMode);
   const [liveEnabled, setLiveEnabled] = useState(() => {
     try { return !simulationMode && localStorage.getItem(cameraPreference) === 'on'; }
@@ -213,7 +267,7 @@ export function App() {
     try { return localStorage.getItem(navigationPreference) === 'calibrated' ? 'calibrated' : 'fuzzy'; }
     catch { return 'fuzzy'; }
   });
-  const [previewVisible, setPreviewVisible] = useState(true);
+  const [visitorPreviewVisible, setVisitorPreviewVisible] = useState(readPreviewPreference);
   const [liveStatus, setLiveStatus] = useState<LiveHandStatus>({ phase: 'connecting' });
   const [calibrationProgress, setCalibrationProgress] = useState<LiveHandStatus | null>(null);
   const [calibrationBusy, setCalibrationBusy] = useState(false);
@@ -223,8 +277,9 @@ export function App() {
   const [selected, setSelected] = useState<string | null>(null);
   const [pose, setPose] = useState<GestureFeedback | null>(null);
   const [, setRevision] = useState(0);
+  const calibrating = operatorMode && calibrationProgress !== null;
+  const setupOpen = operatorMode ? !calibrating : simulatorSetupOpen;
   const headPerspective = useHeadPerspective(runtime, setupOpen);
-  const calibrating = calibrationProgress !== null;
   const calibrationDisplayChanged = calibrating && liveStatus.display !== undefined && liveStatus.display !== calibrationProgress.display;
   const matchingCalibrationPoll = liveStatus.phase === 'calibration' && liveStatus.display === calibrationProgress?.display
     && liveStatus.step === calibrationProgress?.step ? liveStatus : null;
@@ -242,7 +297,41 @@ export function App() {
   const scene = runtime.current?.scene;
   const details = setupOpen && part ? scene?.describe(part.id) : null;
 
-  async function load(name: string, read: (signal: AbortSignal) => Promise<CadAssembly>, finishes?: SurfaceFinishes) {
+  function setCurrentExhibit(next: Exhibit) {
+    currentExhibit.current = next;
+    setExhibit(next);
+  }
+
+  function displayName(node: CadOccurrence) {
+    const custom = exhibit?.displayNames[node.id] ?? exhibit?.defaultDisplayNames[node.id];
+    return typeof custom === 'string' && custom ? custom : node.name;
+  }
+
+  function savePartNames(current: Exhibit, updates: Readonly<Record<string, string>>) {
+    const names: Record<string, string> = Object.assign(Object.create(null), current.displayNames);
+    for (const [id, name] of Object.entries(updates)) {
+      if (name === (current.defaultDisplayNames[id] ?? '')) delete names[id];
+      else names[id] = name;
+    }
+    setCurrentExhibit({ ...current, displayNames: names });
+    if (current.namesKey) {
+      try { localStorage.setItem(current.namesKey, JSON.stringify(names)); }
+      catch { /* Names still apply in this tab. */ }
+    }
+  }
+
+  useEffect(() => {
+    function syncPartNames(event: StorageEvent) {
+      const current = currentExhibit.current;
+      if (!current?.namesKey || (event.key !== current.namesKey && event.key !== null)) return;
+      const names = readPartNames(current.namesKey);
+      if (names) setCurrentExhibit({ ...current, displayNames: names });
+    }
+    window.addEventListener('storage', syncPartNames);
+    return () => window.removeEventListener('storage', syncPartNames);
+  }, []);
+
+  async function load(name: string, read: (signal: AbortSignal) => Promise<LoadedAssembly>, finishes?: SurfaceFinishes) {
     importAbort.current?.abort();
     const controller = new AbortController();
     importAbort.current = controller;
@@ -250,13 +339,15 @@ export function App() {
     setLoading(name);
     setError(null);
     try {
-      const assembly = await read(controller.signal);
+      const { assembly, sourceSha256, defaultDisplayNames = {} } = await read(controller.signal);
       const active = runtime.current;
       if (controller.signal.aborted || !active) return;
       active.gestures.cancel();
       active.scene.load(assembly, finishes);
       active.hasModel = true;
-      setExhibit({ name, roots: assembly.roots, revision: ++modelRevision.current });
+      const namesKey = partNamesKey(sourceSha256);
+      setCurrentExhibit({ name, roots: assembly.roots, revision: ++modelRevision.current, namesKey, defaultDisplayNames, displayNames: readPartNames(namesKey) ?? {} });
+      setNamesMessage(null);
       setSelected(null);
     } catch (cause) {
       if (!controller.signal.aborted) {
@@ -272,6 +363,36 @@ export function App() {
 
   function loadStartingModel() {
     return load(startingModelName, loadBundledAssembly, ultravioletFinishes);
+  }
+
+  function downloadPartNames() {
+    if (!exhibit) return;
+    const rows = collectPartNameRows(exhibit.roots, { ...exhibit.defaultDisplayNames, ...exhibit.displayNames });
+    const url = URL.createObjectURL(new Blob([exportPartNames(rows)], { type: 'text/csv;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${exhibit.name.replace(/\.(step|stp)$/i, '')}-part-display-names.csv`;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  async function receivePartNames(file: File) {
+    const revision = currentExhibit.current?.revision;
+    if (revision === undefined) return;
+    const request = ++csvRequest.current;
+    try {
+      const text = await file.text();
+      const current = currentExhibit.current;
+      if (csvRequest.current !== request || current?.revision !== revision) return;
+      const updates = importPartNames(text, collectPartNameRows(current.roots, {}));
+      savePartNames(current, updates);
+      const count = Object.keys(updates).length;
+      setNamesMessage({ text: `Imported ${count} ${count === 1 ? 'row' : 'rows'} of display names.` });
+    } catch (cause) {
+      if (csvRequest.current === request && currentExhibit.current?.revision === revision) {
+        setNamesMessage({ text: cause instanceof Error ? cause.message : 'The display names could not be imported.', error: true });
+      }
+    }
   }
 
   useEffect(() => {
@@ -311,7 +432,7 @@ export function App() {
         resetExhibit(false);
       },
     });
-    const active: Runtime = { scene, gestures, setupOpen: false, calibrating: false, contextLost: false, hasModel: false, nativeUntil: 0 };
+    const active: Runtime = { scene, gestures, setupOpen, calibrating: false, contextLost: false, hasModel: false, nativeUntil: 0 };
     runtime.current = active;
     const sizeObserver = new ResizeObserver(([entry]) => {
       const { width, height } = entry.contentRect;
@@ -358,13 +479,13 @@ export function App() {
     const disconnect = connectLiveHands({
       navigation,
       receive: (frame, receivedAt) => {
-        if (operatorMode) {
+        if (operatorSession.current) {
           latestReceipt = receivedAt;
           handPerformance.receive(frame.sequence, receivedAt);
         }
         if (active.setupOpen || active.calibrating || active.contextLost || !active.hasModel || importAbort.current || receivedAt < active.nativeUntil) return;
         active.gestures.receive(frame);
-        if (operatorMode) active.scene.requestRenderMeasurement(submittedAt => {
+        if (operatorSession.current) active.scene.requestRenderMeasurement(submittedAt => {
           if (latestReceipt === receivedAt) handPerformance.submitted(frame, receivedAt, submittedAt);
         });
       },
@@ -389,7 +510,11 @@ export function App() {
       setError('Choose a STEP assembly or part with a .step or .stp extension.');
       return;
     }
-    void load(file.name, async signal => importStep(await readStepFile(file, signal), signal));
+    void load(file.name, async signal => {
+      const data = await readStepFile(file, signal);
+      const sourceSha256 = globalThis.crypto?.subtle ? await sha256(data) : null;
+      return { assembly: await importStep(data, signal), sourceSha256 };
+    });
   }
 
   function onFile(event: ChangeEvent<HTMLInputElement>) {
@@ -419,30 +544,58 @@ export function App() {
     }, cancelGestures);
   }
 
-  function openSetup() {
-    const active = runtime.current;
-    if (active) {
-      active.setupOpen = true;
-      active.simulator?.setEnabled(false);
-      active.gestures.resetStream();
-    }
-    setSetupOpen(true);
-  }
-
   function closeSetup() {
-    setSetupOpen(false);
-    const active = runtime.current;
-    if (active) {
-      active.setupOpen = false;
-      active.gestures.resetStream();
-      active.simulator?.setEnabled(enabled);
-    }
-    requestAnimationFrame(() => (simulationMode ? viewport.current : setupTrigger.current)?.focus({ preventScroll: true }));
+    setSimulatorSetupOpen(false);
+    requestAnimationFrame(() => viewport.current?.focus({ preventScroll: true }));
   }
 
   useEffect(() => {
-    if (setupOpen) setupClose.current?.focus({ preventScroll: true });
-  }, [setupOpen]);
+    const active = runtime.current;
+    if (active && active.setupOpen !== setupOpen) {
+      active.setupOpen = setupOpen;
+      active.gestures.resetStream();
+    }
+    active?.simulator?.setEnabled(enabled && !setupOpen);
+  }, [enabled, setupOpen]);
+
+  function syncRoute() {
+    const next = isOperatorPage();
+    if (next) operatorSession.current = true;
+    else leaveCalibration();
+    setOperatorMode(next);
+  }
+
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (!simulationMode && (legacyOperatorUrl(url) || url.pathname === `${operatorPath}/`)) {
+      url.pathname = operatorPath;
+      url.searchParams.delete('operator');
+      window.history.replaceState(window.history.state, '', url);
+    }
+    window.addEventListener('popstate', syncRoute);
+    return () => window.removeEventListener('popstate', syncRoute);
+  }, []);
+
+  useEffect(() => {
+    document.title = operatorMode ? 'Operator settings · Spatial CAD Explorer' : 'Spatial CAD Explorer';
+    if (setupOpen) (operatorMode ? operatorTitle.current : setupClose.current)?.focus({ preventScroll: true });
+  }, [operatorMode, setupOpen]);
+
+  function openExhibit(event: MouseEvent<HTMLAnchorElement>) {
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    window.history.pushState(null, '', event.currentTarget.href);
+    syncRoute();
+    requestAnimationFrame(() => canvas.current?.focus({ preventScroll: true }));
+  }
+
+  useEffect(() => {
+    function syncPreview(event: StorageEvent) {
+      if (event.key === previewPreference || event.key === null) setVisitorPreviewVisible(readPreviewPreference());
+    }
+    window.addEventListener('storage', syncPreview);
+    return () => window.removeEventListener('storage', syncPreview);
+  }, []);
 
   useEffect(() => {
     if (!calibrationSaved) return;
@@ -458,6 +611,12 @@ export function App() {
     setCalibrationError(null);
   }
 
+  function changePreview(next: boolean) {
+    try { localStorage.setItem(previewPreference, next ? 'on' : 'off'); }
+    catch { /* The preference still applies to this tab. */ }
+    setVisitorPreviewVisible(next);
+  }
+
   function changeNavigation(next: HandNavigation) {
     try { localStorage.setItem(navigationPreference, next); }
     catch { /* This mode remains available for the current session. */ }
@@ -467,38 +626,52 @@ export function App() {
   }
 
   function finishCalibration() {
-    calibrationDisplay.current = null;
+    calibrationAttempt.current = null;
     const active = runtime.current;
     if (active) {
       active.calibrating = false;
       active.gestures.resetStream();
     }
     setCalibrationProgress(null);
-    requestAnimationFrame(() => setupTrigger.current?.focus({ preventScroll: true }));
+  }
+
+  function leaveCalibration() {
+    const attempt = calibrationAttempt.current;
+    if (!attempt) return;
+    attempt.abandoned = true;
+    setNavigation(attempt.previousNavigation);
+    finishCalibration();
+    if (!attempt.pending) {
+      setCalibrationBusy(true);
+      void calibrateHands('cancel', attempt.display).catch(() => {}).finally(() => setCalibrationBusy(false));
+    }
   }
 
   async function changeCalibration(action: 'begin' | 'capture' | 'cancel') {
     if (!operatorMode || calibrationBusy) return;
-    const display = action === 'begin' ? handDisplayKey() : calibrationDisplay.current;
-    if (!display) return;
+    const attempt = action === 'begin'
+      ? { display: handDisplayKey(), previousNavigation: navigation, pending: false, abandoned: false }
+      : calibrationAttempt.current;
+    if (!attempt || attempt.pending) return;
+    calibrationAttempt.current = attempt;
+    attempt.pending = true;
     setCalibrationBusy(true);
     setCalibrationError(null);
     try {
-      const next = await calibrateHands(action, display);
+      const next = await calibrateHands(action, attempt.display);
+      if (attempt.abandoned) return;
       if (action === 'begin') {
         if (next.phase !== 'calibration') throw new Error(next.message ?? 'The hand camera is unavailable.');
         setCalibrationSaved(false);
         setNavigation('calibrated');
-        calibrationDisplay.current = display;
         const active = runtime.current;
         if (active) active.calibrating = true;
         setCalibrationProgress(next);
-        closeSetup();
       } else if (action === 'cancel' || next.phase === 'ready') {
         if (action === 'capture') {
           setCalibrationSaved(true);
           changeNavigation('calibrated');
-        } else changeNavigation('fuzzy');
+        } else setNavigation(attempt.previousNavigation);
         finishCalibration();
       } else if (next.phase === 'calibration') {
         setCalibrationProgress(current => ({ ...next, previewToken: current?.previewToken }));
@@ -506,22 +679,29 @@ export function App() {
         setCalibrationError(next.message ?? 'The hand camera is unavailable.');
       }
     } catch (cause) {
+      if (attempt.abandoned) return;
       if (action === 'cancel') {
-        changeNavigation('fuzzy');
+        setNavigation(attempt.previousNavigation);
         finishCalibration();
-      } else setCalibrationError(cause instanceof Error ? cause.message : 'The camera did not respond.');
+      } else {
+        if (action === 'begin') calibrationAttempt.current = null;
+        setCalibrationError(cause instanceof Error ? cause.message : 'The camera did not respond.');
+      }
     } finally {
+      if (attempt.abandoned && action !== 'cancel') await calibrateHands('cancel', attempt.display).catch(() => {});
+      attempt.pending = false;
       setCalibrationBusy(false);
     }
   }
 
   const graphicsIssue = rendererError ?? (contextLost ? 'The graphics connection was interrupted. Waiting for it to recover.' : null);
+  const showStageActions = setupOpen || simulationMode;
   const stageMessage = graphicsIssue ? <div className="message error" role="alert"><TriangleAlert size={18} /><span>{graphicsIssue}</span>
-    <button className="button" type="button" onClick={() => window.location.reload()}>Reload</button>
+    {showStageActions && <button className="button" type="button" onClick={() => window.location.reload()}>Reload</button>}
   </div> : loading ? <div className="message loading" role="status"><LoaderCircle size={18} /> <span>Loading {loading}</span>
-    <button className="button" type="button" onClick={() => importAbort.current?.abort()}>Cancel</button>
+    {showStageActions && <button className="button" type="button" onClick={() => importAbort.current?.abort()}>Cancel</button>}
   </div> : error ? <div className="message error" role="alert"><TriangleAlert size={18} /> <span>{error}</span>
-    <button type="button" className="icon-button close-message" aria-label="Dismiss import error" onClick={() => setError(null)}><X size={16} /></button>
+    {showStageActions && <button type="button" className="icon-button close-message" aria-label="Dismiss import error" onClick={() => setError(null)}><X size={16} /></button>}
   </div> : null;
   const handsEnabled = simulationMode ? enabled : liveEnabled && liveStatus.phase === 'ready';
   const showPose = handsEnabled && !setupOpen && !calibrating && !contextLost && !!exhibit;
@@ -529,21 +709,23 @@ export function App() {
   const resetProgress = showPose && !loading && !graphicsIssue ? Math.max(0, Math.min(1, pose?.resetProgress ?? 0)) : 0;
   const resetSeconds = Math.max(0.1, (1 - resetProgress) * RESET_HOLD_MS / 1000).toFixed(1);
   const immersiveHeadView = headPerspective.enabled && !setupOpen;
+  const showCameraPreview = liveEnabled && !calibrating
+    && (operatorMode || (visitorPreviewVisible && liveStatus.phase === 'ready'));
   const visibleHint = !immersiveHeadView && !resetProgress && !setupOpen && !calibrating && exhibit && !contextLost && (calibrationSaved || !hasExplored) && (!simulationMode || enabled);
   const hint = calibrationSaved ? 'Calibration saved. Point at the model to try it.'
     : handsEnabled ? visitorCue(pose, simulationMode) : 'Drag to look around. Tap a part to inspect it.';
 
-  return <main className={`explorer${setupOpen ? ' is-setup-open' : ''}`} onKeyDown={event => {
+  return <main className={`explorer${setupOpen ? operatorMode ? ' is-operator' : ' is-setup-open' : ''}`} onKeyDown={event => {
     if (event.key !== 'Escape' || event.defaultPrevented) return;
     if (calibrating) void changeCalibration('cancel');
-    else if (setupOpen) closeSetup();
+    else if (simulatorSetupOpen) closeSetup();
   }}>
-    <h1 className="sr-only">Spatial CAD Explorer</h1>
+    {(!operatorMode || calibrating) && <h1 className="sr-only">Spatial CAD Explorer</h1>}
     <section ref={viewport} className="exhibit" tabIndex={simulationMode ? 0 : undefined} aria-label="Interactive CAD exhibit" aria-describedby={simulationMode ? 'visitor-cue' : undefined}>
       <div className="stage-light" />
       <canvas ref={canvas} className="model" tabIndex={simulationMode ? undefined : 0} aria-label="3D CAD assembly" aria-describedby={simulationMode ? undefined : 'canvas-help'} />
       {!simulationMode && <p id="canvas-help" className="sr-only">Use the arrow keys to orbit, plus and minus to zoom, Enter to select the part in the center, Escape to clear selection, or Home to reset the view.</p>}
-      {!setupOpen && !calibrating && <button ref={setupTrigger} className="setup-trigger" type="button" onClick={openSetup}><Settings size={22} /> Setup</button>}
+      {simulationMode && !setupOpen && <button className="setup-trigger" type="button" onClick={() => setSimulatorSetupOpen(true)}><Settings size={22} /> Setup</button>}
       <p id="visitor-cue" className={visibleHint ? `visitor-hint${simulationMode ? ' simulator-hint' : ''}` : 'sr-only'} aria-live="polite">{hint}</p>
       {resetProgress > 0 && <div className="reset-countdown">
         <ThumbsUp size={21} aria-hidden="true" />
@@ -555,30 +737,33 @@ export function App() {
           <progress value={resetProgress} max={1} aria-hidden="true" />
         </div>
       </div>}
-      {operatorMode && liveEnabled && previewVisible && !calibrating && !immersiveHeadView && <CameraPreview className="navigation-preview" display={liveStatus.display ?? handDisplayKey()} />}
+      {showCameraPreview && <CameraPreview className="navigation-preview" display={liveStatus.display ?? handDisplayKey()} />}
       {!setupOpen && !calibrating && (stageMessage || !exhibit) && <div className="stage-message">
         {stageMessage}
-        {!exhibit && !loading && !graphicsIssue && <div className="empty-stage">
-          <Box size={35} /><p>Open Setup to load an assembly.</p>
-          <button type="button" className="button" onClick={() => void loadStartingModel()}>Load Ultraviolet</button>
+        {!exhibit && !stageMessage && <div className="empty-stage">
+          <Box size={35} /><p>{simulationMode ? 'Open Setup to load an assembly.' : 'Preparing the exhibit…'}</p>
         </div>}
       </div>}
       <HandCursors visible={showPose} controls={cursorControls} />
       {!setupOpen && !calibrating && (simulationMode || focusPart || pose?.target === 'view') && <footer className="exhibit-footer">
         {pose?.target === 'view'
           ? <div className="part-caption">{dualViewGrip ? <Move size={16} /> : <Orbit size={16} />}<span>{dualViewGrip ? 'Pan · Zoom' : 'Exhibit view'}</span></div>
-          : focusPart && <div className="part-caption" aria-live="polite"><Box size={16} /><span>{focusPart.name}</span></div>}
+          : focusPart && <div className="part-caption" aria-live="polite"><Box size={16} /><span>{displayName(focusPart)}</span></div>}
         {simulationMode && <span className="input-status" data-active={enabled && pose?.status !== 'lost' && !rendererError}><i />{enabled ? 'Simulated hands' : 'Simulation paused'}</span>}
       </footer>}
-      {calibrationProgress && <CalibrationPanel step={calibrationProgress.step ?? 0} message={calibrationError ?? calibrationProgress.message ?? null} busy={calibrationBusy}
+      {calibrating && calibrationProgress && <CalibrationPanel step={calibrationProgress.step ?? 0} message={calibrationError ?? calibrationProgress.message ?? null} busy={calibrationBusy}
         captureReady={captureReady} captureHint={captureHint} previewDisplay={calibrationProgress.display} previewToken={calibrationProgress.previewToken}
         onCapture={() => void changeCalibration('capture')} onCancel={() => void changeCalibration('cancel')} />}
     </section>
 
     {setupOpen && <aside id="exhibit-setup" className="setup-panel" aria-labelledby="setup-title">
       <div className="setup-head">
-        <div><h2 id="setup-title">{operatorMode ? 'Operator setup' : 'Exhibit setup'}</h2><p>Choose an assembly and prepare the exhibit.</p></div>
-        <button ref={setupClose} className="button icon-button" type="button" aria-label="Close setup" onClick={closeSetup}><X size={20} /></button>
+        <div>
+          {operatorMode ? <h1 id="setup-title" ref={operatorTitle} tabIndex={-1}>Operator settings</h1> : <h2 id="setup-title">Exhibit setup</h2>}
+          <p>Choose an assembly and prepare the exhibit.</p>
+        </div>
+        {operatorMode ? <a className="button exhibit-link" href="/" onClick={openExhibit}>Open exhibit</a>
+          : <button ref={setupClose} className="button icon-button" type="button" aria-label="Close setup" onClick={closeSetup}><X size={20} /></button>}
       </div>
       <div className="setup-scroll" onDragOver={event => { if (event.dataTransfer.types.includes('Files')) event.preventDefault(); }} onDrop={onDrop}>
         {operatorMode && <HeadPerspectivePanel controls={headPerspective} unavailable={!!graphicsIssue || !exhibit} />}
@@ -587,7 +772,7 @@ export function App() {
             <button className="button" type="button" onClick={toggleLive}>{liveEnabled ? 'Disconnect' : 'Connect'}</button>
           </div>
           <p className="setup-hint" role="status">{!liveEnabled ? 'Touch, mouse, and keyboard controls are ready.'
-            : liveStatus.phase === 'ready' ? navigation === 'fuzzy' ? 'Fuzzy navigation is ready. Close Setup and move an open hand into view.' : 'Connected. Close Setup to use hand gestures.'
+            : liveStatus.phase === 'ready' ? navigation === 'fuzzy' ? 'Fuzzy navigation is ready. Open the exhibit and move an open hand into view.' : 'Connected. Open the exhibit to use hand gestures.'
             : liveStatus.phase === 'calibration' ? liveStatus.message ?? 'This display needs a reach profile. Choose fuzzy navigation or calibrate below.'
             : liveStatus.phase === 'connecting' ? 'Connecting to the local hand camera.' : liveStatus.message ?? 'Camera unavailable. Start the local camera service and check the USB connection. Retrying automatically.'}</p>
           {liveEnabled && <label className="navigation-choice">Hand navigation
@@ -596,12 +781,13 @@ export function App() {
               <option value="calibrated">Calibrated reach</option>
             </select>
           </label>}
-          {liveEnabled && <label className="preview-choice">
-            <input type="checkbox" checked={previewVisible} onChange={event => setPreviewVisible(event.target.checked)} />
-            Show live camera preview
-          </label>}
+          <label className="preview-choice">
+            <input type="checkbox" checked={visitorPreviewVisible} onChange={event => changePreview(event.target.checked)} />
+            Show hand camera preview in the exhibit
+          </label>
           {liveEnabled && (liveStatus.phase === 'ready' || liveStatus.phase === 'calibration') && <button className="button camera-calibrate" type="button" disabled={calibrationBusy || !!graphicsIssue} onClick={() => void changeCalibration('begin')}>{navigation === 'fuzzy' ? 'Optional reach calibration' : 'Calibrate reach'}</button>}
           {calibrationError && <p className="setup-hint" role="alert">{calibrationError}</p>}
+          {calibrationSaved && <p className="setup-hint" role="status">Reach calibration saved.</p>}
           <CameraSettings navigation={navigation} performance={handPerformance} />
         </section>}
         <section className="panel file-panel" aria-label="STEP import">
@@ -614,11 +800,15 @@ export function App() {
           <input ref={picker} type="file" aria-label="STEP file" accept=".step,.stp" onChange={onFile} hidden />
           {stageMessage}
         </section>
-        <AssemblyPanel key={exhibit?.revision ?? 0} roots={roots} index={index} selected={selected} onSelect={id => edit(scene => {
+        <AssemblyPanel key={exhibit?.revision ?? 0} roots={roots} index={index} selected={selected}
+          displayName={displayName} onExportNames={downloadPartNames} onImportNames={file => void receivePartNames(file)} namesMessage={namesMessage} onSelect={id => edit(scene => {
           scene.select(id);
           setSelected(id);
         })} />
-        <PartPanel part={part} details={details} canUndo={scene?.canUndo() ?? false} onColor={color => {
+        <PartPanel part={part} displayName={part && displayName(part)} onDisplayName={name => {
+          const current = currentExhibit.current;
+          if (part && current && current.revision === exhibit?.revision) savePartNames(current, { [part.id]: name });
+        }} details={details} canUndo={scene?.canUndo() ?? false} onColor={color => {
           if (part) edit(scene => scene.color(part.id, color));
         }} onRestore={() => { if (part) edit(scene => scene.reset(part.id)); }} onUndo={() => edit(scene => scene.undo())} />
         <section className="panel camera-panel" aria-label="Camera controls">
