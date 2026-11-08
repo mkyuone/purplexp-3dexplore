@@ -70,6 +70,74 @@ class CustomDepthRangeTests(TestCase):
         self.assertEqual(custom.update([out_of_bounds], 1.08, 3), ())
 
 
+class CalibratedMappingTests(TestCase):
+    def setUp(self):
+        points = [Pose(((0.5 - x) * 0.68, (y - 0.5) * 0.48, 0.7),
+                       ((0.5 - x) * 0.68, (y - 0.5) * 0.48 + 0.04, 0.72)) for x, y in TARGETS]
+        self.calibration = fit(points)
+
+    @staticmethod
+    def project_image(x, y, z):
+        return (0.5 - x) * 0.95 * z / 0.7, (y - 0.5) * 0.48 * z / 0.7, z
+
+    def test_reset_gesture_does_not_require_spatial_reach(self):
+        for palm in ((0.65, 0, 0.7), (0, 0, 1.2)):
+            with self.subTest(palm=palm):
+                mapper = CalibratedMapper(self.calibration, self.project_image)
+                outside = replace(hand(), pose=Pose(palm, palm))
+                self.assertIsNone(self.calibration.project(outside.pose))
+
+                reset, = mapper.update([replace(outside, pointing=False, thumbs_up=True)], 1, 1)
+                self.assertEqual((reset.id, reset.grip, reset.thumbs_up, reset.depth_valid), ('one', 'open', True, True))
+                self.assertTrue(0 <= reset.x <= 1 and 0 <= reset.y <= 1)
+
+                self.assertEqual(mapper.update([replace(outside, grip='fist')], 1.04, 2), ())
+                self.assertEqual(mapper.update([replace(outside, grip='pinch')], 1.08, 3), ())
+                self.assertEqual(mapper.update([replace(outside, pose=None, pointing=False, thumbs_up=True)], 1.12, 4), ())
+
+    def test_rgb_pinch_starts_after_an_open_aim_with_or_without_measured_fingertip_depth(self):
+        for measured_open in (True, False):
+            with self.subTest(measured_open=measured_open):
+                mapper = CalibratedMapper(self.calibration, self.project_image)
+                tip = self.project_image(0.55, 0.5, 0.8)
+                palm = (tip[0], 0.04, 0.82)
+                observed = replace(hand(x=0.55), pose=Pose(tip, palm) if measured_open else None,
+                                   pointing=measured_open)
+                opened, = mapper.update([observed], 1, 1)
+                self.assertEqual(opened.depth_valid, measured_open)
+
+                # Palm depth still exists but neither fingertip can drive the calibrated aim.
+                optical = replace(observed, pose=Pose(palm, palm), pointing=False,
+                                  grip='pinch', image=(0.57, 0.5))
+                grabbed, = mapper.update([optical], 1.04, 2)
+                self.assertEqual((grabbed.id, grabbed.grip, grabbed.depth_valid), (opened.id, 'pinch', False))
+                self.assertGreater(grabbed.x, opened.x)
+
+                tip = self.project_image(*optical.image, 0.95)
+                measured = replace(optical, pose=Pose(tip, (tip[0], 0.04, 0.97)), pointing=True)
+                restored, = mapper.update([measured], 1.08, 3)
+                self.assertTrue(restored.depth_valid)
+                self.assertAlmostEqual(restored.x, grabbed.x)
+                self.assertAlmostEqual(restored.y, grabbed.y)
+
+    def test_outside_optical_aim_does_not_arm_a_pinch_and_depth_reach_only_pauses_held_depth(self):
+        mapper = CalibratedMapper(self.calibration, self.project_image)
+        outside = replace(hand(x=0.98), pose=None, pointing=False)
+        self.assertEqual(mapper.update([outside], 1, 1), ())
+        self.assertEqual(mapper.update([replace(outside, image=(0.5, 0.5), grip='pinch')], 1.04, 2), ())
+
+        initial, = mapper.update([hand(grip='pinch')], 1.08, 3)
+        outside_depth = replace(hand(x=0.55, grip='pinch'), pose=Pose((0, 0, 1.05), (0, 0.04, 1.1)))
+        continued, = mapper.update([outside_depth], 1.12, 4)
+        self.assertFalse(continued.depth_valid)
+        self.assertGreater(continued.x, initial.x)
+        edge, = mapper.update([replace(outside_depth, image=outside.image)], 1.16, 5)
+        self.assertEqual((edge.x, edge.grip, edge.depth_valid), (1.0, 'pinch', False))
+        released, = mapper.update([outside], 1.20, 6)
+        self.assertEqual(released.grip, 'open')
+        self.assertEqual(mapper.update([replace(outside, image=(0.5, 0.5), grip='pinch')], 1.24, 7), ())
+
+
 class FuzzyMappingTests(TestCase):
     def test_aim_mirrors_a_broad_region_and_reaches_soft_edges(self):
         mapper = FuzzyMapper()

@@ -232,6 +232,47 @@ test('an exact pinch hit wins over a recent target from the same hand', t => {
   assert.equal(h.selected(), 'axle')
 })
 
+test('live pinch keeps the aimed part through a closing shift at exhibit scale', async t => {
+  let now = 1000
+  t.mock.method(performance, 'now', () => now)
+  for (const { id, shift, neighbor } of [
+    { id: 'hand-1', shift: -0.018, neighbor: null },
+    { id: 'hand-2', shift: 0.018, neighbor: 'axle' },
+  ]) {
+    await t.test(id, subtest => {
+      const h = harness(subtest, { liveTracking: true, pick: x => Math.abs(x - 0.5) < 0.004 ? 'wheel' : neighbor })
+      h.controller.setViewport(1920, 1080)
+      const open = hand(id, 0.5, 0.4)
+      const closed = { ...open, x: open.x + shift, pinched: true }
+      h.send(open)
+      now += 33
+      h.send({ ...closed, pinched: false, pinchPending: true })
+      assert.equal(h.state().hovered, 'wheel')
+      assert.equal(h.state().held, null)
+      now += 67
+      h.send(closed)
+      assert.equal(h.state().held, 'wheel')
+      assert.deepEqual(h.pose(), h.initial)
+      h.send({ ...closed, x: closed.x + 0.01 })
+      assertVector(h.pose().position, h.initial.position.clone().add(new Vector3(0.01, 0, 0)))
+    })
+  }
+})
+
+test('live pinch follows a new open-hand target and drops a closing target beyond its tolerance', t => {
+  const h = harness(t, { liveTracking: true, pick: x => x < 0.51 ? 'wheel' : x < 0.53 ? 'axle' : null })
+  h.controller.setViewport(1920, 1080)
+  const open = hand('hand-1', 0.5, 0.4)
+  h.send(open)
+  h.send({ ...open, x: 0.52 })
+  h.send({ ...open, x: 0.522, pinched: true })
+  assert.equal(h.state().held, 'axle')
+  h.send(open)
+  h.send({ ...open, x: 0.54, pinchPending: true })
+  h.send({ ...open, x: 0.54, pinched: true })
+  assert.equal(h.state().held, null)
+})
+
 test('recent target acquisition is limited by capture age and circular viewport pixels', async t => {
   let now = 1000
   t.mock.method(performance, 'now', () => now)
@@ -1548,6 +1589,65 @@ test('a thumbs-up without measured depth cannot reset or start orbiting', t => {
   }
   assert.equal(h.state().resetProgress, 0)
   assert.equal(resets, 0)
+})
+
+test('a live reset resumes after a brief lost frame and fist flicker without counting the gap', t => {
+  let now = 1000
+  let resets = 0
+  t.mock.method(performance, 'now', () => now)
+  const h = harness(t, { liveTracking: true, onReset: () => { resets++ } })
+  const open = hand('first', 0.3, 0.4)
+  const thumb = { ...open, thumbsUp: true }
+  h.send(thumb)
+  for (let index = 0; index < 10; index++) {
+    now += 100
+    h.send(thumb)
+  }
+  now += 50
+  h.sendLost()
+  now += 50
+  h.send({ ...open, fist: true })
+  now += 50
+  h.send(thumb)
+  assert.equal(h.state().resetProgress, 1000 / RESET_HOLD_MS)
+  assert.equal(h.state().target, null)
+  assert.equal(resets, 0)
+
+  for (let index = 0; index < 5; index++) {
+    now += 100
+    h.send(thumb)
+  }
+  assert.equal(resets, 1)
+})
+
+test('a reset can rearm after the hand leaves the frame long enough to return with a new ID', t => {
+  let now = 1000
+  let resets = 0
+  t.mock.method(performance, 'now', () => now)
+  const h = harness(t, { liveTracking: true, onReset: () => { resets++ } })
+  function holdThumb(id: string) {
+    const thumb = { ...hand(id, 0.3, 0.4), thumbsUp: true }
+    h.send(thumb)
+    for (let elapsed = 100; elapsed <= RESET_HOLD_MS; elapsed += 100) {
+      now += 100
+      h.send(thumb)
+    }
+  }
+  holdThumb('original')
+  assert.equal(resets, 1)
+
+  now += 50
+  h.sendLost()
+  now += 50
+  holdThumb('renamed')
+  assert.equal(resets, 1)
+
+  for (let index = 0; index < 6; index++) {
+    now += 100
+    h.sendLost()
+  }
+  holdThumb('returned')
+  assert.equal(resets, 2)
 })
 
 test('two thumbs-up choose a stable deterministic owner and changing owner restarts the countdown', t => {

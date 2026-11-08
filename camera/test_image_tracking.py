@@ -174,6 +174,19 @@ class FusedImageTests(TestCase):
                 else:
                     self.assertGreater(hand.pinch_gap, .10)
 
+    def test_distal_depth_disambiguates_a_gap_just_above_the_pinch_threshold(self):
+        self.landmarks[4] = SimpleNamespace(x=.38, y=.25, z=0)
+        palm = (0, .02, .70)
+        index = (0, .03, .70)
+        thumb = (.005, .03, .728)
+        for pad, expected in ((None, 'pinch'), ((.005, .03, .711), 'pinch'), (thumb, 'open')):
+            with self.subTest(pad=pad), patch('realsense.locate_depth', side_effect=[
+                palm, palm, palm, index, thumb, index, pad,
+            ]):
+                hand = fuse_hand(None, self.np, self.landmarks, [], [], self.depth, PINCH)
+                self.assertEqual(classify_grip(hand), expected)
+                self.assertEqual(hand.pinch_gap_corroborated, expected == 'open')
+
     def test_missing_finger_depth_preserves_optical_aim_and_measured_palm(self):
         palm = (0,.02,.7)
         with patch('realsense.grip_features', return_value=OPEN), patch('realsense.locate_depth', side_effect=[palm,palm,palm,None,None]):

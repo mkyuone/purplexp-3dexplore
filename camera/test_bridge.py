@@ -200,7 +200,10 @@ class CalibrationBridgeTests(TestCase):
             self.assertAlmostEqual(restored['y'], moved['y'])
             released, = publish(replace(optical, grip='open'))
             self.assertEqual((released['pinched'], released['depthValid']), (False, False))
-            self.assertEqual(publish(optical), [])
+            regripped, = publish(optical)
+            self.assertEqual((regripped['id'], regripped['pinched'], regripped['depthValid']), (initial['id'], True, False))
+            self.assertAlmostEqual(regripped['x'], released['x'])
+            self.assertAlmostEqual(regripped['y'], released['y'])
 
             publish(measured)
             self.assertEqual(publish(optical, elapsed=0.30), [])

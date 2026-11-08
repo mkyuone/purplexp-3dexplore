@@ -245,12 +245,92 @@ class PinchTrackingTests(TestCase):
         tracker.update([sample()], 1.00)
         closed = sample(gap=0.020, features=GripFeatures(0.39, 1, 2))
         _, (pending,) = tracker.update([closed], 1.04)
-        self.assertEqual(pending.grip, 'open')
+        self.assertEqual((pending.grip, pending.pinch_pending), ('open', True))
         _, (still_pending,) = tracker.update([closed], 1.06)
         self.assertEqual(still_pending.grip, 'open')
         _, (held,) = tracker.update([closed], 1.09)
-        self.assertEqual(held.grip, 'pinch')
+        self.assertEqual((held.grip, held.pinch_pending), ('pinch', False))
         self.assertEqual(held.id, pending.id)
+
+    def test_strong_rgb_closure_confirms_despite_intermittent_fingertip_depth_disagreement(self):
+        for side in ('Left', 'Right'):
+            with self.subTest(side=side):
+                tracker = HandTracker()
+                tracker.update([replace(sample(), side=side)], 1.00)
+                closed = replace(sample(gap=.020, features=CLOSED), side=side, optical_pinch_ratio=.16)
+                disagreement = replace(closed, pinch_gap=.028)
+                for candidate, at in ((closed, 1.03), (disagreement, 1.06)):
+                    _, (pending,) = tracker.update([candidate], at)
+                    self.assertEqual((pending.grip, pending.pinch_pending), ('open', True))
+                _, (held,) = tracker.update([disagreement], 1.10)
+                self.assertEqual(held.grip, 'pinch')
+
+    def test_depth_disagreement_alone_does_not_broaden_the_near_touch_band(self):
+        close = replace(sample(gap=.028, features=CLOSED), optical_pinch_ratio=.16)
+        for still_open in (
+            replace(close, pinch_gap_corroborated=True),
+            replace(close, optical_pinch_ratio=.22),
+            replace(close, pinch_gap=.050),
+        ):
+            with self.subTest(still_open=still_open):
+                tracker = HandTracker()
+                tracker.update([sample()], 1.00)
+                for at in (1.03, 1.07, 1.11):
+                    _, (hand,) = tracker.update([still_open], at)
+                    self.assertEqual((hand.grip, hand.pinch_pending), ('open', False))
+
+    def test_left_pinch_confirms_when_the_measured_gap_and_image_agree_with_a_high_world_ratio(self):
+        tracker = HandTracker()
+        opening = replace(sample(), side='Left', optical_pinch_ratio=.69)
+        _, (initial,) = tracker.update([opening], 1.00)
+        for index, (gap, image_ratio, world_ratio) in enumerate((
+            (.011, .20, .85), (.012, .21, .93), (.009, .18, .86),
+        ), start=1):
+            closed = replace(opening, pinch_gap=gap, optical_pinch_ratio=image_ratio,
+                             features=GripFeatures(world_ratio, 0, 1))
+            _, (current,) = tracker.update([closed], 1.00 + index / 30)
+            self.assertEqual((current.id, current.grip, current.pinch_pending),
+                             (initial.id, 'open' if index < 3 else 'pinch', index < 3))
+
+        moving = replace(closed, pinch_gap=.023, optical_pinch_ratio=.34)
+        _, (held,) = tracker.update([moving], 1.14)
+        self.assertEqual((held.id, held.grip), (initial.id, 'pinch'))
+        _, (released,) = tracker.update([opening], 1.18)
+        self.assertEqual((released.id, released.grip), (initial.id, 'open'))
+
+    def test_tight_measured_gap_or_image_overlap_alone_cannot_override_the_world_ratio(self):
+        closed = replace(sample(gap=.010, features=GripFeatures(.85, 0, 1)), optical_pinch_ratio=.21)
+        for uncertain in (
+            replace(closed, optical_pinch_ratio=.26),
+            replace(closed, pinch_gap=.020),
+            replace(closed, pinch_gap=None, pointing=False),
+        ):
+            with self.subTest(uncertain=uncertain):
+                self.assertEqual(classify_grip(uncertain), 'open')
+
+    def test_a_spurious_fist_can_release_into_a_confirmed_pinch(self):
+        tracker = HandTracker()
+        tracker.update([sample()], 1.00)
+        fist = replace(sample(gap=.018, features=GripFeatures(.26, 4, 4)), optical_pinch_ratio=.16)
+        _, (fisted,) = tracker.update([fist], 1.03)
+        self.assertEqual(fisted.grip, 'fist')
+
+        closed = replace(fist, features=GripFeatures(.30, 2, 3))
+        _, (pending,) = tracker.update([closed], 1.06)
+        self.assertEqual(pending.grip, 'fist')
+        _, (released,) = tracker.update([closed], 1.10)
+        self.assertEqual((released.id, released.grip, released.pinch_pending), (fisted.id, 'open', True))
+        _, (held,) = tracker.update([closed], 1.13)
+        self.assertEqual((held.id, held.grip), (fisted.id, 'pinch'))
+
+    def test_a_fist_does_not_change_grip_from_optical_overlap_without_measured_fingers(self):
+        tracker = HandTracker()
+        fist = replace(sample(features=GripFeatures(.26, 4, 4)), optical_pinch_ratio=.16)
+        tracker.update([fist], 1.00)
+        overlap = optical_sample(features=GripFeatures(.30, 2, 3))
+        for at in (1.03, 1.07, 1.11):
+            _, (hand,) = tracker.update([overlap], at)
+            self.assertEqual((hand.grip, hand.pinch_pending), ('fist', False))
 
     def test_brief_false_closure_is_canceled_by_an_open_sample(self):
         tracker = HandTracker()

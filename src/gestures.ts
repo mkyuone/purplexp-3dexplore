@@ -9,6 +9,7 @@ export interface HandPose {
   readonly depth: number
   readonly depthValid: boolean
   readonly pinched: boolean
+  readonly pinchPending?: boolean
   readonly fist?: boolean
   readonly thumbsUp?: boolean
 }
@@ -99,11 +100,14 @@ interface ActiveGrip {
 
 export const FRAME_MAX_AGE_MS = 240
 export const RESET_HOLD_MS = 1500
+const RESET_DROPOUT_GRACE_MS = 180
+const RESET_RELEASE_CONFIRM_MS = 400
 export const LIVE_PINCH_CONTINUITY_MS = 320
 const MIN_HAND_SEPARATION = 0.06
 const RESUME_HAND_SEPARATION = 0.08
 const TARGET_GRACE_MS = 200
 const TARGET_GRACE_PX = 28
+const LIVE_TARGET_GRACE_FRACTION = 0.025
 const TRACKING_GRACE_MS = 150
 const CLOSED_GRIP_CONFIRM_MS = 100
 const PINCH_REIDENTIFY_DISTANCE = 0.08
@@ -142,7 +146,7 @@ function sameHands(left: readonly HandPose[], right: readonly HandPose[]) {
     return hand.id === other.id && hand.x === other.x && hand.y === other.y
       && hand.depth === other.depth && hand.depthValid === other.depthValid
       && hand.pinched === other.pinched && Boolean(hand.fist) === Boolean(other.fist)
-      && Boolean(hand.thumbsUp) === Boolean(other.thumbsUp)
+      && Boolean(hand.thumbsUp) === Boolean(other.thumbsUp) && Boolean(hand.pinchPending) === Boolean(other.pinchPending)
   })
 }
 
@@ -180,10 +184,10 @@ export class GestureController {
   private closedCandidate: ClosedCandidate | null = null
   private hovered: string[] = []
   private hoverCandidates = new Map<string, { id: string; x: number; y: number; capturedAt: number }>()
-  private resetCandidate: { id: string; capturedAt: number; elapsed: number } | null = null
-  // Keep this latch across source loss and cancellation: missing frames are not
-  // evidence that the visitor released a thumbs-up that already fired.
+  private resetCandidate: { id: string; capturedAt: number; elapsed: number; paused: boolean } | null = null
+  // Keep the latch through a dropped frame or stream restart.
   private resetOwner: string | null = null
+  private resetReleaseSince: number | null = null
   private state: GestureState = {
     status: 'ready', hands: [], activeHands: [], resetProgress: 0, hovered: null, held: null, target: null, join: null,
   }
@@ -211,6 +215,7 @@ export class GestureController {
 
   // Call on source replacement, after detaching the previous stream's listener.
   resetStream(allowClosedRecovery = this.liveTracking) {
+    this.resetReleaseSince = null
     this.lastSequence = -1
     this.lastCapture = -Infinity
     this.lastReceivedAt = -Infinity
@@ -220,6 +225,7 @@ export class GestureController {
 
   cancel() {
     this.resetCandidate = null
+    this.resetReleaseSince = null
     this.endGrip()
     this.armed.clear()
     this.hoverCandidates.clear()
@@ -266,7 +272,13 @@ export class GestureController {
     const hands = frame.hands.filter(isUsableHand)
     const ambiguous = frame.tracking === 'ambiguous' || frame.hands.length > 2
       || new Set(frame.hands.map(hand => hand.id)).size !== frame.hands.length
+    this.observeResetRelease(hands, frame.capturedAt, gap, ambiguous)
     if (frame.tracking === 'lost' || ambiguous) {
+      if (!ambiguous && this.pauseReset(frame.capturedAt)) {
+        this.updateState([])
+        if (this.timeout === undefined) this.checkTimeout()
+        return
+      }
       this.interruptTracking(previousCapture, previousReceipt, ambiguous)
       return
     }
@@ -341,13 +353,15 @@ export class GestureController {
       return
     }
 
+    const aimTolerance = this.liveTracking ? LIVE_TARGET_GRACE_FRACTION : 0
+    const radiusX = Math.max(TARGET_GRACE_PX / this.viewportWidth, aimTolerance)
+    const radiusY = Math.max(TARGET_GRACE_PX / this.viewportHeight, aimTolerance)
     for (const [id, candidate] of this.hoverCandidates) {
       const hand = hands.find(hand => hand.id === id)
       if (!hand || frame.capturedAt - candidate.capturedAt > TARGET_GRACE_MS
-        || Math.hypot(
-          (hand.x - candidate.x) * this.viewportWidth,
-          (hand.y - candidate.y) * this.viewportHeight,
-        ) > TARGET_GRACE_PX) this.hoverCandidates.delete(id)
+        || Math.hypot((hand.x - candidate.x) / radiusX, (hand.y - candidate.y) / radiusY) > 1) {
+        this.hoverCandidates.delete(id)
+      }
     }
 
     if (hands.length) {
@@ -427,19 +441,41 @@ export class GestureController {
     this.updateState([])
   }
 
+  private observeResetRelease(hands: readonly HandPose[], capturedAt: number, gap: number, ambiguous: boolean) {
+    if (this.resetOwner === null) return
+    const owner = hands.find(hand => hand.id === this.resetOwner)
+    if (ambiguous || (owner && !owner.depthValid) || hands.some(hand => hand.thumbsUp)) {
+      this.resetReleaseSince = null
+      return
+    }
+    // An open hand releases immediately. When it leaves the frame, require a
+    // series of fresh observations without the gesture before rearming.
+    if (this.resetReleaseSince === null || gap >= FRAME_MAX_AGE_MS) this.resetReleaseSince = capturedAt
+    if ((owner && isNeutral(owner)) || capturedAt - this.resetReleaseSince >= RESET_RELEASE_CONFIRM_MS) {
+      this.resetOwner = null
+      this.resetReleaseSince = null
+    }
+  }
+
+  private pauseReset(capturedAt: number) {
+    const candidate = this.resetCandidate
+    if (!this.liveTracking || !candidate || capturedAt - candidate.capturedAt > RESET_DROPOUT_GRACE_MS) {
+      this.resetCandidate = null
+      return false
+    }
+    candidate.paused = true
+    return true
+  }
+
   private updateReset(hands: readonly HandPose[], capturedAt: number) {
     const thumbs = hands.filter(hand => hand.depthValid && hand.thumbsUp)
-    const firstThumb = () => thumbs.reduce((first, hand) => hand.id < first.id ? hand : first)
-    if (this.resetOwner !== null) {
-      const owner = hands.find(hand => hand.id === this.resetOwner)
-      if (owner?.depthValid && !owner.thumbsUp && !thumbs.length) this.resetOwner = null
-      else if (!owner && thumbs.length) {
-        // A restarted source may rename a still-held hand. Retain the lock and
-        // require this newly observed owner to release before another reset.
-        this.resetOwner = firstThumb().id
-      }
-    }
     if (!thumbs.length) {
+      const candidate = this.resetCandidate
+      const hand = candidate && hands.find(hand => hand.id === candidate.id)
+      if ((!hand || !hand.depthValid || hand.fist) && this.pauseReset(capturedAt)) {
+        this.updateState(hands)
+        return true
+      }
       this.resetCandidate = null
       return false
     }
@@ -449,17 +485,25 @@ export class GestureController {
     this.hoverCandidates.clear()
     this.recoverClosed = false
     this.recovering = false
+    const firstThumb = () => thumbs.reduce((first, hand) => hand.id < first.id ? hand : first)
     if (this.resetOwner !== null) {
+      // Tracking may rename a still-held hand during a source restart.
+      if (!hands.some(hand => hand.id === this.resetOwner)) this.resetOwner = firstThumb().id
       this.resetCandidate = null
       this.updateState(hands)
       return true
     }
     const hand = thumbs.find(hand => hand.id === this.resetCandidate?.id) ?? firstThumb()
-    if (this.resetCandidate?.id === hand.id) {
-      this.resetCandidate.elapsed += capturedAt - this.resetCandidate.capturedAt
-      this.resetCandidate.capturedAt = capturedAt
-    } else this.resetCandidate = { id: hand.id, capturedAt, elapsed: 0 }
-    if (this.resetCandidate.elapsed >= RESET_HOLD_MS) {
+    let candidate = this.resetCandidate
+    if (candidate?.id === hand.id && (!candidate.paused || capturedAt - candidate.capturedAt <= RESET_DROPOUT_GRACE_MS)) {
+      if (!candidate.paused) candidate.elapsed += capturedAt - candidate.capturedAt
+      candidate.capturedAt = capturedAt
+      candidate.paused = false
+    } else {
+      candidate = { id: hand.id, capturedAt, elapsed: 0, paused: false }
+      this.resetCandidate = candidate
+    }
+    if (candidate.elapsed >= RESET_HOLD_MS) {
       this.resetOwner = hand.id
       this.resetCandidate = null
       this.updateState(hands)
@@ -471,8 +515,9 @@ export class GestureController {
   private startGrip(first: HandPose, hands: readonly HandPose[], fresh: readonly HandPose[] = []) {
     let part: PartGrip | null = null
     if (first.pinched) {
-      // Closing the fingers can move the aim just beyond the highlighted surface.
-      const id = this.scene.pick(first.x, first.y) ?? this.hoverCandidates.get(first.id)?.id
+      // Use the highlighted part when the live fingertip shifts a little as it closes.
+      const aimedPart = this.hoverCandidates.get(first.id)?.id
+      const id = this.liveTracking && aimedPart ? aimedPart : this.scene.pick(first.x, first.y) ?? aimedPart
       if (!id) return false
       const pose = this.scene.getPose(id)
       if (!pose) return false
@@ -851,9 +896,10 @@ export class GestureController {
     const hovered: string[] = []
     if (!grip) {
       for (const hand of hands.filter(isNeutral)) {
-        const id = this.scene.pick(hand.x, hand.y)
-        if (id === null) continue
-        if (this.armed.has(hand.id)) {
+        // A pinch awaiting confirmation still arms the hand, but must not change its target.
+        const id = hand.pinchPending ? this.hoverCandidates.get(hand.id)?.id : this.scene.pick(hand.x, hand.y)
+        if (!id) continue
+        if (!hand.pinchPending && this.armed.has(hand.id)) {
           this.hoverCandidates.set(hand.id, { id, x: hand.x, y: hand.y, capturedAt: this.lastCapture })
         }
         if (!hovered.includes(id)) hovered.push(id)

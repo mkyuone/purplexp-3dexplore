@@ -770,7 +770,10 @@ export function App() {
         {operatorMode && <HeadPerspectivePanel controls={headPerspective} unavailable={!!graphicsIssue || !exhibit} />}
         {operatorMode && <section className="panel" aria-label="Live hand camera">
           <div className="panel-heading"><h2>Hand camera</h2>
-            <button className="button" type="button" onClick={toggleLive}>{liveEnabled ? 'Disconnect' : 'Connect'}</button>
+            <div className="hand-camera-actions">
+              <a className="button" href="/diagnostics" target="_blank" rel="noopener">Diagnostics<span className="sr-only"> (opens in a new tab)</span></a>
+              <button className="button" type="button" onClick={toggleLive}>{liveEnabled ? 'Disconnect' : 'Connect'}</button>
+            </div>
           </div>
           <p className="setup-hint" role="status">{!liveEnabled ? 'Touch, mouse, and keyboard controls are ready.'
             : liveStatus.phase === 'ready' ? navigation === 'fuzzy' ? 'Fuzzy navigation is ready. Open the exhibit and move an open hand into view.' : 'Connected. Open the exhibit to use hand gestures.'

@@ -17,6 +17,10 @@ CORNERS = (0, 1, 2, 3)
 CENTER = 4
 
 
+def aim_in_bounds(x: float, y: float) -> bool:
+    return -OVERSCAN <= x <= 1 + OVERSCAN and -OVERSCAN <= y <= 1 + OVERSCAN
+
+
 def subtract(a: Vec3, b: Vec3) -> Vec3:
     return a[0] - b[0], a[1] - b[1], a[2] - b[2]
 
@@ -126,6 +130,10 @@ class Calibration:
     def uses_ray_projection(self) -> bool:
         return self.plane.ray_depth is not None
 
+    @property
+    def reference_tip_depth_m(self) -> float:
+        return self.plane.origin[2]
+
     def aim(self, tip: Vec3) -> tuple[float, float]:
         return self.plane.aim(tip)
 
@@ -134,7 +142,7 @@ class Calibration:
         if not pose.valid():
             return None
         x, y = self.aim(pose.tip)
-        if not (-OVERSCAN <= x <= 1 + OVERSCAN and -OVERSCAN <= y <= 1 + OVERSCAN):
+        if not aim_in_bounds(x, y):
             return None
         if depth_range is None:
             palm_travel = dot(pose.palm, self.plane.normal) - self.neutral_depth_m

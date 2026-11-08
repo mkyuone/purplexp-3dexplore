@@ -22,11 +22,17 @@ MIN_IMAGE_PALM_SEPARATION = 0.06
 CLOSE_PAIR_IMAGE_SEPARATION = 0.025
 CLOSE_PAIR_IMAGE_TRAVEL = 0.025
 IMAGE_MATCH_PENALTY = 0.03
+SIDE_LABEL_GRACE_SECONDS = 0.10
+SIDE_LABEL_MAX_IMAGE_TRAVEL = 0.025
 PINCH_START_GAP_M = 0.024
+PINCH_DISAGREEMENT_GAP_M = 0.032
 PINCH_END_GAP_M = 0.052
 PINCH_START_RATIO = 0.42
 PINCH_END_RATIO = 0.64
+MEASURED_IMAGE_PINCH_START_GAP_M = 0.018
+MEASURED_IMAGE_PINCH_START_RATIO = 0.25
 PINCH_CONFIRM_SECONDS = 0.035
+PINCH_DISAGREEMENT_CONFIRM_SECONDS = 0.065
 PINCH_CONFIRM_MAX_INTERVAL = TRACK_TIMEOUT
 PINCH_EVIDENCE_GRACE = 0.12
 OPTICAL_PINCH_START_RATIO = 0.24
@@ -34,6 +40,8 @@ OPTICAL_PINCH_HOLD_RATIO = 0.38
 OPTICAL_PINCH_OPEN_RATIO = 0.50
 OPTICAL_WORLD_START_RATIO = 0.34
 OPTICAL_WORLD_HOLD_RATIO = 0.52
+STRONG_IMAGE_PINCH_RATIO = 0.20
+STRONG_WORLD_PINCH_RATIO = 0.32
 OPTICAL_CLEAR_OPEN_RATIO = 0.60
 OPTICAL_WORLD_CLEAR_OPEN_RATIO = 0.60
 GRIP_RELEASE_CONFIRM_SECONDS = 0.065
@@ -62,6 +70,7 @@ class Candidate:
     optical_pinch_ratio: float | None = None
     thumbs_up: bool = False
     thumb_depth_m: float | None = None
+    pinch_gap_corroborated: bool = False
 
 
 @dataclass(frozen=True)
@@ -73,6 +82,7 @@ class Hand:
     # Unmirrored normalized aim in the aligned RGB image.
     image: Vec2 | None = None
     thumbs_up: bool = False
+    pinch_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,6 +99,7 @@ class Track:
     image_palm: Vec2 | None = None
     pinch_had_depth: bool = False
     release_handoff: bool = False
+    side_observed_at: float | None = None
 
 
 def grip_features(points: list[Vec3]) -> GripFeatures | None:
@@ -122,14 +133,18 @@ def classify_grip(candidate: Candidate, previous: Grip = 'open') -> Grip:
     features = candidate.features
     gap = candidate.pinch_gap if candidate.pose is not None else None
     if previous == 'fist':
-        return 'fist' if features.loosely_folded >= 3 else 'open'
+        if features.loosely_folded < 3:
+            return 'open'
+        if (candidate.pointing and gap is not None and gap <= PINCH_START_GAP_M
+                and strong_rgb_closure(candidate)):
+            return 'pinch'
+        return 'fist'
     if previous == 'pinch' and clear_pinch_opening(candidate):
         return 'open'
     if previous != 'pinch' and features.folded == 4:
         return 'fist'
     if gap is None:
-        # Both optical estimates must agree. An actual measured gap takes
-        # precedence when both fingertips have depth.
+        # Both optical estimates must agree when either fingertip lacks depth.
         ratio = valid_optical_ratio(candidate)
         if (ratio is None or (candidate.pose is not None and not candidate.pose.valid())
                 or features.folded == 4 or features.loosely_folded == 4):
@@ -139,9 +154,11 @@ def classify_grip(candidate: Candidate, previous: Grip = 'open') -> Grip:
         else:
             closed = ratio <= OPTICAL_PINCH_START_RATIO and 0 <= features.pinch_ratio <= OPTICAL_WORLD_START_RATIO
     elif previous == 'pinch':
-        closed = gap < PINCH_END_GAP_M and features.pinch_ratio < PINCH_END_RATIO and features.folded < 4
+        closed = (gap < PINCH_END_GAP_M and features.pinch_ratio < PINCH_END_RATIO and features.folded < 4
+                  or measured_image_closure(candidate, PINCH_START_GAP_M, OPTICAL_PINCH_HOLD_RATIO))
     else:
-        closed = gap <= PINCH_START_GAP_M and features.pinch_ratio <= PINCH_START_RATIO
+        closed = (gap <= PINCH_START_GAP_M and features.pinch_ratio <= PINCH_START_RATIO
+                  or uncertain_pinch_gap(candidate) or world_pinch_disagreement(candidate))
     return 'pinch' if closed else 'open'
 
 
@@ -215,6 +232,34 @@ def valid_optical_ratio(candidate: Candidate) -> float | None:
     return ratio
 
 
+def strong_rgb_closure(candidate: Candidate) -> bool:
+    ratio = valid_optical_ratio(candidate)
+    return (ratio is not None and ratio <= STRONG_IMAGE_PINCH_RATIO
+            and 0 <= candidate.features.pinch_ratio <= STRONG_WORLD_PINCH_RATIO
+            and candidate.features.loosely_folded < 4)
+
+
+def measured_image_closure(candidate: Candidate, max_gap: float, max_ratio: float) -> bool:
+    ratio = valid_optical_ratio(candidate)
+    return (candidate.pose is not None and candidate.pointing and candidate.pinch_gap is not None
+            and 0 <= candidate.pinch_gap <= max_gap and ratio is not None and ratio <= max_ratio
+            and candidate.features.loosely_folded < 4)
+
+
+def world_pinch_disagreement(candidate: Candidate) -> bool:
+    # A tilted hand can have adjacent fingertips in aligned stereo and the
+    # image even when the model's inferred 3D landmarks place them far apart.
+    return (candidate.features.pinch_ratio > PINCH_START_RATIO
+            and measured_image_closure(candidate, MEASURED_IMAGE_PINCH_START_GAP_M, MEASURED_IMAGE_PINCH_START_RATIO))
+
+
+def uncertain_pinch_gap(candidate: Candidate) -> bool:
+    gap = candidate.pinch_gap
+    return (candidate.pose is not None and candidate.pointing and gap is not None
+            and PINCH_START_GAP_M < gap <= PINCH_DISAGREEMENT_GAP_M
+            and not candidate.pinch_gap_corroborated and strong_rgb_closure(candidate))
+
+
 def clear_pinch_opening(candidate: Candidate) -> bool:
     ratio = valid_optical_ratio(candidate)
     world_ratio = candidate.features.pinch_ratio
@@ -233,7 +278,7 @@ def tracking_alpha(elapsed: float, travel: float, still: float, moving: float) -
     return 1 - exp(-max(0.001, elapsed) / seconds)
 
 
-def match_cost(sample: Candidate, track: Track) -> float | None:
+def match_cost(sample: Candidate, track: Track, *, allow_side_disagreement: bool = False) -> float | None:
     side_changed = sample.side is not None and track.side is not None and sample.side != track.side
     if sample.pose is not None and track.palm is not None:
         distance = dist(sample.pose.palm, track.palm)
@@ -243,9 +288,11 @@ def match_cost(sample: Candidate, track: Track) -> float | None:
         return distance + (0.045 if side_changed else 0)
     # The cursor changes between fingertip and palm. Identity always compares
     # current palm anchors, with a tighter gate when the hand was absent.
-    if side_changed or not valid_image(sample.image_palm) or not valid_image(track.image_palm):
+    if not valid_image(sample.image_palm) or not valid_image(track.image_palm):
         return None
     distance = dist(sample.image_palm, track.image_palm)
+    if side_changed and (not allow_side_disagreement or distance > SIDE_LABEL_MAX_IMAGE_TRAVEL):
+        return None
     limit = REACQUIRE_IMAGE_TRAVEL if track.interrupted else MAX_IMAGE_TRAVEL
     return distance + IMAGE_MATCH_PENALTY if distance <= limit else None
 
@@ -274,7 +321,7 @@ class HandTracker:
             self.reset()
         return tracking, ()
 
-    def assignments(self, samples: list[Candidate]) -> tuple[int, ...] | None:
+    def assignments(self, samples: list[Candidate], *, allow_side_disagreement: bool = False) -> tuple[int, ...] | None:
         # There are at most two hands. Rank the small set of one-to-one
         # assignments by continuity, using MediaPipe's handedness as a hint.
         candidates: list[tuple[int, float, tuple[int, ...]]] = []
@@ -283,7 +330,7 @@ class HandTracker:
             if len(set(matched)) != len(matched):
                 continue
             costs = [
-                match_cost(sample, self.tracks[index])
+                match_cost(sample, self.tracks[index], allow_side_disagreement=allow_side_disagreement)
                 for sample, index in zip(samples, assignment) if index >= 0
             ]
             if any(cost is None for cost in costs):
@@ -348,7 +395,16 @@ class HandTracker:
             if track.observed_at is not None and 0 <= at - track.observed_at < TRACK_TIMEOUT
         )
 
-        assignment = self.assignments(observed)
+        # An isolated, continuously visible palm can outvote a brief label
+        # flip in RGB. Keep strict matching if another hand could own it.
+        allow_side_disagreement = False
+        if len(samples) == len(self.tracks) == 1:
+            track, = self.tracks
+            allow_side_disagreement = (
+                track.published and not track.interrupted and track.side_observed_at is not None
+                and at - track.side_observed_at <= SIDE_LABEL_GRACE_SECONDS
+            )
+        assignment = self.assignments(observed, allow_side_disagreement=allow_side_disagreement)
         if assignment is None or (close_rgb_pair and not self.continues_measured_pair(observed, assignment, at)):
             return self.pause(at, 'ambiguous')
         next_tracks = []
@@ -367,7 +423,9 @@ class HandTracker:
             optical_aim = valid_image(sample.image_index)
             optical_ratio = valid_optical_ratio(sample)
             optically_open = optical_ratio is not None and optical_ratio >= OPTICAL_PINCH_OPEN_RATIO
-            optical_pinch = gap is None and grip == 'pinch'
+            disagreeing_pinch = (grip == 'pinch' and previous_grip == 'open'
+                                 and (uncertain_pinch_gap(sample) or world_pinch_disagreement(sample)))
+            optical_pinch = grip == 'pinch' and (gap is None or disagreeing_pinch)
             private_candidate = not previous.published if previous else optical_pinch
             pinch_since = None
             pinch_evidence_at = None
@@ -406,7 +464,12 @@ class HandTracker:
                     pinch_since = at
                     if previous and not resuming and elapsed <= PINCH_CONFIRM_MAX_INTERVAL and previous.pinch_since is not None:
                         pinch_since = previous.pinch_since
-                    if at - pinch_since < PINCH_CONFIRM_SECONDS:
+                    confirmation = PINCH_DISAGREEMENT_CONFIRM_SECONDS if disagreeing_pinch else PINCH_CONFIRM_SECONDS
+                    if at - pinch_since < confirmation:
+                        grip = previous_grip
+                    elif previous_grip == 'fist':
+                        # Publish the deliberate fist release before a pinch so
+                        # the exhibit can finish the view grip and arm the part grip.
                         grip = 'open'
             confirm_handoff_release = depth_handoff and opening_supported and not clear_pinch_opening(sample)
             if previous is not None and grip == 'open' and (
@@ -474,16 +537,25 @@ class HandTracker:
                 self.next_id += 1
                 identifier = f'hand-{self.next_id}'
 
-            side = sample.side if sample.side is not None else previous.side if previous else None
+            side = sample.side
+            side_observed_at = at if side is not None else None
+            if previous is not None and (side is None or (
+                previous.side is not None and side != previous.side and (measured is None or previous.palm is None)
+            )):
+                # An RGB match admitted despite its label does not teach the
+                # tracker the opposite side or extend the grace period.
+                side, side_observed_at = previous.side, previous.side_observed_at
             pose = None
             if palm is not None:
                 pose = Pose(tip if tip is not None and not palm_anchor and pointing else palm, palm)
-            hand = Hand(identifier, pose, grip, pointing, image, thumbs_up)
+            hand = Hand(identifier, pose, grip, pointing, image, thumbs_up,
+                        pinch_pending=grip == 'open' and pinch_since is not None)
             next_tracks.append(Track(
                 hand, measured.palm if measured is not None else None, side, pinch_since, pinch_evidence_at,
                 release_since, published, at, image_palm=sample.image_palm,
                 pinch_had_depth=grip == 'pinch' and pinch_had_depth,
                 release_handoff=confirm_handoff_release,
+                side_observed_at=side_observed_at,
             ))
 
         hands = tuple(track.hand for track in sorted(next_tracks, key=lambda track: track.hand.id) if track.published)

@@ -5,7 +5,8 @@ from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
-from realsense import CameraError, CameraFeed, CameraSample, DepthMatcher, DepthStream, PreviewEncoder, image_projector
+from infrared_preview import InfraredPreview
+from realsense import CameraError, CameraFeed, CameraSample, DepthMatcher, DepthStream, PreviewEncoder, image_projector, open_depth
 
 
 def sample(number, timestamp, domain='camera', arrival=None):
@@ -98,6 +99,76 @@ class CaptureTests(TestCase):
             finally:
                 stream.close()
         self.assertFalse(stream.thread.is_alive())
+
+    def test_infrared_uses_both_matched_profiles_and_routes_only_depth_to_the_matcher(self):
+        def profile(stream, fmt, index, width=848):
+            value = SimpleNamespace(stream_type=lambda: stream, format=lambda: fmt, fps=lambda: 30,
+                                    stream_index=lambda: index, width=lambda: width, height=lambda: 480)
+            value.as_video_stream_profile = lambda: value
+            return value
+
+        depth, first, second = (profile('depth', 'z16', 0), profile('infrared', 'y8', 1), profile('infrared', 'y8', 2))
+        sensor = Mock()
+        sensor.get_stream_profiles.return_value = [profile('infrared', 'y8', 1, 640), second, depth, first]
+        queue, infrared = Mock(), Mock()
+        sdk = SimpleNamespace(stream=SimpleNamespace(depth='depth', infrared='infrared'),
+                              format=SimpleNamespace(z16='z16', y8='y8'), frame_queue=lambda _: queue,
+                              option=SimpleNamespace(global_time_enabled='clock', emitter_enabled='emitter'))
+
+        with open_depth(sdk, SimpleNamespace(first_depth_sensor=lambda: sensor), 30, (848,), infrared=infrared) as (opened, output):
+            self.assertIs(opened, depth)
+            self.assertIs(output, queue)
+            sensor.open.assert_called_once_with([depth, first, second])
+            receive, = sensor.start.call_args.args
+            for current in (first, depth, second):
+                frame = SimpleNamespace(get_profile=lambda current=current: current)
+                receive(frame)
+            self.assertEqual(queue.enqueue.call_count, 1)
+            self.assertIs(queue.enqueue.call_args.args[0].get_profile(), depth)
+            self.assertEqual([call.args[0] for call in infrared.submit.call_args_list], [1, 2])
+        sensor.stop.assert_called_once()
+        sensor.close.assert_called_once()
+
+    def test_infrared_lease_returns_only_fresh_frames_and_expires(self):
+        preview = InfraredPreview()
+        with patch('infrared_preview.monotonic', return_value=10) as now:
+            self.assertFalse(preview.wanted())
+            self.assertIsNone(preview.request(1))
+            preview.publish(1, 10, b'left')
+            preview.publish(2, 10, b'right')
+            self.assertTrue(preview.fresh_pair(.65))
+            self.assertEqual(preview.request(2), b'right')
+            now.return_value = 10.8
+            self.assertIsNone(preview.request(1))
+            now.return_value = 12.5
+            self.assertFalse(preview.wanted())
+            self.assertIsNone(preview.request(2))
+
+    def test_unavailable_infrared_restores_normal_depth_during_the_same_viewer_lease(self):
+        attempts = []
+        depth_started = Event()
+        sdk = SimpleNamespace(distortion=SimpleNamespace(modified_brown_conrady='modified'))
+        color = SimpleNamespace(intrinsics=SimpleNamespace(model='none'))
+        infrared = Mock()
+        encoder = Mock()
+
+        @contextmanager
+        def open_modes(rs, device, fps, widths, *, infrared=None):
+            attempts.append(infrared)
+            if infrared is not None:
+                raise CameraError('Infrared profiles unavailable')
+            yield SimpleNamespace(width=lambda: 848), None
+
+        with (patch('realsense.open_depth', side_effect=open_modes),
+              patch('realsense.InfraredEncoder', return_value=encoder), patch('realsense.logging.warning')):
+            stream = DepthStream(sdk, None, color, 30, lambda *_: depth_started.set(), infrared=infrared, cv2=object())
+            try:
+                self.assertTrue(depth_started.wait(1))
+                self.assertEqual(attempts, [encoder, None])
+                infrared.fail.assert_called_once()
+                encoder.close.assert_called_once()
+            finally:
+                stream.close()
 
     def test_project_image_uses_normalized_color_pixels_at_the_supplied_depth(self):
         intrinsics = SimpleNamespace(width=640, height=480)

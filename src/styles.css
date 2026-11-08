@@ -243,6 +243,7 @@ button svg { flex: none; }
 .undo-button { margin-top: 8px; }
 .panel-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 10px; }
 .panel-heading h2 { margin: 0; }
+.hand-camera-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
 .sim-toggle { display: flex; width: 39px; height: 23px; align-items: center; border: 1px solid #66577a; border-radius: 20px; padding: 3px; background: #322742; }
 .sim-toggle span { width: 15px; height: 15px; border-radius: 50%; background: #cfc1df; }
 .sim-toggle[aria-checked="true"] { justify-content: flex-end; background: #7453a4; }

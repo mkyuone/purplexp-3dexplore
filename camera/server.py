@@ -352,6 +352,7 @@ class CameraService:
         if (frame.tracking == 'tracking' and any(hand.grip == 'open' for hand in frame.hands)
                 and not any(hand.thumbs_up for hand in frame.hands)):
             self.suppress_thumb_session = None
+            return False
         return True
 
     def refresh_navigation(self, info: CameraInfo) -> None:
@@ -402,6 +403,7 @@ class CameraService:
                 'id': hand.id, 'x': hand.x, 'y': hand.y, 'depth': hand.depth, 'depthValid': hand.depth_valid,
                 'pinched': hand.grip == 'pinch' and not hand.thumbs_up,
                 'fist': hand.grip == 'fist' and not hand.thumbs_up, 'thumbsUp': hand.thumbs_up and not suppress_thumb,
+                **({'pinchPending': True} if hand.pinch_pending else {}),
             } for hand in mapped]
             age = monotonic() - frame.at
             if stale := stale_pose(age):
@@ -412,6 +414,29 @@ class CameraService:
                 'depthRangeRevision': self.depth_range_revision,
                 'ageMs': max(0, age * 1000), 'tracking': tracking, 'hands': hands,
             }
+
+    def diagnostics(self) -> dict:
+        with self.lock:
+            snapshot = self.feed.snapshot()
+            if snapshot.error:
+                return {**offline(snapshot.error), 'hands': []}
+            if message := camera_problem(snapshot):
+                return {'status': 'waiting', 'message': message, 'hands': []}
+            assert snapshot.info is not None and snapshot.frame is not None
+            reset_suppressed = self.suppress_capture_thumb(snapshot.info, snapshot.frame)
+        observations = snapshot.frame.hand_diagnostics
+        hands = [hand.row() for hand in observations if hand.side is not None]
+        result = {'status': 'ready', 'hands': hands, 'unassignedHands': len(observations) - len(hands)}
+        if reset_suppressed:
+            result['resetSuppressed'] = True
+        if message := self.feed.infrared_status():
+            result['infraredMessage'] = message
+        return result
+
+    def diagnostic_frame(self, stream: str) -> bytes | None:
+        if stream == 'rgb':
+            return self.feed.request_diagnostic_rgb()
+        return self.feed.request_infrared(1 if stream == 'ir1' else 2)
 
     def preview(self, display: str, token: str | None) -> bytes | None:
         with self.lock:
@@ -574,7 +599,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         if not self.allowed(require_origin=True):
             self.send_json(403, {'message': 'Only the local Explorer can access the camera bridge.'})
-        elif self.path.split('?', 1)[0] not in {'/poses', '/calibration', '/preview', '/settings', '/depth-range'}:
+        elif self.path.split('?', 1)[0] not in {
+            '/poses', '/calibration', '/preview', '/settings', '/depth-range', '/diagnostics', '/diagnostics/frame',
+        }:
             self.send_json(404, {'message': 'Unknown camera bridge endpoint.'})
         else:
             self.send_json(204)
@@ -595,6 +622,23 @@ class Handler(BaseHTTPRequestHandler):
             return
         if url.path == '/depth-range' and not query:
             self.send_json(200, self.server.service.depth_range())
+            return
+        if url.path in {'/diagnostics', '/diagnostics/frame'}:
+            if not self.allowed(require_origin=True):
+                self.send_json(403, {'message': 'Only the local Explorer can access camera diagnostics.'})
+                return
+            if url.path == '/diagnostics':
+                if query:
+                    self.send_json(400, {'message': 'Invalid camera diagnostics request.'})
+                else:
+                    self.send_json(200, self.server.service.diagnostics())
+                return
+            streams = query.get('stream', [])
+            if set(query) != {'stream'} or len(streams) != 1 or streams[0] not in {'rgb', 'ir1', 'ir2'}:
+                self.send_json(400, {'message': 'Choose RGB, IR 1, or IR 2.'})
+                return
+            image = self.server.service.diagnostic_frame(streams[0])
+            self.send_body(200 if image else 204, image or b'', 'image/jpeg')
             return
         if url.path not in {'/poses', '/preview'}:
             self.send_json(404, {'message': 'Unknown camera bridge endpoint.'})

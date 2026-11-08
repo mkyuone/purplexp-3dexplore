@@ -13,10 +13,13 @@ from uuid import uuid4
 import logging
 
 from calibration import MAX_DEPTH_M, MIN_DEPTH_M, Pose, Vec3, median_point, valid_point
+from diagnostics import DiagnosticHand, diagnostic_hands, encode_diagnostic_rgb, hand_overlay, matching_track
 from estimators import is_thumbs_up
+from infrared_preview import INFRARED_INDEXES, InfraredEncoder, InfraredPreview
 from options import CameraOptions
 from tracking import (
-    OPTICAL_WORLD_START_RATIO, Candidate, Hand, HandTracker, Track, Tracking, Vec2,
+    OPTICAL_WORLD_START_RATIO, PINCH_DISAGREEMENT_GAP_M, PINCH_START_GAP_M,
+    Candidate, Hand, HandTracker, Track, Tracking, Vec2,
     grip_features, valid_image,
 )
 
@@ -31,7 +34,7 @@ DEPTH_QUEUE_SIZE = 4
 STREAM_TIMEOUT = 2.0
 DEPTH_RETRY_DELAY = 2.0
 FINGERTIP_DEPTH_DISAGREEMENT_M = 0.035
-FINGERTIP_GAP_CHECK_M = 0.032
+FINGERTIP_DEPTH_CORROBORATION_M = 0.012
 FINGERTIP_GAP_CHECK_OPTICAL_RATIO = 0.28
 PALM_LENGTH_SCALE = 0.65
 ImageProjector = Callable[[float, float, float], Vec3 | None]
@@ -66,6 +69,7 @@ class Frame:
     processing_ms: float = 0.0
     diagnostics: dict | None = None
     thumb_depth_m: float | None = None
+    hand_diagnostics: tuple[DiagnosticHand, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -103,12 +107,7 @@ def preview_markers(
             if valid_image(point):
                 markers.append(PreviewMarker(point, sample is not None and sample.thumb_depth_m is not None))
             continue
-        track = None
-        if sample is not None:
-            if sample.pose is not None:
-                track = next((track for track in tracks if track.palm == sample.pose.palm), None)
-            else:
-                track = next((track for track in tracks if track.palm is None and track.image_palm == sample.image_palm), None)
+        track = matching_track(sample, tracks)
         thumbs_up = track.hand.thumbs_up if track else sample is not None and sample.thumbs_up
         fist = track.hand.grip == 'fist' if track else sample is not None and sample.features.folded == 4 and not thumbs_up
         point = sample.image_palm if (fist or thumbs_up) and sample else (hand[8].x, hand[8].y)
@@ -256,13 +255,18 @@ def fuse_hand(
     thumb_tip = fingertip(4, 3) if tip is not None else None
     thumb_pad = None
     gap = dist(thumb_tip, tip) if tip is not None and thumb_tip is not None else None
-    if (tip is not None and thumb_tip is not None and gap > FINGERTIP_GAP_CHECK_M and features.loosely_folded < 4
+    gap_corroborated = False
+    if (gap is not None and gap > PINCH_START_GAP_M and features.loosely_folded < 4
             and optical_ratio is not None and optical_ratio <= FINGERTIP_GAP_CHECK_OPTICAL_RATIO
             and features.pinch_ratio <= OPTICAL_WORLD_START_RATIO):
-        # A fingertip patch can contain a coherent background surface. Only
-        # defer to RGB when a sample inside the same finger contradicts it.
+        # Verify a gap that conflicts with a close image pose against samples
+        # inside the fingers, where the patch is less likely to include background.
         index_pad = fingertip_pad(8, 7)
         thumb_pad = fingertip_pad(4, 3)
+        if gap <= PINCH_DISAGREEMENT_GAP_M and index_pad is not None and thumb_pad is not None:
+            gap_corroborated = (abs(tip[2] - index_pad[2]) <= FINGERTIP_DEPTH_CORROBORATION_M
+                                and abs(thumb_tip[2] - thumb_pad[2]) <= FINGERTIP_DEPTH_CORROBORATION_M
+                                and dist(index_pad, thumb_pad) > PINCH_START_GAP_M)
         if index_pad is not None and abs(tip[2] - index_pad[2]) > FINGERTIP_DEPTH_DISAGREEMENT_M:
             tip, gap = index_pad, None
         if thumb_pad is not None and abs(thumb_tip[2] - thumb_pad[2]) > FINGERTIP_DEPTH_DISAGREEMENT_M:
@@ -284,13 +288,14 @@ def fuse_hand(
             thumb_depth_m = measured_thumb[2]
     return replace(
         sample, pose=Pose(tip or palm, palm), pinch_gap=gap, pointing=tip is not None,
-        thumbs_up=thumbs_up, thumb_depth_m=thumb_depth_m,
+        thumbs_up=thumbs_up, thumb_depth_m=thumb_depth_m, pinch_gap_corroborated=gap_corroborated,
     )
 
 
-def video_profile(sensor, stream, fmt, size, fps):
+def video_profile(sensor, stream, fmt, size, fps, *, index=None):
     for profile in sensor.get_stream_profiles():
-        if profile.stream_type() == stream and profile.format() == fmt and profile.fps() == fps:
+        if (profile.stream_type() == stream and profile.format() == fmt and profile.fps() == fps
+                and (index is None or profile.stream_index() == index)):
             video = profile.as_video_stream_profile()
             if (video.width(), video.height()) == size:
                 return video
@@ -306,7 +311,7 @@ def close_sensor(action) -> None:
         logging.debug('D435i sensor cleanup: %s', error)
 
 
-def start_sensor(rs, sensor, profile, queue, resources: ExitStack) -> None:
+def start_sensor(rs, sensor, profile, receiver, resources: ExitStack) -> None:
     clock = rs.option.global_time_enabled
     try:
         if sensor.supports(clock):
@@ -315,7 +320,7 @@ def start_sensor(rs, sensor, profile, queue, resources: ExitStack) -> None:
         logging.debug('D435i global time unavailable: %s', error)
     sensor.open(profile)
     resources.callback(close_sensor, sensor.close)
-    sensor.start(queue)
+    sensor.start(receiver)
     resources.callback(close_sensor, sensor.stop)
 
 
@@ -332,16 +337,35 @@ def open_color(rs, device, fps: int):
 
 
 @contextmanager
-def open_depth(rs, device, fps: int, widths):
+def open_depth(rs, device, fps: int, widths, *, infrared=None):
     depth = device.first_depth_sensor()
     errors = []
     with ExitStack() as resources:
         for width in widths:
             try:
-                profile = video_profile(depth, rs.stream.depth, rs.format.z16, (width, 480), fps)
+                size = (width, 480)
+                profile = video_profile(depth, rs.stream.depth, rs.format.z16, size, fps)
                 queue = rs.frame_queue(DEPTH_QUEUE_SIZE)
+                profiles, receiver = profile, queue
+                if infrared is not None:
+                    profiles = [profile, *(
+                        video_profile(depth, rs.stream.infrared, rs.format.y8, size, fps, index=index)
+                        for index in INFRARED_INDEXES
+                    )]
+
+                    def receiver(frame, depth_queue=queue):
+                        try:
+                            frame_profile = frame.get_profile()
+                            stream = frame_profile.stream_type()
+                            if stream == rs.stream.depth:
+                                depth_queue.enqueue(frame)
+                            elif stream == rs.stream.infrared:
+                                infrared.submit(frame_profile.stream_index(), frame)
+                        except RuntimeError:
+                            # SDK buffers may become invalid as a sensor disconnects.
+                            logging.debug('D435i stereo callback dropped a frame', exc_info=True)
                 with ExitStack() as attempt:
-                    start_sensor(rs, depth, profile, queue, attempt)
+                    start_sensor(rs, depth, profiles, receiver, attempt)
                     enable_depth_projector(rs, depth)
                     resources.enter_context(attempt.pop_all())
                 break
@@ -407,12 +431,15 @@ class DepthMatcher:
 
 
 class DepthStream:
-    def __init__(self, rs, device, color, fps: int, on_profile) -> None:
+    def __init__(self, rs, device, color, fps: int, on_profile, *, infrared=None, cv2=None, np=None) -> None:
         self.rs = rs
         self.device = device
         self.color = color
         self.fps = fps
         self.on_profile = on_profile
+        self.infrared = infrared
+        self.cv2 = cv2
+        self.np = np
         self.stop = Event()
         self.lock = Lock()
         self.source = None
@@ -422,9 +449,30 @@ class DepthStream:
     def run(self) -> None:
         widths = (848, 640)
         last_error = None
+        infrared_failed = False
+
+        def infrared_requested() -> bool:
+            nonlocal infrared_failed
+            if self.infrared is None or not self.infrared.wanted():
+                infrared_failed = False
+                return False
+            if self.cv2 is None:
+                self.infrared.fail('IR previews require OpenCV in the camera bridge environment.')
+                return False
+            return not infrared_failed
+
         while not self.stop.is_set():
+            with_infrared = infrared_requested()
             try:
-                with open_depth(self.rs, self.device, self.fps, widths) as (profile, queue):
+                with ExitStack() as resources:
+                    if with_infrared:
+                        encoder = InfraredEncoder(self.cv2, self.np, self.infrared.publish)
+                        resources.callback(self.infrared.clear_frames)
+                        resources.callback(encoder.close)
+                        depth = open_depth(self.rs, self.device, self.fps, widths, infrared=encoder)
+                    else:
+                        depth = open_depth(self.rs, self.device, self.fps, widths)
+                    profile, queue = resources.enter_context(depth)
                     if self.stop.is_set():
                         return
                     width = profile.width()
@@ -432,14 +480,21 @@ class DepthStream:
                     projector = depth_space_projector(self.rs, self.color, profile) if modified else None
                     self.on_profile(width, image_projector(self.rs, self.color.intrinsics, projector))
                     matcher = DepthMatcher(self.rs, queue, self.fps)
+                    started_at = monotonic()
                     with self.lock:
                         self.source = (matcher, projector)
                     try:
                         while not self.stop.wait(.25):
-                            if monotonic() - matcher.last_seen > STREAM_TIMEOUT:
+                            now = monotonic()
+                            if infrared_requested() != with_infrared:
+                                break
+                            if now - matcher.last_seen > STREAM_TIMEOUT:
                                 if len(widths) > 1:
                                     widths = tuple(candidate for candidate in (640, 848) if candidate != width) + (width,)
                                 raise CameraError('D435i depth frames stopped.')
+                            if (with_infrared and now - started_at > STREAM_TIMEOUT
+                                    and not self.infrared.fresh_pair(STREAM_TIMEOUT)):
+                                raise CameraError('D435i infrared frames stopped.')
                             if matcher.last_number is not None:
                                 # Once the stream works, retain the same profile across retries.
                                 widths = (width,)
@@ -448,10 +503,15 @@ class DepthStream:
                         with self.lock:
                             self.source = None
             except RuntimeError as error:
+                if with_infrared and not self.stop.is_set():
+                    infrared_failed = True
+                    self.infrared.fail('The D435i could not stream both IR previews with the current depth mode.')
+                    logging.warning('%s Restoring depth without infrared previews.', error)
+                    continue
                 if not self.stop.is_set() and str(error) != last_error:
                     last_error = str(error)
                     logging.warning('%s Retrying depth while RGB tracking continues.', error)
-            self.stop.wait(DEPTH_RETRY_DELAY)
+                self.stop.wait(DEPTH_RETRY_DELAY)
 
     def match(self, color: CameraSample):
         with self.lock:
@@ -534,16 +594,17 @@ def image_projector(rs, intrinsics, depth_space=None) -> ImageProjector:
 
 
 class PreviewEncoder:
-    def __init__(self, cv2, publish) -> None:
+    def __init__(self, cv2, publish, *, encode=None) -> None:
         self.cv2 = cv2
         self.publish = publish
+        self.encode = encode or encode_preview
         self.ready = Condition()
         self.pending = None
         self.closed = False
         self.thread = Thread(target=self.run, name='D435i preview', daemon=True)
         self.thread.start()
 
-    def submit(self, at: float, rgb, markers: tuple[PreviewMarker, ...]) -> None:
+    def submit(self, at: float, rgb, markers: tuple) -> None:
         # Detach the preview from the SDK buffer so slow encoding cannot hold
         # capture frames. Only the latest queued preview is retained.
         copy = rgb.copy()
@@ -560,7 +621,7 @@ class PreviewEncoder:
                 at, rgb, markers = self.pending
                 self.pending = None
             try:
-                jpeg = encode_preview(self.cv2, rgb, markers)
+                jpeg = self.encode(self.cv2, rgb, markers)
             except Exception:
                 logging.exception('D435i preview could not encode a frame')
                 continue
@@ -586,12 +647,16 @@ class CameraFeed:
         self.last_contact = float('-inf')
         self.info: CameraInfo | None = None
         self.frame: Frame | None = None
+        self.infrared = InfraredPreview()
         self.history: deque[Frame] = deque(maxlen=24)
         self.gesture_history: deque[Frame] = deque(maxlen=48)
         self.preview: Preview | None = None
         self.preview_clients: dict[str, float] = {}
         self.preview_until = 0.0
         self.next_preview_at = 0.0
+        self.diagnostic_rgb: Preview | None = None
+        self.diagnostic_rgb_until = 0.0
+        self.next_diagnostic_rgb_at = 0.0
         self.thumb_depth_until = 0.0
         self.error: str | None = None
         self.options = options
@@ -612,6 +677,8 @@ class CameraFeed:
             self.info = None
             self.frame = None
             self.preview = None
+            self.diagnostic_rgb = None
+            self.next_diagnostic_rgb_at = 0.0
             self.thumb_depth_until = 0.0
             self.history.clear()
             self.gesture_history.clear()
@@ -676,6 +743,18 @@ class CameraFeed:
             self.changed.notify_all()
         self.thread.join(timeout=4)
 
+    def request_infrared(self, index: int) -> bytes | None:
+        if index not in INFRARED_INDEXES:
+            return None
+        image = self.infrared.request(index)
+        with self.lock:
+            self.last_contact = monotonic()
+        self.wake.set()
+        return image
+
+    def infrared_status(self) -> str | None:
+        return self.infrared.status()
+
     def request_preview(self, session: str, after: float, client: str = 'calibration') -> bytes | None:
         with self.lock:
             if self.info is None or self.info.session != session:
@@ -687,6 +766,36 @@ class CameraFeed:
             if preview is None or preview.at <= after or now - preview.at >= PREVIEW_LEASE:
                 return None
             return preview.jpeg
+
+    def request_diagnostic_rgb(self) -> bytes | None:
+        with self.lock:
+            now = monotonic()
+            self.last_contact = now
+            self.diagnostic_rgb_until = now + PREVIEW_LEASE
+            preview = self.diagnostic_rgb
+            if preview is None or now - preview.at >= PREVIEW_LEASE:
+                image = None
+            else:
+                image = preview.jpeg
+        self.wake.set()
+        return image
+
+    def diagnostic_rgb_due(self, at: float) -> bool:
+        with self.lock:
+            if monotonic() >= self.diagnostic_rgb_until:
+                self.diagnostic_rgb = None
+                return False
+            if at < self.next_diagnostic_rgb_at:
+                return False
+            self.next_diagnostic_rgb_at = at + PREVIEW_INTERVAL
+            return True
+
+    def publish_diagnostic_rgb(self, at: float, jpeg: bytes, session: str) -> None:
+        with self.lock:
+            now = monotonic()
+            if (self.info is not None and self.info.session == session and now < self.diagnostic_rgb_until
+                    and now - at < PREVIEW_LEASE and (self.diagnostic_rgb is None or at > self.diagnostic_rgb.at)):
+                self.diagnostic_rgb = Preview(at, jpeg)
 
     def update_preview_expiry(self, now: float) -> None:
         self.preview_clients = {client: until for client, until in self.preview_clients.items() if until > now}
@@ -787,6 +896,8 @@ class CameraFeed:
                     self.preview_clients.clear()
                     self.preview_until = 0.0
                     self.next_preview_at = 0.0
+                    self.diagnostic_rgb = None
+                    self.next_diagnostic_rgb_at = 0.0
                     self.thumb_depth_until = 0.0
                     self.error = message
                     self.changed.notify_all()
@@ -849,15 +960,20 @@ class CameraFeed:
                     if self.info is not None and self.info.session == session and self.info.profile != profile:
                         self.info = CameraInfo(profile, session, project_image, serial)
 
-            depth = DepthStream(rs, device, color, options.fps, set_depth_profile)
+            depth = DepthStream(rs, device, color, options.fps, set_depth_profile,
+                                infrared=self.infrared, cv2=cv2, np=np)
             resources.callback(depth.close)
-            preview = None
+            preview = diagnostic_rgb = None
             if cv2 is not None:
                 preview = PreviewEncoder(cv2, lambda at, jpeg: self.publish_preview(at, jpeg, session))
                 resources.callback(preview.close)
-            self.track_frames(rs, np, estimator, color_queue, depth, align, revision, preview)
+                diagnostic_rgb = PreviewEncoder(cv2, lambda at, jpeg: self.publish_diagnostic_rgb(at, jpeg, session),
+                                                encode=encode_diagnostic_rgb)
+                resources.callback(diagnostic_rgb.close)
+            self.track_frames(rs, np, estimator, color_queue, depth, align, revision, preview, diagnostic_rgb)
 
-    def track_frames(self, rs, np, estimator, color_queue, depth_stream, align, revision, preview=None) -> None:
+    def track_frames(self, rs, np, estimator, color_queue, depth_stream, align, revision,
+                     preview=None, diagnostic_rgb=None) -> None:
         tracker = HandTracker()
         sequence = 0
         previous_number = None
@@ -916,6 +1032,8 @@ class CameraFeed:
             if not self.wanted(revision):
                 return
             tracking, hands = tracker.update(samples, at)
+            current_tracks = tuple(track for track in tracker.tracks if track.published and track.observed_at == at)
+            observed = diagnostic_hands(detections, samples, current_tracks)
             # Calibration observes a single depth-valid pointing hand even
             # when the live gesture classifier briefly reads a grip.
             sample = samples[0] if len(samples) == 1 else None
@@ -936,9 +1054,11 @@ class CameraFeed:
                 sequence, at, tracking, hands, calibration_pose, len(samples),
                 (monotonic() - dequeued_at) * 1000, diagnostics,
                 thumb_depth_m=sample.thumb_depth_m if sample is not None else None,
+                hand_diagnostics=observed,
             ), revision)
             if preview is not None and self.preview_due(at):
-                current_tracks = tuple(track for track in tracker.tracks if track.published and track.observed_at == at)
                 markers = preview_markers([hand.landmarks for hand in detections], samples, current_tracks,
                                           mark_thumb=measure_thumb_depth)
                 preview.submit(at, rgb, markers)
+            if diagnostic_rgb is not None and self.diagnostic_rgb_due(at):
+                diagnostic_rgb.submit(at, rgb, hand_overlay(detections, observed))

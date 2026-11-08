@@ -32,20 +32,51 @@ class TrackingRecoveryTests(TestCase):
         self.assertEqual(measured.pose.palm, recovered.pose.palm)
         self.assertEqual(measured.pose.tip, measured.pose.palm)
 
-    def test_optical_match_rejects_conflicting_handedness_and_distant_palms(self):
+    def test_optical_match_rejects_conflicting_handedness_without_isolated_palm_continuity(self):
         original = candidate(grip=OPEN, side='Left')
-        for replacement in (
-            candidate(grip=OPEN, side='Right'),
-            candidate(.15, grip=OPEN, side='Left'),
+        for name, replacement in (
+            ('interrupted', candidate(grip=OPEN, side='Right')),
+            ('possible second hand', candidate(grip=OPEN, side='Right')),
+            ('label flip and palm moved', candidate(.04, grip=OPEN, side='Right')),
+            ('distant palm', candidate(.15, grip=OPEN, side='Left')),
         ):
-            with self.subTest(replacement=replacement):
+            with self.subTest(name=name):
                 tracker = HandTracker()
                 _, (before,) = tracker.update([original], 1)
+                if name == 'interrupted':
+                    tracker.update([], 1.02)
                 optical = replace(replacement, pose=None, pointing=False, pinch_gap=None)
-                status, (after,) = tracker.update([optical], 1.04)
+                observations = [optical, None] if name == 'possible second hand' else [optical]
+                status, (after,) = tracker.update(observations, 1.04)
                 self.assertEqual(status, 'tracking')
                 self.assertNotEqual(after.id, before.id)
                 self.assertIsNone(after.pose)
+
+    def test_an_isolated_pinch_keeps_its_identity_during_a_brief_rgb_side_flip(self):
+        for side, flipped in (('Left', 'Right'), ('Right', 'Left')):
+            with self.subTest(side=side):
+                tracker = HandTracker()
+                original = replace(candidate(side=side), optical_pinch_ratio=.16)
+                optical = replace(original, side=flipped, pose=None, pointing=False, pinch_gap=None)
+                _, (before,) = tracker.update([original], 1)
+                for at, sample in ((1.04, optical), (1.08, optical), (1.12, replace(optical, side=side))):
+                    status, (after,) = tracker.update([sample], at)
+                    self.assertEqual((status, after.id, after.grip), ('tracking', before.id, 'pinch'))
+                    self.assertIsNone(after.pose)
+                _, (recovered,) = tracker.update([original], 1.16)
+                self.assertEqual((recovered.id, recovered.grip), (before.id, 'pinch'))
+                self.assertIsNotNone(recovered.pose)
+
+    def test_repeated_conflicting_labels_cannot_extend_the_rgb_match_grace(self):
+        tracker = HandTracker()
+        original = candidate(grip=OPEN, side='Left')
+        optical = replace(original, side='Right', pose=None, pointing=False, pinch_gap=None)
+        _, (before,) = tracker.update([original], 1)
+        for at in (1.04, 1.08):
+            _, (after,) = tracker.update([optical], at)
+            self.assertEqual(after.id, before.id)
+        _, (replacement,) = tracker.update([optical], 1.12)
+        self.assertNotEqual(replacement.id, before.id)
 
     def test_mixed_depth_tracks_keep_identity_when_reordered_and_reject_overlapping_palms(self):
         tracker = HandTracker()

@@ -1,0 +1,106 @@
+.hand-diagnostics {
+  width: min(100%, 1240px);
+  margin-inline: auto;
+  padding: clamp(12px, 2.4vw, 28px);
+}
+
+.diagnostics-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-block-end: 16px;
+}
+
+.diagnostics-header h1 {
+  margin: 0 0 4px;
+  font-size: clamp(22px, 3vw, 30px);
+  letter-spacing: -.025em;
+}
+
+.diagnostics-connection {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.diagnostics-connection[data-phase='ready'] { color: var(--mint); }
+.diagnostics-connection[data-phase='offline'] { color: #ffd0d3; }
+
+.diagnostics-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.diagnostics-tile {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #1b1628;
+}
+
+.diagnostics-tile h2 { margin: 0 0 10px; font-size: 15px; }
+
+.diagnostics-feed {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  max-block-size: clamp(170px, 36svh, 380px);
+  overflow: hidden;
+  border: 1px solid #30263d;
+  border-radius: 6px;
+  background: #100c1c;
+  color: var(--muted);
+}
+
+.diagnostics-feed-rgb { aspect-ratio: 4 / 3; }
+.diagnostics-feed p { margin: 0; padding: 12px; font-size: 13px; text-align: center; }
+.diagnostics-feed img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.diagnostics-hands table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  text-align: start;
+  font-variant-numeric: tabular-nums;
+}
+
+.diagnostics-hands th, .diagnostics-hands td {
+  padding: 9px 5px;
+  border-block-end: 1px solid var(--line);
+  text-align: start;
+}
+
+.diagnostics-hands thead th { color: var(--muted); font-weight: 550; }
+.diagnostics-hands tbody th { font-weight: 650; white-space: nowrap; }
+
+.diagnostics-hand-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-inline-end: 5px;
+  border-radius: 50%;
+  background: var(--violet);
+  vertical-align: .08em;
+}
+
+.diagnostics-hand-dot[data-side='Left'] { background: var(--mint); }
+.diagnostics-hand-note { margin: 10px 4px 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+.diagnostics-hand-note a { color: var(--violet); }
+
+@media (max-width: 660px) {
+  .diagnostics-grid { grid-template-columns: minmax(0, 1fr); }
+  .diagnostics-feed { max-block-size: none; }
+}

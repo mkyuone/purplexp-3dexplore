@@ -45,6 +45,10 @@ const poseUrl = import.meta.env?.VITE_HAND_POSE_URL || 'http://127.0.0.1:4182/po
 const POSE_POLL_MS = 1000 / 60;
 const POSE_RETRY_WINDOW_MS = 500;
 
+export function handCameraUrl(path: string) {
+  return new URL(path, new URL(poseUrl, window.location.href));
+}
+
 function readCameraSettings(value: unknown): HandCameraSettings {
   if (!value || typeof value !== 'object') throw new Error('The local hand camera returned invalid settings.');
   const settings = value as HandCameraSettings;
@@ -183,6 +187,7 @@ function validHand(value: unknown): value is HandPose {
   if (!value || typeof value !== 'object') return false;
   const hand = value as Partial<HandPose>;
   return typeof hand.id === 'string' && typeof hand.pinched === 'boolean'
+    && (hand.pinchPending === undefined || typeof hand.pinchPending === 'boolean')
     && (hand.fist === undefined || typeof hand.fist === 'boolean')
     && (hand.thumbsUp === undefined || typeof hand.thumbsUp === 'boolean') && typeof hand.depthValid === 'boolean'
     && [hand.x, hand.y, hand.depth].every(Number.isFinite);
