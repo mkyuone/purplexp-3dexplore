@@ -6,6 +6,7 @@ from math import copysign, exp, hypot, isfinite
 from statistics import median
 
 from calibration import Calibration, Vec3
+from depth_range import DepthRange
 from tracking import TRACK_TIMEOUT, Grip, Hand, Vec2, valid_image
 
 
@@ -66,7 +67,8 @@ class MappedHand:
 
 
 class FuzzyMapper:
-    def __init__(self) -> None:
+    def __init__(self, depth_range: DepthRange | None = None) -> None:
+        self.depth_range = depth_range
         self.neutral_depth_m: float | None = None
         self.last_at: float | None = None
         self.previous: dict[str, MappedHand] = {}
@@ -88,14 +90,15 @@ class FuzzyMapper:
         valid = [hand for hand in hands if hand.image is not None and len(hand.image) == 2
                  and (hand.pose is None or hand.pose.valid())
                  and all(isfinite(value) and 0 <= value <= 1 for value in hand.image)]
-        measured_depths = [hand.pose.palm[2] for hand in valid if hand.pose is not None]
-        if measured_depths:
-            observed_depth = median(measured_depths)
-            if self.neutral_depth_m is None:
-                self.neutral_depth_m = observed_depth
-            elif all(hand.grip == 'open' and not hand.thumbs_up for hand in hands):
-                alpha = 1 - exp(-elapsed / NEUTRAL_SECONDS)
-                self.neutral_depth_m += (observed_depth - self.neutral_depth_m) * alpha
+        if self.depth_range is None:
+            measured_depths = [hand.pose.palm[2] for hand in valid if hand.pose is not None]
+            if measured_depths:
+                observed_depth = median(measured_depths)
+                if self.neutral_depth_m is None:
+                    self.neutral_depth_m = observed_depth
+                elif all(hand.grip == 'open' and not hand.thumbs_up for hand in hands):
+                    alpha = 1 - exp(-elapsed / NEUTRAL_SECONDS)
+                    self.neutral_depth_m += (observed_depth - self.neutral_depth_m) * alpha
 
         targets = []
         for hand in valid:
@@ -104,8 +107,11 @@ class FuzzyMapper:
             y = soft_axis(image_y, IMAGE_TOP, IMAGE_BOTTOM)
             depth = 0.0
             if hand.pose is not None:
-                assert self.neutral_depth_m is not None
-                depth = clamp((hand.pose.palm[2] - self.neutral_depth_m) / DEPTH_WIDTH_M, -MAX_DEPTH, MAX_DEPTH)
+                if self.depth_range is None:
+                    assert self.neutral_depth_m is not None
+                    depth = clamp((hand.pose.palm[2] - self.neutral_depth_m) / DEPTH_WIDTH_M, -MAX_DEPTH, MAX_DEPTH)
+                else:
+                    depth = self.depth_range.map_depth(hand.pose.palm[2])
             targets.append(MappedHand(hand.id, x, y, depth, hand.grip, hand.thumbs_up,
                                       depth_valid=hand.pose is not None))
 
@@ -151,9 +157,11 @@ class _CalibratedAnchor:
 
 
 class CalibratedMapper:
-    def __init__(self, calibration: Calibration, project_image: Callable[[float, float, float], Vec3 | None] | None) -> None:
+    def __init__(self, calibration: Calibration, project_image: Callable[[float, float, float], Vec3 | None] | None,
+                 depth_range: DepthRange | None = None) -> None:
         self.calibration = calibration
         self.project_image = project_image
+        self.depth_range = depth_range
         self.last_at = float('-inf')
         self.last_sequence = -1
         self.anchors: dict[str, _CalibratedAnchor] = {}
@@ -184,7 +192,7 @@ class CalibratedMapper:
         for hand in hands:
             previous = self.anchors.get(hand.id)
             if hand.pose is not None and (hand.pointing or hand.grip == 'fist' or hand.thumbs_up):
-                projected = self.calibration.project(hand.pose)
+                projected = self.calibration.project(hand.pose, self.depth_range)
                 if projected is None:
                     continue
                 x, y, depth = projected

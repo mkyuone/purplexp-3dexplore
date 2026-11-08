@@ -26,6 +26,21 @@ export type LiveHandStatus = {
   previewToken?: string;
 };
 
+export type DepthRange = { nearM: number; farM: number };
+
+type DepthRangeStatus = {
+  range: DepthRange | null;
+  session?: string;
+  step?: 'near' | 'far';
+  nearM?: number;
+  captureM?: number;
+  captureHint?: string;
+  confirming?: boolean;
+  confirmed?: boolean;
+};
+
+type DepthRangeAction = { session: string; action: 'begin' | 'cancel' | 'reset' };
+
 const poseUrl = import.meta.env?.VITE_HAND_POSE_URL || 'http://127.0.0.1:4182/poses';
 const POSE_POLL_MS = 1000 / 60;
 const POSE_RETRY_WINDOW_MS = 500;
@@ -80,6 +95,31 @@ export function fetchHandCameraSettings(signal: AbortSignal) {
 
 export function applyHandCameraSettings(fps: number, signal: AbortSignal) {
   return cameraSettingsRequest(fps, signal);
+}
+
+export async function requestDepthRange(signal: AbortSignal, action?: DepthRangeAction): Promise<DepthRangeStatus> {
+  const response = await fetch(new URL('./depth-range', new URL(poseUrl, window.location.href)), {
+    method: action ? 'POST' : 'GET', cache: 'no-store',
+    ...(action && { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(action), keepalive: action.action === 'cancel' }),
+    signal: AbortSignal.any([signal, AbortSignal.timeout(1800)]),
+  });
+  if (response.status === 404) throw new Error('Restart the local camera service to use depth range settings.');
+  const value = await response.json();
+  if (!response.ok) throw new Error(typeof value?.message === 'string' ? value.message : 'The camera could not update the depth range.');
+  const range = value?.range;
+  if (range !== null && (!Number.isFinite(range?.nearM) || !Number.isFinite(range?.farM) || range.nearM >= range.farM)) {
+    throw new Error('The local hand camera returned an invalid depth range.');
+  }
+  return {
+    range,
+    session: typeof value.session === 'string' ? value.session : undefined,
+    step: value.step === 'near' || value.step === 'far' ? value.step : undefined,
+    nearM: Number.isFinite(value.nearM) ? value.nearM : undefined,
+    captureM: Number.isFinite(value.captureM) ? value.captureM : undefined,
+    captureHint: typeof value.captureHint === 'string' ? value.captureHint : undefined,
+    confirming: value.confirming === true,
+    confirmed: value.confirmed === true,
+  };
 }
 
 export function handDisplayKey() {
@@ -151,7 +191,7 @@ function validHand(value: unknown): value is HandPose {
 export function connectLiveHands(options: {
   navigation: HandNavigation;
   receive: (frame: PoseFrame, receivedAt: number) => void;
-  reset: () => void;
+  reset: (reason?: 'depth-range') => void;
   status: (status: LiveHandStatus) => void;
 }) {
   const session = new AbortController();
@@ -161,6 +201,7 @@ export function connectLiveHands(options: {
   let lastSequence = -1;
   let lastCapturedAt = -Infinity;
   let lastContactAt = -Infinity;
+  let lastDepthRangeRevision = 0;
   let status: LiveHandStatus = { phase: 'connecting' };
   let display: string | undefined;
 
@@ -217,11 +258,16 @@ export function connectLiveHands(options: {
       const receivedAt = performance.now();
       lastContactAt = receivedAt;
       if (value.ageMs >= 220) return;
+      const depthRangeRevision = Number.isSafeInteger(value.depthRangeRevision) ? value.depthRangeRevision : 0;
       if (sourceId !== value.session) {
         sourceId = value.session;
         lastSequence = -1;
         lastCapturedAt = -Infinity;
+        lastDepthRangeRevision = depthRangeRevision;
         options.reset();
+      } else if (depthRangeRevision !== lastDepthRangeRevision) {
+        lastDepthRangeRevision = depthRangeRevision;
+        options.reset('depth-range');
       }
       setStatus(next);
       if (value.sequence > lastSequence) {

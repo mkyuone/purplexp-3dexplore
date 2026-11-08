@@ -9,7 +9,7 @@ from unittest.mock import patch
 from calibration import Pose, TARGETS, fit
 from estimators import is_thumbs_up
 from navigation import DEPTH_WIDTH_M, FuzzyMapper, soft_axis, IMAGE_LEFT, IMAGE_RIGHT
-from realsense import fuse_hand
+from realsense import fuse_hand, preview_markers
 from server import CameraService, Profiles
 from test_bridge import StubFeed
 from tracking import Candidate, GripFeatures, Hand, HandTracker, classify_grip, grip_features
@@ -144,6 +144,51 @@ class ThumbsUpTests(TestCase):
         status, (hand,) = HandTracker().update([sample], 1)
         self.assertEqual(status, 'tracking')
         self.assertFalse(hand.thumbs_up)
+
+    def test_range_calibration_measures_the_same_thumb_with_open_and_curled_fingers(self):
+        profile = SimpleNamespace(as_video_stream_profile=lambda: SimpleNamespace(intrinsics=None))
+        depth = SimpleNamespace(profile=profile, get_data=lambda: SimpleNamespace(shape=(406, 382)), get_units=lambda: 0.001)
+        np = SimpleNamespace(asanyarray=lambda data: data)
+        points = landmarks()
+        palm = (0.01, 0.02, 0.72)
+        thumb = (0.01, -0.06, 0.65)
+
+        def measure(_rs, _np, _pixels, _intrinsics, _units, x, y, _near, pad=None):
+            if (x, y) == (points[8].x, points[8].y):
+                return None
+            if (x, y) == (points[4].x, points[4].y):
+                # The outline misses the depth patch, but the thumb pad has it.
+                return thumb if pad else None
+            return palm
+
+        for features, thumbs_up in ((GripFeatures(1.1, 0, 0), False), (FOLDED, True)):
+            with self.subTest(thumbs_up=thumbs_up), patch('realsense.locate_depth', side_effect=measure):
+                sample = fuse_hand(None, np, points, [], [], depth, features, measure_thumb_depth=True)
+                self.assertEqual(sample.thumbs_up, thumbs_up)
+                self.assertFalse(sample.pointing)
+                self.assertEqual(sample.pose.palm, palm)
+                self.assertEqual(sample.thumb_depth_m, thumb[2])
+                marker, = preview_markers([points], [sample], (), mark_thumb=True)
+                self.assertEqual(marker.point, (points[4].x, points[4].y))
+                self.assertTrue(marker.valid)
+
+    def test_range_calibration_does_not_substitute_palm_or_index_for_missing_thumb(self):
+        profile = SimpleNamespace(as_video_stream_profile=lambda: SimpleNamespace(intrinsics=None))
+        depth = SimpleNamespace(profile=profile, get_data=lambda: SimpleNamespace(shape=(406, 382)), get_units=lambda: 0.001)
+        np = SimpleNamespace(asanyarray=lambda data: data)
+        palm = (0.01, 0.02, 0.72)
+        index = (0.02, -0.10, 0.67)
+        with patch('realsense.locate_depth', side_effect=[palm, palm, palm, index, None, None]):
+            sample = fuse_hand(None, np, landmarks(), [], [], depth, FOLDED, measure_thumb_depth=True)
+        self.assertTrue(sample.thumbs_up)
+        self.assertEqual(sample.pose.tip, index)
+        self.assertIsNone(sample.thumb_depth_m)
+
+        # Without calibration, the visitor gesture needs no extra samples.
+        with patch('realsense.locate_depth', side_effect=[palm, palm, palm, None]) as locate:
+            sample = fuse_hand(None, np, landmarks(), [], [], depth, FOLDED)
+        self.assertTrue(sample.thumbs_up)
+        self.assertEqual(locate.call_count, 4)
 
     def test_thumb_up_keeps_neutral_depth_fixed_and_changes_mapping_anchor_immediately(self):
         mapper = FuzzyMapper()

@@ -1,6 +1,7 @@
 """Loopback bridge for the Spatial CAD Explorer's D435i pose and calibration API."""
 
 from argparse import ArgumentParser
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from math import dist
@@ -9,6 +10,7 @@ from secrets import compare_digest, token_urlsafe
 from tempfile import NamedTemporaryFile
 from threading import Lock
 from time import monotonic
+from typing import TypeVar
 from urllib.parse import parse_qs, urlsplit
 import json
 import logging
@@ -17,9 +19,11 @@ import re
 import signal
 
 from calibration import CENTER, Calibration, CalibrationFitError, Pose, TARGETS, fit, fit_corners, median_point
+from depth_range import DepthRange
+from depth_range_capture import DepthRangeCapture
 from navigation import CalibratedMapper, FuzzyMapper
 from options import CameraOptions, DEFAULT_SETTINGS, load_options, save_options
-from realsense import CameraFeed, CameraInfo, FRAME_MAX_AGE, Snapshot
+from realsense import CameraFeed, CameraInfo, FRAME_MAX_AGE, Frame, Snapshot
 
 PORT = 4182
 POSE_WAIT_SECONDS = 0.09
@@ -29,6 +33,8 @@ WAITING_FOR_DEPTH = 'Waiting for the RealSense depth stream. Fuzzy navigation is
 CALIBRATION_TIMEOUT = 120.0
 OPERATOR_PREVIEW_TIMEOUT = 6.0
 MAX_OPERATOR_PREVIEWS = 8
+DEPTH_CAPTURE_TIMEOUT = 120.0
+DEPTH_CAPTURE_IDLE_TIMEOUT = 10.0
 CAPTURE_WINDOW = 0.65
 CAPTURE_MIN_SPAN = 0.10
 CAPTURE_MIN_SAMPLES = 5
@@ -70,39 +76,74 @@ def stale_pose(age: float) -> dict | None:
     return offline(WAITING_FOR_FRAMES)
 
 
+Profile = TypeVar('Profile', Calibration, DepthRange)
+
+
+def write_profile_map(path: Path, records: dict[str, Profile]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump({key: value.to_dict() for key, value in records.items()}, handle, allow_nan=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def read_profile_map(path: Path, parse: Callable[[object], Profile]) -> dict[str, Profile]:
+    records = {}
+    try:
+        stored = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(stored, dict):
+            raise ValueError('Expected a profile map.')
+        for key, value in stored.items():
+            try:
+                records[key] = parse(value)
+            except ValueError:
+                logging.warning('Ignoring an invalid camera profile in %s', path)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        logging.warning('Could not read camera profiles from %s', path)
+    return records
+
+
 class Profiles:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.records: dict[str, Calibration] = {}
-        try:
-            stored = json.loads(path.read_text(encoding='utf-8'))
-            if not isinstance(stored, dict):
-                raise ValueError('Expected a profile map.')
-            for key, value in stored.items():
-                try:
-                    self.records[key] = Calibration.from_dict(value)
-                except ValueError:
-                    logging.warning('Ignoring an invalid display calibration in %s', path)
-        except FileNotFoundError:
-            pass
-        except (OSError, ValueError):
-            logging.warning('Could not read camera calibration profiles from %s', path)
+        self.records: dict[str, Calibration] = read_profile_map(path, Calibration.from_dict)
+        self.depth_path = path.with_name(f'{path.stem}.depth-ranges.json')
+        self.depth_ranges: dict[str, DepthRange] = read_profile_map(self.depth_path, DepthRange.from_dict)
 
     def save(self, key: str, profile: Calibration) -> None:
         records = self.records | {key: profile}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = None
-        try:
-            with NamedTemporaryFile(mode='w', encoding='utf-8', dir=self.path.parent, delete=False) as handle:
-                temporary = Path(handle.name)
-                json.dump({key: value.to_dict() for key, value in records.items()}, handle, allow_nan=False)
-                handle.flush()
-                os.fsync(handle.fileno())
-            temporary.replace(self.path)
-            self.records = records
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+        write_profile_map(self.path, records)
+        self.records = records
+
+    def save_depth_range(self, key: str, depth_range: DepthRange | None) -> None:
+        records = self.depth_ranges.copy()
+        if depth_range is None:
+            records.pop(key, None)
+        else:
+            records[key] = depth_range
+        write_profile_map(self.depth_path, records)
+        self.depth_ranges = records
+
+
+class DepthRangeSessionError(ValueError):
+    pass
+
+
+@dataclass
+class DepthRangeAttempt:
+    session: str
+    started: float
+    touched: float
+    capture: DepthRangeCapture
 
 
 @dataclass
@@ -201,9 +242,13 @@ class CameraService:
         self.attempts: dict[str, Attempt] = {}
         self.operator_previews: dict[str, OperatorPreview] = {}
         self.fuzzy = FuzzyMapper()
-        self.fuzzy_session: str | None = None
         self.calibrated: dict[str, CalibratedMapper] = {}
-        self.calibrated_session: str | None = None
+        self.navigation_session: str | None = None
+        self.active_depth_range: DepthRange | None = None
+        self.depth_range_revision = 0
+        self.depth_attempt: DepthRangeAttempt | None = None
+        self.depth_outcome: tuple[str, bool, str] | None = None
+        self.suppress_thumb_session: str | None = None
         self.settings_path = settings_path
 
     def settings(self, value: dict | None = None) -> dict:
@@ -222,6 +267,104 @@ class CameraService:
             self.feed.snapshot()
             return self.feed.settings()
 
+    def active_depth_capture(self, info: CameraInfo | None, now: float) -> DepthRangeAttempt | None:
+        attempt = self.depth_attempt
+        if attempt is None:
+            return None
+        if info is None or attempt.session != info.session:
+            self.depth_attempt = None
+            return None
+        if now - attempt.started >= DEPTH_CAPTURE_TIMEOUT or now - attempt.touched >= DEPTH_CAPTURE_IDLE_TIMEOUT:
+            self.depth_attempt = None
+            self.depth_outcome = (attempt.session, False, 'Depth range capture timed out. Start again when you’re ready.')
+            return None
+        return attempt
+
+    def depth_range(self, request: dict | None = None) -> dict:
+        with self.lock:
+            snapshot = self.feed.snapshot(include_gestures=self.depth_attempt is not None)
+            info = snapshot.info
+            key = info.serial if info is not None else None
+            now = monotonic()
+            attempt = self.active_depth_capture(info, now)
+            depth_ready = info is not None and info.profile is not None and key is not None
+            message = camera_problem(snapshot) or (WAITING_FOR_DEPTH if not depth_ready else None)
+            current = self.profiles.depth_ranges.get(key) if key is not None else None
+            if request is not None:
+                if info is None or key is None or request['session'] != info.session:
+                    raise DepthRangeSessionError('The hand camera session changed. Try again once it reconnects.')
+                action = request['action']
+                if action == 'begin':
+                    if message is not None or snapshot.frame is None:
+                        raise DepthRangeSessionError(message or WAITING_FOR_FRAMES)
+                    attempt = DepthRangeAttempt(info.session, now, now, DepthRangeCapture(started_at=snapshot.frame.at))
+                    self.depth_attempt = attempt
+                    self.suppress_thumb_session = info.session
+                else:
+                    if action == 'reset' and current is not None:
+                        self.profiles.save_depth_range(key, None)
+                        current = None
+                    attempt = self.depth_attempt = None
+                self.depth_outcome = None
+
+            response = {'range': current.to_dict() if current is not None else None}
+            if depth_ready and info is not None:
+                response['session'] = info.session
+            if attempt is not None:
+                attempt.touched = now
+                self.feed.request_thumb_depth()
+                capture = attempt.capture
+                if message is None:
+                    capture.observe(snapshot)
+                if capture.result is None:
+                    response.update(step=capture.step, captureHint=message or capture.hint)
+                    if capture.near_m is not None:
+                        response['nearM'] = capture.near_m
+                    if message is None and capture.capture_m is not None:
+                        response['captureM'] = capture.capture_m
+                        response['confirming'] = capture.confirming
+                    return response
+                assert key is not None
+                self.depth_attempt = None
+                try:
+                    if capture.result != current:
+                        self.profiles.save_depth_range(key, capture.result)
+                    response['range'] = capture.result.to_dict()
+                    self.depth_outcome = (attempt.session, True, 'Depth range saved.')
+                except OSError:
+                    logging.exception('Could not save the hand camera depth range')
+                    self.depth_outcome = (attempt.session, False, 'Could not save the depth range. Try again.')
+
+            if info is not None and self.depth_outcome and self.depth_outcome[0] == info.session:
+                _, confirmed, hint = self.depth_outcome
+                response.update(confirmed=confirmed, captureHint=hint)
+            elif message is not None:
+                response['captureHint'] = message
+            return response
+
+    def suppress_capture_thumb(self, info: CameraInfo, frame: Frame) -> bool:
+        if self.suppress_thumb_session != info.session:
+            return False
+        if self.active_depth_capture(info, monotonic()) is not None:
+            return True
+        # A thumb still held after the far capture belongs to setup. Let a
+        # visible release rearm the exhibit reset gesture.
+        if (frame.tracking == 'tracking' and any(hand.grip == 'open' for hand in frame.hands)
+                and not any(hand.thumbs_up for hand in frame.hands)):
+            self.suppress_thumb_session = None
+        return True
+
+    def refresh_navigation(self, info: CameraInfo) -> None:
+        depth_range = self.profiles.depth_ranges.get(info.serial) if info.serial is not None else None
+        changed = depth_range != self.active_depth_range
+        if changed:
+            self.depth_range_revision += 1
+        if changed or self.navigation_session != info.session:
+            self.fuzzy = FuzzyMapper(depth_range)
+            self.calibrated.clear()
+            self.active_depth_range = depth_range
+            self.navigation_session = info.session
+
     def active_attempt(self, info: CameraInfo, display: str) -> Attempt | None:
         attempt = self.attempts.get(display)
         if attempt and (attempt.session != info.session or monotonic() - attempt.touched >= CALIBRATION_TIMEOUT):
@@ -239,10 +382,8 @@ class CameraService:
                 return offline(snapshot.error or WAITING_FOR_FRAMES)
             if stale := stale_pose(monotonic() - frame.at):
                 return stale
+            self.refresh_navigation(info)
             if mode == 'fuzzy':
-                if self.fuzzy_session != info.session:
-                    self.fuzzy.reset()
-                    self.fuzzy_session = info.session
                 mapped = self.fuzzy.update(frame.hands, frame.at)
             else:
                 if attempt := self.active_attempt(info, display):
@@ -252,17 +393,15 @@ class CameraService:
                 calibration = self.profiles.records.get(f'{info.profile}|{display}')
                 if calibration is None:
                     return calibrating()
-                if self.calibrated_session != info.session:
-                    self.calibrated.clear()
-                    self.calibrated_session = info.session
                 mapper = self.calibrated.get(display)
                 if mapper is None or mapper.calibration is not calibration or mapper.project_image is not info.project_image:
-                    mapper = self.calibrated[display] = CalibratedMapper(calibration, info.project_image)
+                    mapper = self.calibrated[display] = CalibratedMapper(calibration, info.project_image, self.active_depth_range)
                 mapped = mapper.update(frame.hands, frame.at, frame.sequence)
+            suppress_thumb = self.suppress_capture_thumb(info, frame)
             hands = [{
                 'id': hand.id, 'x': hand.x, 'y': hand.y, 'depth': hand.depth, 'depthValid': hand.depth_valid,
                 'pinched': hand.grip == 'pinch' and not hand.thumbs_up,
-                'fist': hand.grip == 'fist' and not hand.thumbs_up, 'thumbsUp': hand.thumbs_up,
+                'fist': hand.grip == 'fist' and not hand.thumbs_up, 'thumbsUp': hand.thumbs_up and not suppress_thumb,
             } for hand in mapped]
             age = monotonic() - frame.at
             if stale := stale_pose(age):
@@ -270,6 +409,7 @@ class CameraService:
             tracking = frame.tracking if hands or frame.tracking == 'ambiguous' else 'lost'
             return {
                 'status': 'ready', 'session': f'{info.session}:{mode}:{display}', 'sequence': frame.sequence,
+                'depthRangeRevision': self.depth_range_revision,
                 'ageMs': max(0, age * 1000), 'tracking': tracking, 'hands': hands,
             }
 
@@ -434,7 +574,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         if not self.allowed(require_origin=True):
             self.send_json(403, {'message': 'Only the local Explorer can access the camera bridge.'})
-        elif self.path.split('?', 1)[0] not in {'/poses', '/calibration', '/preview', '/settings'}:
+        elif self.path.split('?', 1)[0] not in {'/poses', '/calibration', '/preview', '/settings', '/depth-range'}:
             self.send_json(404, {'message': 'Unknown camera bridge endpoint.'})
         else:
             self.send_json(204)
@@ -452,6 +592,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if url.path == '/settings' and not query:
             self.send_json(200, self.server.service.settings())
+            return
+        if url.path == '/depth-range' and not query:
+            self.send_json(200, self.server.service.depth_range())
             return
         if url.path not in {'/poses', '/preview'}:
             self.send_json(404, {'message': 'Unknown camera bridge endpoint.'})
@@ -492,7 +635,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.allowed(require_origin=True):
             self.send_json(403, {'message': 'Only the local Explorer can access the camera bridge.'})
             return
-        if self.path not in {'/calibration', '/preview', '/settings'}:
+        if self.path not in {'/calibration', '/preview', '/settings', '/depth-range'}:
             self.send_json(404, {'message': 'Unknown camera bridge endpoint.'})
             return
         if self.headers.get_content_type() != 'application/json':
@@ -516,6 +659,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {'message': str(error)})
             except OSError:
                 self.send_json(500, {'message': 'Camera settings could not be saved.'})
+            return
+        if self.path == '/depth-range':
+            if (not isinstance(request, dict) or request.get('action') not in ('begin', 'cancel', 'reset')
+                    or not isinstance(request.get('session'), str)):
+                self.send_json(400, {'message': 'A depth range action and camera session are required.'})
+                return
+            try:
+                self.send_json(200, self.server.service.depth_range(request))
+            except DepthRangeSessionError as error:
+                self.send_json(409, {'message': str(error)})
+            except ValueError as error:
+                self.send_json(400, {'message': str(error)})
+            except OSError:
+                logging.exception('Could not save the hand camera depth range')
+                self.send_json(500, {'message': 'The depth range could not be saved.'})
             return
         actions = ('begin', 'end') if self.path == '/preview' else ACTIONS
         if not isinstance(request, dict) or not valid_display(request.get('display')) or request.get('action') not in actions:

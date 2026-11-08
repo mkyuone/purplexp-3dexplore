@@ -11,6 +11,7 @@ import { applyHandCameraSettings, calibrateHands, connectLiveHands, fetchHandCam
 import { attachVisitorControls } from './visitor-controls';
 import { CalibrationPanel } from './calibration-panel';
 import { CameraPreview } from './camera-preview';
+import { DepthRangePanel } from './depth-range-panel';
 import { HeadPerspectivePanel, useHeadPerspective } from './head-perspective-panel';
 import { HandPerformance } from './hand-performance';
 import { collectPartNameRows, exportPartNames, importPartNames } from './part-names';
@@ -489,10 +490,10 @@ export function App() {
           if (latestReceipt === receivedAt) handPerformance.submitted(frame, receivedAt, submittedAt);
         });
       },
-      reset: () => {
+      reset: reason => {
         latestReceipt = undefined;
         handPerformance.reset();
-        active.gestures.resetStream();
+        active.gestures.resetStream(reason === 'depth-range' ? false : undefined);
       },
       status: setLiveStatus,
     });
@@ -788,6 +789,7 @@ export function App() {
           {liveEnabled && (liveStatus.phase === 'ready' || liveStatus.phase === 'calibration') && <button className="button camera-calibrate" type="button" disabled={calibrationBusy || !!graphicsIssue} onClick={() => void changeCalibration('begin')}>{navigation === 'fuzzy' ? 'Optional reach calibration' : 'Calibrate reach'}</button>}
           {calibrationError && <p className="setup-hint" role="alert">{calibrationError}</p>}
           {calibrationSaved && <p className="setup-hint" role="status">Reach calibration saved.</p>}
+          {liveEnabled && <DepthRangePanel />}
           <CameraSettings navigation={navigation} performance={handPerformance} />
         </section>}
         <section className="panel file-panel" aria-label="STEP import">

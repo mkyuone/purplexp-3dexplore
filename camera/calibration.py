@@ -5,13 +5,13 @@ from dataclasses import dataclass, replace
 from math import dist, isfinite
 from statistics import median
 
+from depth_range import MAX_DEPTH_M, MIN_DEPTH_M, DepthRange
+
 
 Vec3 = tuple[float, float, float]
 TARGETS = ((0.12, 0.14), (0.88, 0.14), (0.88, 0.86), (0.12, 0.86), (0.5, 0.5))
 TARGET_WIDTH = TARGETS[1][0] - TARGETS[0][0]
 TARGET_HEIGHT = TARGETS[2][1] - TARGETS[1][1]
-MIN_DEPTH_M = 0.30
-MAX_DEPTH_M = 1.50
 OVERSCAN = 0.10
 CORNERS = (0, 1, 2, 3)
 CENTER = 4
@@ -129,16 +129,21 @@ class Calibration:
     def aim(self, tip: Vec3) -> tuple[float, float]:
         return self.plane.aim(tip)
 
-    def project(self, pose: Pose) -> tuple[float, float, float] | None:
-        """Return stage x/y and palm travel in viewport widths, positive toward the visitor."""
+    def project(self, pose: Pose, depth_range: DepthRange | None = None) -> tuple[float, float, float] | None:
+        """Return stage x/y and mapped palm depth, positive toward the visitor."""
         if not pose.valid():
             return None
         x, y = self.aim(pose.tip)
-        palm_travel = dot(pose.palm, self.plane.normal) - self.neutral_depth_m
-        reach = self.plane.depth_reach_m
-        if not (-OVERSCAN <= x <= 1 + OVERSCAN and -OVERSCAN <= y <= 1 + OVERSCAN and abs(palm_travel) <= reach):
+        if not (-OVERSCAN <= x <= 1 + OVERSCAN and -OVERSCAN <= y <= 1 + OVERSCAN):
             return None
-        return max(0.0, min(1.0, x)), max(0.0, min(1.0, y)), palm_travel / self.viewport_width_m
+        if depth_range is None:
+            palm_travel = dot(pose.palm, self.plane.normal) - self.neutral_depth_m
+            if abs(palm_travel) > self.plane.depth_reach_m:
+                return None
+            depth = palm_travel / self.viewport_width_m
+        else:
+            depth = depth_range.map_depth(pose.palm[2])
+        return max(0.0, min(1.0, x)), max(0.0, min(1.0, y)), depth
 
     def to_dict(self) -> dict:
         return {

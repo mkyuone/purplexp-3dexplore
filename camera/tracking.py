@@ -61,6 +61,7 @@ class Candidate:
     image_palm: Vec2 | None = None
     optical_pinch_ratio: float | None = None
     thumbs_up: bool = False
+    thumb_depth_m: float | None = None
 
 
 @dataclass(frozen=True)

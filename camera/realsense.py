@@ -25,6 +25,7 @@ CALIBRATION_WINDOW = 0.7
 LEASE_SECONDS = 6.0
 PREVIEW_LEASE = 0.60
 PREVIEW_INTERVAL = 1 / 6
+THUMB_DEPTH_LEASE = 2.0
 RGB_SIZE = (640, 480)
 DEPTH_QUEUE_SIZE = 4
 STREAM_TIMEOUT = 2.0
@@ -51,6 +52,7 @@ class CameraInfo:
     profile: str | None
     session: str
     project_image: ImageProjector | None = None
+    serial: str | None = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,7 @@ class Frame:
     detected_hands: int = 0
     processing_ms: float = 0.0
     diagnostics: dict | None = None
+    thumb_depth_m: float | None = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +74,7 @@ class Snapshot:
     frame: Frame | None
     history: tuple[Frame, ...]
     error: str | None
+    gesture_history: tuple[Frame, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -86,12 +90,19 @@ class PreviewMarker:
     fist: bool = False
 
 
-def preview_markers(landmarks, samples: list[Candidate | None], tracks: tuple[Track, ...]) -> tuple[PreviewMarker, ...]:
+def preview_markers(
+    landmarks, samples: list[Candidate | None], tracks: tuple[Track, ...], *, mark_thumb: bool = False,
+) -> tuple[PreviewMarker, ...]:
     markers = []
     for index, hand in enumerate(landmarks):
         if len(hand) <= 8:
             continue
         sample = samples[index] if index < len(samples) else None
+        if mark_thumb:
+            point = (hand[4].x, hand[4].y)
+            if valid_image(point):
+                markers.append(PreviewMarker(point, sample is not None and sample.thumb_depth_m is not None))
+            continue
         track = None
         if sample is not None:
             if sample.pose is not None:
@@ -169,7 +180,7 @@ def locate_depth(
 
 def fuse_hand(
     rs, np, image_landmarks, world_landmarks, handedness, aligned_depth,
-    features_override=None, *, image_size=RGB_SIZE, deproject=None,
+    features_override=None, *, image_size=RGB_SIZE, deproject=None, measure_thumb_depth=False,
 ) -> Candidate | None:
     if len(image_landmarks) != 21:
         return None
@@ -243,6 +254,7 @@ def fuse_hand(
 
     tip = fingertip(8, 7)
     thumb_tip = fingertip(4, 3) if tip is not None else None
+    thumb_pad = None
     gap = dist(thumb_tip, tip) if tip is not None and thumb_tip is not None else None
     if (tip is not None and thumb_tip is not None and gap > FINGERTIP_GAP_CHECK_M and features.loosely_folded < 4
             and optical_ratio is not None and optical_ratio <= FINGERTIP_GAP_CHECK_OPTICAL_RATIO
@@ -255,9 +267,24 @@ def fuse_hand(
             tip, gap = index_pad, None
         if thumb_pad is not None and abs(thumb_tip[2] - thumb_pad[2]) > FINGERTIP_DEPTH_DISAGREEMENT_M:
             gap = None
+    thumbs_up = is_thumbs_up(image_landmarks, width, height, features)
+    thumb_depth_m = None
+    if measure_thumb_depth and (features.folded < 4 or thumbs_up):
+        target = image_landmarks[4]
+        # The index can be completely hidden as the other fingers curl.
+        # Calibration needs a separate stereo sample at the extended thumb.
+        measured_thumb = thumb_tip if tip is not None else locate(target.x, target.y, palm[2])
+        thumb_pad = thumb_pad or fingertip_pad(4, 3)
+        # A patch on the tip can straddle the background. Prefer the depth
+        # inside the thumb's distal segment when it contradicts that patch.
+        if thumb_pad is not None and (measured_thumb is None or
+                abs(measured_thumb[2] - thumb_pad[2]) > FINGERTIP_DEPTH_DISAGREEMENT_M):
+            measured_thumb = thumb_pad
+        if measured_thumb is not None and valid_point(measured_thumb):
+            thumb_depth_m = measured_thumb[2]
     return replace(
         sample, pose=Pose(tip or palm, palm), pinch_gap=gap, pointing=tip is not None,
-        thumbs_up=is_thumbs_up(image_landmarks, width, height, features),
+        thumbs_up=thumbs_up, thumb_depth_m=thumb_depth_m,
     )
 
 
@@ -560,10 +587,12 @@ class CameraFeed:
         self.info: CameraInfo | None = None
         self.frame: Frame | None = None
         self.history: deque[Frame] = deque(maxlen=24)
+        self.gesture_history: deque[Frame] = deque(maxlen=48)
         self.preview: Preview | None = None
         self.preview_clients: dict[str, float] = {}
         self.preview_until = 0.0
         self.next_preview_at = 0.0
+        self.thumb_depth_until = 0.0
         self.error: str | None = None
         self.options = options
         self.active_options: CameraOptions | None = None
@@ -583,7 +612,9 @@ class CameraFeed:
             self.info = None
             self.frame = None
             self.preview = None
+            self.thumb_depth_until = 0.0
             self.history.clear()
+            self.gesture_history.clear()
             self.frame_times.clear()
             self.processing_times.clear()
             self.processing_ms = 0.0
@@ -622,10 +653,11 @@ class CameraFeed:
                 'error': self.error, 'diagnostics': diagnostics,
             }
 
-    def snapshot(self) -> Snapshot:
+    def snapshot(self, *, include_gestures: bool = False) -> Snapshot:
         with self.lock:
             self.last_contact = monotonic()
-            snapshot = Snapshot(self.info, self.frame, tuple(self.history), self.error)
+            gestures = tuple(self.gesture_history) if include_gestures else ()
+            snapshot = Snapshot(self.info, self.frame, tuple(self.history), self.error, gestures)
         self.wake.set()
         return snapshot
 
@@ -667,6 +699,14 @@ class CameraFeed:
             self.preview_clients.pop(client, None)
             self.update_preview_expiry(monotonic())
 
+    def request_thumb_depth(self) -> None:
+        with self.lock:
+            self.thumb_depth_until = monotonic() + THUMB_DEPTH_LEASE
+
+    def thumb_depth_requested(self) -> bool:
+        with self.lock:
+            return monotonic() < self.thumb_depth_until
+
     def preview_due(self, at: float) -> bool:
         with self.lock:
             self.update_preview_expiry(monotonic())
@@ -697,6 +737,12 @@ class CameraFeed:
             if revision is not None and revision != self.revision:
                 return
             self.frame = frame
+            if self.thumb_depth_until:
+                if monotonic() < self.thumb_depth_until:
+                    self.gesture_history.append(frame)
+                else:
+                    self.thumb_depth_until = 0.0
+                    self.gesture_history.clear()
             self.frame_times.append(frame.at)
             self.processing_times.append(frame.processing_ms)
             self.processing_ms += (frame.processing_ms - self.processing_ms) * 0.2
@@ -736,10 +782,12 @@ class CameraFeed:
                     self.processing_times.clear()
                     self.processing_ms = 0.0
                     self.history.clear()
+                    self.gesture_history.clear()
                     self.preview = None
                     self.preview_clients.clear()
                     self.preview_until = 0.0
                     self.next_preview_at = 0.0
+                    self.thumb_depth_until = 0.0
                     self.error = message
                     self.changed.notify_all()
             if message is not None:
@@ -791,7 +839,7 @@ class CameraFeed:
             with self.lock:
                 if revision != self.revision:
                     return
-                self.info = CameraInfo(None, session)
+                self.info = CameraInfo(None, session, serial=serial)
                 self.active_options = options
                 self.error = None
 
@@ -799,7 +847,7 @@ class CameraFeed:
                 profile = profile_key(width)
                 with self.lock:
                     if self.info is not None and self.info.session == session and self.info.profile != profile:
-                        self.info = CameraInfo(profile, session, project_image)
+                        self.info = CameraInfo(profile, session, project_image, serial)
 
             depth = DepthStream(rs, device, color, options.fps, set_depth_profile)
             resources.callback(depth.close)
@@ -859,8 +907,10 @@ class CameraFeed:
                 # the frame was queued. Keep publishing the fresh RGB pose.
                 depth = paired_depth = project = None
             after_alignment = monotonic()
+            measure_thumb_depth = len(detections) == 1 and self.thumb_depth_requested()
             samples = [
-                fuse_hand(rs, np, hand.landmarks, [], hand.handedness, depth, hand.features, deproject=project)
+                fuse_hand(rs, np, hand.landmarks, [], hand.handedness, depth, hand.features,
+                          deproject=project, measure_thumb_depth=measure_thumb_depth)
                 for hand in detections
             ]
             if not self.wanted(revision):
@@ -885,8 +935,10 @@ class CameraFeed:
             self.publish(Frame(
                 sequence, at, tracking, hands, calibration_pose, len(samples),
                 (monotonic() - dequeued_at) * 1000, diagnostics,
+                thumb_depth_m=sample.thumb_depth_m if sample is not None else None,
             ), revision)
             if preview is not None and self.preview_due(at):
                 current_tracks = tuple(track for track in tracker.tracks if track.published and track.observed_at == at)
-                markers = preview_markers([hand.landmarks for hand in detections], samples, current_tracks)
+                markers = preview_markers([hand.landmarks for hand in detections], samples, current_tracks,
+                                          mark_thumb=measure_thumb_depth)
                 preview.submit(at, rgb, markers)

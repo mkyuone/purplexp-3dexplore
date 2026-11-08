@@ -2,8 +2,9 @@ from dataclasses import replace
 from math import exp, isclose
 from unittest import TestCase
 
-from calibration import Pose
-from navigation import DEPTH_WIDTH_M, FuzzyMapper, IMAGE_BOTTOM, IMAGE_LEFT, IMAGE_RIGHT, IMAGE_TOP, soft_axis
+from calibration import Pose, TARGETS, fit
+from depth_range import DepthRange
+from navigation import CalibratedMapper, DEPTH_WIDTH_M, FuzzyMapper, IMAGE_BOTTOM, IMAGE_LEFT, IMAGE_RIGHT, IMAGE_TOP, soft_axis
 from tracking import Candidate, GripFeatures, Hand, HandTracker
 
 
@@ -14,6 +15,59 @@ def hand(identifier='one', x=0.5, y=0.5, depth=0.7, grip='open'):
 def pinch(x=0.5, depth=0.7, *, side='Left', palm_x=0):
     pose = Pose((palm_x, 0, depth), (palm_x, 0.04, depth))
     return Candidate(pose, side, GripFeatures(0.24, 1, 1), 0.020, True, (x, 0.5), (x, 0.5), 0.15)
+
+
+class CustomDepthRangeTests(TestCase):
+    def test_saved_endpoints_require_a_supported_and_ordered_twenty_centimeter_span(self):
+        minimum = DepthRange(0.4, 0.6)
+        self.assertEqual(DepthRange.from_dict(minimum.to_dict()), minimum)
+        for value in (None, {}, {'nearM': '0.4', 'farM': 0.8}, {'nearM': True, 'farM': 1.5},
+                      {'nearM': float('nan'), 'farM': 0.8}, {'nearM': 0.2, 'farM': 0.8},
+                      {'nearM': 0.4, 'farM': 1.6}, {'nearM': 0.4, 'farM': 0.59},
+                      {'nearM': 0.9, 'farM': 0.4}):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                DepthRange.from_dict(value)
+
+    def test_fuzzy_depth_range_saturates_while_smoothing_and_rgb_fallback_still_apply(self):
+        mapper = FuzzyMapper(DepthRange(0.5, 0.9))
+        measured = hand(depth=0.42, grip='pinch')
+        near, = mapper.update([measured], 1)
+        self.assertEqual((near.depth, near.depth_valid), (-0.5, True))
+
+        moved = hand(x=0.60, depth=0.7, grip='pinch')
+        middle, = mapper.update([moved], 1.04)
+        self.assertLess(near.depth, middle.depth)
+        self.assertLess(middle.depth, 0)
+
+        dropout = replace(moved, pose=None, pointing=False, image=(0.65, 0.5))
+        image_only, = mapper.update([dropout], 1.08)
+        self.assertFalse(image_only.depth_valid)
+        self.assertLess(image_only.x, middle.x)
+
+        far, = mapper.update([hand(x=0.7, depth=1.0, grip='pinch')], 1.12)
+        self.assertEqual((far.depth, far.depth_valid), (0.5, True))
+        self.assertIsNone(mapper.neutral_depth_m)
+
+    def test_calibrated_range_replaces_only_depth_reach_and_keeps_rgb_pinch_continuity(self):
+        def point(x, y, palm_depth=0.7):
+            x, y = (0.5 - x) * 0.5, (y - 0.5) * 0.4
+            return Pose((x, y, 0.7), (x, y + 0.04, palm_depth))
+
+        calibration = fit([point(x, y) for x, y in TARGETS])
+        custom = CalibratedMapper(calibration, lambda x, y, z: point(x, y).tip,
+                                  DepthRange(0.5, 0.9))
+        outside_legacy_reach = point(0.5, 0.5, 1.2)
+        self.assertIsNone(calibration.project(outside_legacy_reach))
+        pinch = replace(hand(grip='pinch'), pose=outside_legacy_reach)
+        mapped, = custom.update([pinch], 1, 1)
+        self.assertEqual((mapped.x, mapped.y, mapped.depth, mapped.depth_valid), (0.5, 0.5, 0.5, True))
+
+        dropout = replace(pinch, pose=None, pointing=False, image=(0.6, 0.5))
+        continued, = custom.update([dropout], 1.04, 2)
+        self.assertAlmostEqual(continued.x, 0.6)
+        self.assertFalse(continued.depth_valid)
+        out_of_bounds = replace(pinch, pose=point(1.2, 0.5))
+        self.assertEqual(custom.update([out_of_bounds], 1.08, 3), ())
 
 
 class FuzzyMappingTests(TestCase):

@@ -104,6 +104,7 @@ class FusedImageTests(TestCase):
         estimator = SimpleNamespace(detect=lambda image, at: next(detections))
         published = []
         feed = SimpleNamespace(wanted=lambda revision: len(published) < 5,
+                               thumb_depth_requested=lambda: False,
                                publish=lambda frame, revision: published.append(frame))
         def locate(rs, np, pixels, *args):
             return None if pixels is missing_pixels else (0, .02, .7)

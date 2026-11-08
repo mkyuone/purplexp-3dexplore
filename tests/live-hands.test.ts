@@ -165,3 +165,30 @@ test('long polling requests the next sequence and excludes the bridge wait from 
   assert.equal(requests[1].searchParams.get('session'), session)
   assert.deepEqual(frames.map(frame => frame.capturedAt), [93, 127])
 })
+
+test('a new depth range drops the old grip before delivering depth in the new coordinates', { timeout: 1000 }, async t => {
+  withWindow(t)
+  const received = Promise.withResolvers<void>()
+  const events: string[] = []
+  const frames = [
+    { sequence: 1, depthRangeRevision: 0 },
+    { sequence: 1, depthRangeRevision: 1 },
+    { sequence: 2, depthRangeRevision: 1 },
+  ]
+  t.mock.method(globalThis, 'fetch', async () => Response.json({
+    status: 'ready', session: 'same-camera', ageMs: 0,
+    tracking: 'tracking', hands: [{ id: 'held', x: .5, y: .5, depth: .2, depthValid: true, pinched: true }],
+    ...frames.shift(),
+  }))
+  const disconnect = connectLiveHands({
+    navigation: 'fuzzy', status: () => {},
+    reset: reason => { if (reason) events.push(reason) },
+    receive: frame => {
+      events.push(`pose ${frame.sequence}`)
+      if (frame.sequence === 2) received.resolve()
+    },
+  })
+  t.after(disconnect)
+  await received.promise
+  assert.deepEqual(events, ['pose 1', 'depth-range', 'pose 2'])
+})
