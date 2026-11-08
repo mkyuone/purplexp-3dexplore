@@ -92,6 +92,32 @@ class StubFeed:
 
 
 class CalibrationBridgeTests(TestCase):
+    def test_rgb_only_startup_is_ready_in_fuzzy_mode_and_waits_for_depth_to_calibrate(self):
+        feed = StubFeed()
+        snapshot = replace(feed.snapshot(), info=CameraInfo(None, 'session-1'))
+        with (TemporaryDirectory() as folder, patch('server.monotonic', lambda: feed.now),
+              patch.object(feed, 'snapshot', return_value=snapshot)):
+            service = CameraService(feed, Profiles(Path(folder) / 'profiles.json'))
+            self.assertEqual(service.poses('1280x720@1')['status'], 'ready')
+            self.assertIn('depth stream', service.poses('1280x720@1', 'calibrated')['message'])
+            self.assertEqual(service.calibrate('1280x720@1', 'begin')['status'], 'offline')
+
+    def test_pose_cursor_waits_without_holding_the_service_lock_and_reads_the_latest_frame(self):
+        feed = StubFeed()
+        with TemporaryDirectory() as folder, patch('server.monotonic', lambda: feed.now):
+            service = CameraService(feed, Profiles(Path(folder) / 'profiles.json'))
+
+            def publish_during_wait(session, after, timeout):
+                self.assertFalse(service.lock.locked())
+                self.assertEqual((session, after), ('session-1', 6))
+                self.assertGreater(timeout, 0)
+                self.assertLess(timeout, 0.16)
+                feed.replace_sample(-1, sequence=8)
+
+            with patch.object(feed, 'wait_for_pose', publish_during_wait, create=True):
+                response = service.poses('1280x720@1', session='session-1', after=6)
+            self.assertEqual(response['sequence'], 8)
+
     def test_connected_stale_stream_waits_for_fresh_frames_without_republishing_hands(self):
         display = '1280x720@1'
         feed = StubFeed()

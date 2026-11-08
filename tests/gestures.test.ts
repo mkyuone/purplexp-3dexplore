@@ -874,24 +874,45 @@ test('a neutral survivor does not prevent a privately confirming pinch from retu
   assert.equal(h.edits.length, 1)
 })
 
-test('two closed live pinches on the same part acquire a stable primary before the other joins', t => {
+test('two steady closed live pinches on the same part share one confirmation window', t => {
   let now = 1000
   t.mock.method(performance, 'now', () => now)
   const h = harness(t, { liveTracking: true, joinAnywhere: true })
   const first = hand('alpha', 0.3, 0.4, true)
   const second = hand('beta', 0.6, 0.4, true)
   h.send(second, first)
-  now += 100
+  now += 99
   h.send(first, second)
-  assert.equal(h.state().status, 'holding')
-  assert.deepEqual(h.state().activeHands, ['alpha'])
-  assert.deepEqual(h.pose(), h.initial)
+  assert.equal(h.state().target, null)
+  now += 1
   h.send(second, first)
-  now += 100
-  h.send(first, second)
   assert.equal(h.state().status, 'both')
-  assert.deepEqual(h.state().activeHands, ['alpha', 'beta'])
+  assert.deepEqual(h.state().activeHands, ['beta', 'alpha'])
   assert.deepEqual(h.pose(), h.initial)
+})
+
+test('a moving or missing second closed pinch does not inherit the primary confirmation', t => {
+  let now = 1000
+  t.mock.method(performance, 'now', () => now)
+  for (const secondDuringDwell of [undefined, hand('beta', 0.65, 0.4, true)]) {
+    const h = harness(t, { liveTracking: true, joinAnywhere: true })
+    const first = hand('alpha', 0.3, 0.4, true)
+    const second = hand('beta', 0.6, 0.4, true)
+    h.send(first, second)
+    now += 50
+    if (secondDuringDwell) h.send(first, secondDuringDwell)
+    else h.send(first)
+    now += 50
+    h.send(first, second)
+    assert.deepEqual(h.state().activeHands, ['alpha'])
+    now += 99
+    h.send(first, second)
+    assert.equal(h.state().status, 'holding')
+    now += 1
+    h.send(first, second)
+    assert.equal(h.state().status, 'both')
+    assert.deepEqual(h.pose(), h.initial)
+  }
 })
 
 test('closed pinches on different parts remain ambiguous unless an established candidate stays aimed', t => {

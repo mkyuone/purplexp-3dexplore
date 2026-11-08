@@ -4,11 +4,16 @@ from unittest import TestCase
 
 from calibration import Pose
 from navigation import DEPTH_WIDTH_M, FuzzyMapper, IMAGE_BOTTOM, IMAGE_LEFT, IMAGE_RIGHT, IMAGE_TOP, soft_axis
-from tracking import Hand
+from tracking import Candidate, GripFeatures, Hand, HandTracker
 
 
 def hand(identifier='one', x=0.5, y=0.5, depth=0.7, grip='open'):
     return Hand(identifier, Pose((0, 0, depth), (0, 0.04, depth)), grip, True, (x, y))
+
+
+def pinch(x=0.5, depth=0.7, *, side='Left', palm_x=0):
+    pose = Pose((palm_x, 0, depth), (palm_x, 0.04, depth))
+    return Candidate(pose, side, GripFeatures(0.24, 1, 1), 0.020, True, (x, 0.5), (x, 0.5), 0.15)
 
 
 class FuzzyMappingTests(TestCase):
@@ -139,6 +144,42 @@ class FuzzyMappingTests(TestCase):
         target_x = 1 - soft_axis(0.7, IMAGE_LEFT, IMAGE_RIGHT)
         self.assertLess(abs(settled.x - target_x), 0.008)
         self.assertLess(abs(settled.depth - 0.12 / DEPTH_WIDTH_M), 0.015)
+
+    def test_established_tracking_and_mapping_respond_promptly_to_rigid_pair_movement(self):
+        tracker, mapper = HandTracker(), FuzzyMapper()
+        initial = [pinch(.38, .64, palm_x=-.12), pinch(.62, .76, side='Right', palm_x=.12)]
+        moved = [pinch(.416, .67, palm_x=-.12), pinch(.656, .79, side='Right', palm_x=.12)]
+        _, hands = tracker.update(initial, 1)
+        before = mapper.update(hands, 1)
+        for index in range(1, 6):
+            at = 1 + index / 30
+            status, hands = tracker.update(moved[::-1], at)
+            self.assertEqual((status, [item.grip for item in hands]), ('tracking', ['pinch', 'pinch']))
+            after = mapper.update(hands, at)
+            self.assertAlmostEqual(after[1].x - after[0].x, before[1].x - before[0].x)
+            self.assertAlmostEqual(after[1].depth - after[0].depth, before[1].depth - before[0].depth)
+            if index == 1:
+                self.assertGreater(before[0].x - after[0].x, 0.0235)
+                self.assertGreater(after[0].depth - before[0].depth, 0.0225)
+        self.assertGreater(before[0].x - after[0].x, 0.042)
+        self.assertGreater(after[0].depth - before[0].depth, 0.040)
+
+    def test_established_tracking_still_damps_small_image_and_depth_noise(self):
+        for fps in (30, 60):
+            with self.subTest(fps=fps):
+                tracker, mapper = HandTracker(), FuzzyMapper()
+                _, hands = tracker.update([pinch()], 1)
+                mapper.update(hands, 1)
+                samples = []
+                for index in range(1, 91):
+                    at = 1 + index / fps
+                    direction = 1 if index % 2 else -1
+                    _, hands = tracker.update([pinch(.5 + direction * .004, .7 + direction * .006)], at)
+                    current, = mapper.update(hands, at)
+                    if index > 30:
+                        samples.append(current)
+                self.assertLess(max(item.x for item in samples) - min(item.x for item in samples), 0.0005)
+                self.assertLess(max(item.depth for item in samples) - min(item.depth for item in samples), 0.0005)
 
     def test_common_depth_filter_preserves_hand_separation_and_grip_baselines(self):
         mapper = FuzzyMapper()

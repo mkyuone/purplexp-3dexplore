@@ -74,6 +74,14 @@ interface SecondaryGrip {
   missing: boolean
 }
 
+interface ClosedCandidate {
+  hand: HandPose
+  target: string | null
+  secondFistId?: string
+  parallelPinch?: HandPose
+  capturedAt: number
+}
+
 interface ActiveGrip {
   first: HandPose
   second: HandPose | null
@@ -164,7 +172,7 @@ export class GestureController {
   private recovering = false
   private recoverClosed = false
   private retryPinch: string | null = null
-  private closedCandidate: { hand: HandPose; target: string | null; secondId?: string; capturedAt: number } | null = null
+  private closedCandidate: ClosedCandidate | null = null
   private hovered: string[] = []
   private hoverCandidates = new Map<string, { id: string; x: number; y: number; capturedAt: number }>()
   private resetCandidate: { id: string; capturedAt: number; elapsed: number } | null = null
@@ -482,21 +490,17 @@ export class GestureController {
 
   private matchesClosedCandidate(hand: HandPose, target: string | null) {
     const candidate = this.closedCandidate
-    if (!candidate || candidate.hand.id !== hand.id || candidate.hand.pinched !== hand.pinched || candidate.target !== target) return false
-    const travel = Math.hypot(
-      (hand.x - candidate.hand.x) * this.viewportWidth,
-      (hand.y - candidate.hand.y) * this.viewportHeight,
-    )
-    const steadyDepth = !hand.depthValid || !candidate.hand.depthValid || Math.abs(hand.depth - candidate.hand.depth) <= 0.035
-    return travel <= TARGET_GRACE_PX && steadyDepth
+    return candidate !== null && candidate.target === target && this.isSteadyClosedHand(hand, candidate.hand)
   }
 
-  private confirmClosed(hand: HandPose, target: string | null, second?: HandPose) {
-    if (!this.matchesClosedCandidate(hand, target) || this.closedCandidate?.secondId !== second?.id) {
-      this.closedCandidate = { hand, target, secondId: second?.id, capturedAt: this.lastCapture }
-      return false
-    }
-    return this.lastCapture - this.closedCandidate!.capturedAt >= CLOSED_GRIP_CONFIRM_MS
+  private isSteadyClosedHand(hand: HandPose, initial: HandPose) {
+    if (initial.id !== hand.id || initial.pinched !== hand.pinched) return false
+    const travel = Math.hypot(
+      (hand.x - initial.x) * this.viewportWidth,
+      (hand.y - initial.y) * this.viewportHeight,
+    )
+    const steadyDepth = !hand.depthValid || !initial.depthValid || Math.abs(hand.depth - initial.depth) <= 0.035
+    return travel <= TARGET_GRACE_PX && steadyDepth
   }
 
   private tryClosedRecovery(hands: readonly HandPose[]) {
@@ -518,8 +522,22 @@ export class GestureController {
       return
     }
     const { hand, target } = selected
-    const second = hand.fist ? closed.find(other => other.id !== hand.id && other.fist) : undefined
-    if (this.confirmClosed(hand, target, second)) this.startGrip(hand, hands, second ? [second] : [])
+    const secondFist = hand.fist ? closed.find(other => other.id !== hand.id && other.fist) : undefined
+    const secondPinch = hand.pinched && sharedTarget ? candidates.find(other => other.hand.id !== hand.id)?.hand : undefined
+    const candidate = this.closedCandidate
+    if (!candidate || !existing || candidate.secondFistId !== secondFist?.id) {
+      this.closedCandidate = { hand, target, secondFistId: secondFist?.id, parallelPinch: secondPinch, capturedAt: this.lastCapture }
+      return
+    }
+    // A second pinch can share the wait only if it stayed steady on the same
+    // exact target throughout the primary's confirmation window.
+    if (candidate.parallelPinch && (!secondPinch || !this.isSteadyClosedHand(secondPinch, candidate.parallelPinch))) {
+      candidate.parallelPinch = undefined
+    }
+    if (this.lastCapture - candidate.capturedAt >= CLOSED_GRIP_CONFIRM_MS) {
+      const second = secondFist ?? (candidate.parallelPinch && secondPinch)
+      this.startGrip(hand, hands, second ? [second] : [])
+    }
   }
 
   private updateGrip(hands: readonly HandPose[], fresh: readonly HandPose[]) {

@@ -1,13 +1,13 @@
 """Capture aligned D435i frames locally and expose only timestamped hand poses."""
 
 from collections import deque
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from math import dist, hypot, isfinite
 from pathlib import Path
 from statistics import median
-from threading import Event, Lock, Thread
-from time import monotonic
+from threading import Condition, Event, Lock, Thread
+from time import monotonic, time
 from uuid import uuid4
 import logging
 
@@ -25,6 +25,9 @@ LEASE_SECONDS = 6.0
 PREVIEW_LEASE = 0.60
 PREVIEW_INTERVAL = 1 / 6
 RGB_SIZE = (640, 480)
+DEPTH_QUEUE_SIZE = 4
+STREAM_TIMEOUT = 2.0
+DEPTH_RETRY_DELAY = 2.0
 FINGERTIP_DEPTH_DISAGREEMENT_M = 0.035
 FINGERTIP_GAP_CHECK_M = 0.032
 FINGERTIP_GAP_CHECK_OPTICAL_RATIO = 0.28
@@ -35,8 +38,7 @@ class CameraError(RuntimeError):
     pass
 
 
-def enable_depth_projector(rs, profile) -> None:
-    sensor = profile.get_device().first_depth_sensor()
+def enable_depth_projector(rs, sensor) -> None:
     if not sensor.supports(rs.option.emitter_enabled):
         raise CameraError('This camera cannot enable the depth projector.')
     sensor.set_option(rs.option.emitter_enabled, 1)
@@ -44,7 +46,7 @@ def enable_depth_projector(rs, profile) -> None:
 
 @dataclass(frozen=True)
 class CameraInfo:
-    profile: str
+    profile: str | None
     session: str
 
 
@@ -144,7 +146,7 @@ def patch_depth(np, depth, x: int, y: int, units: float, near: float | None = No
 
 def locate_depth(
     rs, np, depth, intrinsics, units: float, x: float, y: float, near: float | None,
-    sample: tuple[float, float] | None = None,
+    sample: tuple[float, float] | None = None, *, deproject=None,
 ) -> Vec3 | None:
     if not (0 <= x < 1 and 0 <= y < 1):
         return None
@@ -155,19 +157,24 @@ def locate_depth(
     z = patch_depth(np, depth, int(sample_x * width), int(sample_y * height), units, near)
     if z is None:
         return None
+    if deproject is not None:
+        return deproject(x * width, y * height, z)
     a, b, c = rs.rs2_deproject_pixel_to_point(intrinsics, [x * width, y * height], z)
     point = (float(a), float(b), float(c))
     return point if valid_point(point) else None
 
 
-def fuse_hand(rs, np, image_landmarks, world_landmarks, handedness, aligned_depth, features_override=None) -> Candidate | None:
+def fuse_hand(
+    rs, np, image_landmarks, world_landmarks, handedness, aligned_depth,
+    features_override=None, *, image_size=RGB_SIZE, deproject=None,
+) -> Candidate | None:
     if len(image_landmarks) != 21:
         return None
     features = features_override or grip_features([(point.x, point.y, point.z) for point in world_landmarks])
     if features is None:
         return None
-    depth = np.asanyarray(aligned_depth.get_data())
-    height, width = depth.shape
+    depth = np.asanyarray(aligned_depth.get_data()) if aligned_depth else None
+    width, height = image_size if depth is None else (depth.shape[1], depth.shape[0])
     wrist = image_landmarks[0]
     palm_bases = [image_landmarks[index] for index in (5, 9, 17)]
     palm_rays = [((wrist.x + base.x) / 2, (wrist.y + base.y) / 2) for base in palm_bases]
@@ -200,12 +207,15 @@ def fuse_hand(rs, np, image_landmarks, world_landmarks, handedness, aligned_dept
     visible_palm = (valid_image((wrist.x, wrist.y)) and valid_image(image_palm)
                     and sum(valid_image((base.x, base.y)) for base in palm_bases) >= 2)
     optical_sample = sample if visible_palm else None
+    if depth is None:
+        return optical_sample
 
     intrinsics = aligned_depth.profile.as_video_stream_profile().intrinsics
     units = aligned_depth.get_units()
+    projection = {} if deproject is None else {'deproject': deproject}
 
     def locate(x: float, y: float, near: float | None = None) -> Vec3 | None:
-        return locate_depth(rs, np, depth, intrinsics, units, x, y, near)
+        return locate_depth(rs, np, depth, intrinsics, units, x, y, near, **projection)
 
     palm_points = [point for x, y in palm_rays if (point := locate(x, y)) is not None]
     if len(palm_points) < 2:
@@ -217,7 +227,7 @@ def fuse_hand(rs, np, image_landmarks, world_landmarks, handedness, aligned_dept
     def fingertip_pad(tip_index: int, joint_index: int) -> Vec3 | None:
         target, joint = image_landmarks[tip_index], image_landmarks[joint_index]
         inner = ((target.x + joint.x) / 2, (target.y + joint.y) / 2)
-        return locate_depth(rs, np, depth, intrinsics, units, target.x, target.y, palm[2], inner)
+        return locate_depth(rs, np, depth, intrinsics, units, target.x, target.y, palm[2], inner, **projection)
 
     def fingertip(tip_index: int, joint_index: int) -> Vec3 | None:
         target = image_landmarks[tip_index]
@@ -248,20 +258,277 @@ def fuse_hand(rs, np, image_landmarks, world_landmarks, handedness, aligned_dept
     )
 
 
-def open_streams(rs, context, serial: str, options: CameraOptions = CameraOptions()):
-    for width in (848, 640):
-        pipeline = rs.pipeline(context)
-        config = rs.config()
-        config.enable_device(serial)
-        config.enable_stream(rs.stream.depth, width, 480, rs.format.z16, options.fps)
-        config.enable_stream(rs.stream.color, *RGB_SIZE, rs.format.rgb8, options.fps)
+def video_profile(sensor, stream, fmt, size, fps):
+    for profile in sensor.get_stream_profiles():
+        if profile.stream_type() == stream and profile.format() == fmt and profile.fps() == fps:
+            video = profile.as_video_stream_profile()
+            if (video.width(), video.height()) == size:
+                return video
+    raise CameraError(f'D435i has no {stream} profile at {size[0]}×{size[1]} and {fps} fps.')
+
+
+def close_sensor(action) -> None:
+    try:
+        action()
+    except RuntimeError as error:
+        # A disconnected sensor may already be stopped or closed. Still close
+        # the other sensor and keep the original capture error available.
+        logging.debug('D435i sensor cleanup: %s', error)
+
+
+def start_sensor(rs, sensor, profile, queue, resources: ExitStack) -> None:
+    clock = rs.option.global_time_enabled
+    try:
+        if sensor.supports(clock):
+            sensor.set_option(clock, 1)
+    except RuntimeError as error:
+        logging.debug('D435i global time unavailable: %s', error)
+    sensor.open(profile)
+    resources.callback(close_sensor, sensor.close)
+    sensor.start(queue)
+    resources.callback(close_sensor, sensor.stop)
+
+
+@contextmanager
+def open_color(rs, device, fps: int):
+    color = device.first_color_sensor()
+    profile = video_profile(color, rs.stream.color, rs.format.rgb8, RGB_SIZE, fps)
+    # Independent queues keep RGB flowing through a depth outage. The single
+    # RGB slot discards superseded frames while inference is busy.
+    queue = rs.frame_queue(1)
+    with ExitStack() as resources:
+        start_sensor(rs, color, profile, queue, resources)
+        yield profile, queue
+
+
+@contextmanager
+def open_depth(rs, device, fps: int, widths):
+    depth = device.first_depth_sensor()
+    errors = []
+    with ExitStack() as resources:
+        for width in widths:
+            try:
+                profile = video_profile(depth, rs.stream.depth, rs.format.z16, (width, 480), fps)
+                queue = rs.frame_queue(DEPTH_QUEUE_SIZE)
+                with ExitStack() as attempt:
+                    start_sensor(rs, depth, profile, queue, attempt)
+                    enable_depth_projector(rs, depth)
+                    resources.enter_context(attempt.pop_all())
+                break
+            except RuntimeError as error:
+                errors.append(str(error))
+        else:
+            raise CameraError('Could not start D435i depth. ' + ' / '.join(errors))
+        yield profile, queue
+
+
+@dataclass(frozen=True)
+class CameraSample:
+    frame: object
+    number: int
+    timestamp: float
+    domain: object
+    arrival: float | None
+
+    @classmethod
+    def read(cls, rs, frame):
+        field = rs.frame_metadata_value.time_of_arrival
+        arrival = frame.get_frame_metadata(field) if frame.supports_frame_metadata(field) else None
+        return cls(frame, frame.get_frame_number(), frame.get_timestamp(), frame.get_frame_timestamp_domain(), arrival)
+
+    def distance(self, other) -> float:
+        if self.domain == other.domain:
+            distance = abs(self.timestamp - other.timestamp)
+        elif self.arrival is not None and other.arrival is not None:
+            distance = abs(self.arrival - other.arrival)
+        else:
+            return float('inf')
+        return distance if isfinite(distance) else float('inf')
+
+
+class DepthMatcher:
+    def __init__(self, rs, queue, fps: int) -> None:
+        self.rs = rs
+        self.queue = queue
+        self.window = 500 / fps
+        self.pending: deque[CameraSample] = deque(maxlen=DEPTH_QUEUE_SIZE)
+        self.last_number = None
+        self.last_seen = monotonic()
+
+    def match(self, color: CameraSample):
+        for _ in range(DEPTH_QUEUE_SIZE):
+            frame = self.queue.poll_for_frame()
+            if not frame:
+                break
+            sample = CameraSample.read(self.rs, frame)
+            if sample.number != self.last_number:
+                self.pending.append(sample)
+                self.last_number = sample.number
+                self.last_seen = monotonic()
+        if not self.pending:
+            return None
+        index = min(range(len(self.pending)), key=lambda index: color.distance(self.pending[index]))
+        depth = self.pending[index]
+        if color.distance(depth) >= self.window:
+            return None
+        for _ in range(index + 1):
+            self.pending.popleft()
+        return depth.frame
+
+
+class DepthStream:
+    def __init__(self, rs, device, color, fps: int, on_profile) -> None:
+        self.rs = rs
+        self.device = device
+        self.color = color
+        self.fps = fps
+        self.on_profile = on_profile
+        self.stop = Event()
+        self.lock = Lock()
+        self.source = None
+        self.thread = Thread(target=self.run, name='D435i depth', daemon=True)
+        self.thread.start()
+
+    def run(self) -> None:
+        widths = (848, 640)
+        last_error = None
+        while not self.stop.is_set():
+            try:
+                with open_depth(self.rs, self.device, self.fps, widths) as (profile, queue):
+                    if self.stop.is_set():
+                        return
+                    width = profile.width()
+                    self.on_profile(width)
+                    modified = self.color.intrinsics.model == self.rs.distortion.modified_brown_conrady
+                    projector = depth_space_projector(self.rs, self.color, profile) if modified else None
+                    matcher = DepthMatcher(self.rs, queue, self.fps)
+                    with self.lock:
+                        self.source = (matcher, projector)
+                    try:
+                        while not self.stop.wait(.25):
+                            if monotonic() - matcher.last_seen > STREAM_TIMEOUT:
+                                if len(widths) > 1:
+                                    widths = tuple(candidate for candidate in (640, 848) if candidate != width) + (width,)
+                                raise CameraError('D435i depth frames stopped.')
+                            if matcher.last_number is not None:
+                                # Once the stream works, retain the same profile across retries.
+                                widths = (width,)
+                                last_error = None
+                    finally:
+                        with self.lock:
+                            self.source = None
+            except RuntimeError as error:
+                if not self.stop.is_set() and str(error) != last_error:
+                    last_error = str(error)
+                    logging.warning('%s Retrying depth while RGB tracking continues.', error)
+            self.stop.wait(DEPTH_RETRY_DELAY)
+
+    def match(self, color: CameraSample):
+        with self.lock:
+            source = self.source
+        if source is None:
+            return None, None
+        matcher, projector = source
+        return matcher.match(color), projector
+
+    def close(self) -> None:
+        self.stop.set()
+        self.thread.join()
+
+
+def depth_aligner(rs):
+    queue = rs.frame_queue(1)
+    pending_depth = []
+
+    def combine(color, source):
+        source.frame_ready(source.allocate_composite_frame([color, pending_depth[0]]))
+
+    combiner = rs.processing_block(combine)
+    combiner.start(queue)
+    align = rs.align(rs.stream.color)
+
+    def aligned_depth(color, depth):
+        pending_depth.append(depth)
         try:
-            profile = pipeline.start(config)
-        except RuntimeError as error:
-            logging.warning('D435i %dx480 depth stream could not start: %s', width, error)
-            continue
-        return pipeline, profile, width
-    raise CameraError('Could not open the selected D435i image and depth streams. Check the camera connection or choose another frame rate.')
+            combiner.invoke(color)
+        finally:
+            pending_depth.clear()
+        frames = queue.poll_for_frame()
+        return align.process(frames.as_frameset()).get_depth_frame() if frames else None
+
+    return aligned_depth
+
+
+def depth_space_projector(rs, color, depth):
+    intrinsics = color.intrinsics
+    extrinsics = color.get_extrinsics_to(depth)
+    origin = extrinsics.translation
+
+    def deproject(pixel_x: float, pixel_y: float, depth_z: float) -> Vec3 | None:
+        # The SDK cannot deproject Modified Brown-Conrady RGB directly. Invert
+        # its forward projection, then solve the color ray at the measured
+        # depth-camera Z. Keep physical points in the original calibration
+        # coordinate space without warping the RGB image used for gestures.
+        x = (pixel_x - intrinsics.ppx) / intrinsics.fx
+        y = (pixel_y - intrinsics.ppy) / intrinsics.fy
+        for _ in range(8):
+            px, py = rs.rs2_project_point_to_pixel(intrinsics, [x, y, 1])
+            dx, dy = pixel_x - px, pixel_y - py
+            if max(abs(dx), abs(dy)) < 0.25:
+                endpoint = rs.rs2_transform_point_to_point(extrinsics, [x, y, 1])
+                ray = tuple(b - a for a, b in zip(origin, endpoint))
+                if ray[2] <= 0:
+                    return None
+                scale = (depth_z - origin[2]) / ray[2]
+                point = tuple(a + b * scale for a, b in zip(origin, ray))
+                return point if valid_point(point) else None
+            x += dx / intrinsics.fx
+            y += dy / intrinsics.fy
+        return None
+
+    return deproject
+
+
+class PreviewEncoder:
+    def __init__(self, cv2, publish) -> None:
+        self.cv2 = cv2
+        self.publish = publish
+        self.ready = Condition()
+        self.pending = None
+        self.closed = False
+        self.thread = Thread(target=self.run, name='D435i preview', daemon=True)
+        self.thread.start()
+
+    def submit(self, at: float, rgb, markers: tuple[PreviewMarker, ...]) -> None:
+        # Detach the preview from the SDK buffer so slow encoding cannot hold
+        # capture frames. Only the latest queued preview is retained.
+        copy = rgb.copy()
+        with self.ready:
+            self.pending = (at, copy, markers)
+            self.ready.notify()
+
+    def run(self) -> None:
+        while True:
+            with self.ready:
+                self.ready.wait_for(lambda: self.closed or self.pending is not None)
+                if self.closed:
+                    return
+                at, rgb, markers = self.pending
+                self.pending = None
+            try:
+                jpeg = encode_preview(self.cv2, rgb, markers)
+            except Exception:
+                logging.exception('D435i preview could not encode a frame')
+                continue
+            if jpeg is not None:
+                self.publish(at, jpeg)
+
+    def close(self) -> None:
+        with self.ready:
+            self.closed = True
+            self.pending = None
+            self.ready.notify()
+        self.thread.join(timeout=1)
 
 
 class CameraFeed:
@@ -269,6 +536,7 @@ class CameraFeed:
         self.model = model
         self.serial = serial
         self.lock = Lock()
+        self.changed = Condition(self.lock)
         self.stop = Event()
         self.wake = Event()
         self.last_contact = float('-inf')
@@ -284,6 +552,7 @@ class CameraFeed:
         self.active_options: CameraOptions | None = None
         self.revision = 0
         self.frame_times: deque[float] = deque(maxlen=60)
+        self.processing_times: deque[float] = deque(maxlen=60)
         self.processing_ms = 0.0
         self.thread = Thread(target=self.run, name='D435i capture', daemon=True)
         self.thread.start()
@@ -299,9 +568,11 @@ class CameraFeed:
             self.preview = None
             self.history.clear()
             self.frame_times.clear()
+            self.processing_times.clear()
             self.processing_ms = 0.0
             self.error = None
             self.last_contact = monotonic()
+            self.changed.notify_all()
         self.wake.set()
 
     def settings(self) -> dict:
@@ -309,16 +580,23 @@ class CameraFeed:
         with self.lock:
             now = monotonic()
             frame = self.frame
+            last = (frame.diagnostics or {}) if frame else {}
             span = self.frame_times[-1] - self.frame_times[0] if len(self.frame_times) > 1 else 0
+            processing = sorted(self.processing_times)
             diagnostics = {
                 'poseFps': (len(self.frame_times) - 1) / span if span > 0 and frame and now - frame.at < FRAME_MAX_AGE else 0,
                 'processingMs': self.processing_ms,
+                'processingP95Ms': processing[(len(processing) * 95 + 99) // 100 - 1] if processing else None,
                 'frameAgeMs': max(0, (now - frame.at) * 1000) if frame else None,
                 'estimatedHands': frame.detected_hands if frame else 0,
-                'depthHands': frame.diagnostics.get('depthHands', 0) if frame and frame.diagnostics else 0,
+                'depthHands': last.get('depthHands', 0),
                 'trackedHands': len(frame.hands) if frame else 0,
-                'model': frame.diagnostics.get('model', {}) if frame and frame.diagnostics else {},
+                'model': last.get('model', {}),
             }
+            for key in ('queueMs', 'inferenceMs', 'alignmentMs', 'fusionMs',
+                        'captureDroppedFrames', 'depthFrameAvailable', 'frameAgeSource'):
+                if key in last:
+                    diagnostics[key] = last[key]
             return {
                 **self.options.to_dict(),
                 'sources': [{'value': 'rgb', 'label': 'RGB'}],
@@ -334,9 +612,19 @@ class CameraFeed:
         self.wake.set()
         return snapshot
 
+    def wait_for_pose(self, session: str, after: int, timeout: float) -> None:
+        with self.changed:
+            self.changed.wait_for(
+                lambda: self.stop.is_set() or self.info is None or self.info.session != session
+                or self.frame is None or self.frame.sequence > after,
+                timeout=timeout,
+            )
+
     def close(self) -> None:
         self.stop.set()
         self.wake.set()
+        with self.changed:
+            self.changed.notify_all()
         self.thread.join(timeout=4)
 
     def request_preview(self, session: str, after: float, client: str = 'calibration') -> bytes | None:
@@ -373,9 +661,13 @@ class CameraFeed:
             self.next_preview_at = at + PREVIEW_INTERVAL
             return True
 
-    def publish_preview(self, at: float, jpeg: bytes) -> None:
+    def publish_preview(self, at: float, jpeg: bytes, session: str | None = None) -> None:
         with self.lock:
-            if monotonic() < self.preview_until:
+            now = monotonic()
+            if session is not None and (self.info is None or self.info.session != session):
+                return
+            if (now < self.preview_until and now - at < PREVIEW_LEASE
+                    and (self.preview is None or at > self.preview.at)):
                 self.preview = Preview(at, jpeg)
 
     def wanted(self, revision: int | None = None) -> bool:
@@ -389,7 +681,9 @@ class CameraFeed:
                 return
             self.frame = frame
             self.frame_times.append(frame.at)
+            self.processing_times.append(frame.processing_ms)
             self.processing_ms += (frame.processing_ms - self.processing_ms) * 0.2
+            self.changed.notify_all()
             if frame.detected_hands > 1:
                 self.history.clear()
                 return
@@ -422,6 +716,7 @@ class CameraFeed:
                     self.active_options = None
                     self.frame = None
                     self.frame_times.clear()
+                    self.processing_times.clear()
                     self.processing_ms = 0.0
                     self.history.clear()
                     self.preview = None
@@ -429,6 +724,7 @@ class CameraFeed:
                     self.preview_until = 0.0
                     self.next_preview_at = 0.0
                     self.error = message
+                    self.changed.notify_all()
             if message is not None:
                 self.stop.wait(2)
 
@@ -466,57 +762,87 @@ class CameraFeed:
                 raise CameraError(str(error)) from error
             if not self.wanted(revision):
                 return
-            pipeline, profile, depth_width = open_streams(rs, context, serial, options)
-            resources.callback(pipeline.stop)
-            enable_depth_projector(rs, profile)
-            color_intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().intrinsics
-            # Modified Brown-Conrady color intrinsics cannot be deprojected.
-            to_depth = color_intrinsics.model == rs.distortion.modified_brown_conrady
-            align = rs.align(rs.stream.depth if to_depth else rs.stream.color)
-            alignment = 'depth' if to_depth else 'color'
+            device = devices[0]
+            color, color_queue = resources.enter_context(open_color(rs, device, options.fps))
+            alignment = 'depth' if color.intrinsics.model == rs.distortion.modified_brown_conrady else 'color'
+            align = depth_aligner(rs)
+            session = uuid4().hex
+
+            def profile_key(width):
+                return f'{serial}:{RGB_SIZE[0]}x{RGB_SIZE[1]}:{width}:{options.fps}:{alignment}'
+
             with self.lock:
                 if revision != self.revision:
                     return
-                profile_key = f'{serial}:{RGB_SIZE[0]}x{RGB_SIZE[1]}:{depth_width}:{options.fps}:{alignment}'
-                self.info = CameraInfo(profile_key, uuid4().hex)
+                self.info = CameraInfo(None, session)
                 self.active_options = options
                 self.error = None
 
-            self.track_frames(rs, np, estimator, pipeline, align, options, revision, cv2)
+            def set_depth_profile(width):
+                with self.lock:
+                    if self.info is not None and self.info.session == session:
+                        self.info = CameraInfo(profile_key(width), session)
 
-    def track_frames(self, rs, np, estimator, pipeline, align, options, revision, cv2=None) -> None:
+            depth = DepthStream(rs, device, color, options.fps, set_depth_profile)
+            resources.callback(depth.close)
+            preview = None
+            if cv2 is not None:
+                preview = PreviewEncoder(cv2, lambda at, jpeg: self.publish_preview(at, jpeg, session))
+                resources.callback(preview.close)
+            self.track_frames(rs, np, estimator, color_queue, depth, align, revision, preview)
+
+    def track_frames(self, rs, np, estimator, color_queue, depth_stream, align, revision, preview=None) -> None:
         tracker = HandTracker()
         sequence = 0
-        previous_pair = (-1, -1)
+        previous_number = None
         previous_timestamp = -1
-        last_pair_at = monotonic()
+        last_rgb_at = monotonic()
+        last_pose_at = float('-inf')
+        dropped = 0
         while self.wanted(revision):
-            found, frames = pipeline.try_wait_for_frames(250)
-            at = monotonic()
-            if at - last_pair_at > 2:
-                raise CameraError('D435i synchronized RGB and depth frames stopped. Check the USB connection.')
-            if not found:
+            found, frame = color_queue.try_wait_for_frame(100)
+            dequeued_at = monotonic()
+            if dequeued_at - last_rgb_at > STREAM_TIMEOUT:
+                raise CameraError('D435i RGB frames stopped. Check the USB connection.')
+            if not found or not frame:
                 continue
-            color = frames.get_color_frame()
-            depth = frames.get_depth_frame()
-            if not color or not depth:
+            color = CameraSample.read(rs, frame)
+            if color.number == previous_number:
                 continue
-            pair = (color.get_frame_number(), depth.get_frame_number())
-            if pair[0] == previous_pair[0] or pair[1] == previous_pair[1]:
+            if previous_number is not None:
+                dropped += max(0, color.number - previous_number - 1)
+            previous_number = color.number
+            last_rgb_at = dequeued_at
+            queue_ms = time() * 1000 - color.arrival if color.arrival is not None else None
+            if queue_ms is None or not isfinite(queue_ms) or abs(queue_ms) > 3_600_000:
+                # Unsupported clock origins cannot be compared with wall time.
+                queue_ms = None
+            elif queue_ms < -2 or queue_ms >= FRAME_MAX_AGE * 1000:
+                dropped += 1
                 continue
-            if align is not None:
-                aligned = align.process(frames)
-                color, depth = aligned.get_color_frame(), aligned.get_depth_frame()
-            if not color or not depth:
+            else:
+                queue_ms = max(0, queue_ms)
+            at = dequeued_at if queue_ms is None else dequeued_at - queue_ms / 1000
+            if at < last_pose_at:
+                dropped += 1
                 continue
-            previous_pair = pair
-            last_pair_at = at
+            last_pose_at = at
             timestamp = max(previous_timestamp + 1, int(at * 1000))
             previous_timestamp = timestamp
-            rgb = np.ascontiguousarray(color.get_data())
+            rgb = np.ascontiguousarray(frame.get_data())
+            before_inference = monotonic()
             detections = estimator.detect(rgb, timestamp)
+            after_inference = monotonic()
+            try:
+                paired_depth, project = depth_stream.match(color)
+                depth = align(frame, paired_depth) if paired_depth is not None and detections else None
+            except RuntimeError:
+                # The depth sensor may have disconnected or restarted since
+                # the frame was queued. Keep publishing the fresh RGB pose.
+                depth = paired_depth = project = None
+            after_alignment = monotonic()
             samples = [
-                fuse_hand(rs, np, hand.landmarks, [], hand.handedness, depth, hand.features)
+                fuse_hand(rs, np, hand.landmarks, [], hand.handedness, depth, hand.features, deproject=project)
                 for hand in detections
             ]
             if not self.wanted(revision):
@@ -530,14 +856,19 @@ class CameraFeed:
             diagnostics = {
                 'depthHands': sum(sample is not None and sample.pose is not None for sample in samples),
                 'model': dict(getattr(estimator, 'diagnostics', {})),
+                'queueMs': queue_ms,
+                'inferenceMs': (after_inference - before_inference) * 1000,
+                'alignmentMs': (after_alignment - after_inference) * 1000,
+                'fusionMs': (monotonic() - after_alignment) * 1000,
+                'captureDroppedFrames': dropped,
+                'depthFrameAvailable': paired_depth is not None,
+                'frameAgeSource': 'hostArrival' if queue_ms is not None else 'dequeue',
             }
             self.publish(Frame(
                 sequence, at, tracking, hands, calibration_pose, len(samples),
-                (monotonic() - at) * 1000, diagnostics,
+                (monotonic() - dequeued_at) * 1000, diagnostics,
             ), revision)
-            if cv2 is not None and self.preview_due(at):
+            if preview is not None and self.preview_due(at):
                 current_tracks = tuple(track for track in tracker.tracks if track.published and track.observed_at == at)
                 markers = preview_markers([hand.landmarks for hand in detections], samples, current_tracks)
-                jpeg = encode_preview(cv2, rgb, markers)
-                if jpeg is not None:
-                    self.publish_preview(at, jpeg)
+                preview.submit(at, rgb, markers)

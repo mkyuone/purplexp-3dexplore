@@ -6,6 +6,7 @@ import {
   Sphere, Spherical, SRGBColorSpace, Vector2, Vector3, WebGLRenderer, type MeshPhysicalMaterialParameters, type WebGLRenderTarget,
 } from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { acceleratedRaycast, MeshBVH } from 'three-mesh-bvh';
 import type { CadAssembly, CadMesh, CadOccurrence } from './cad';
 import type { ObjectPose } from './gestures';
 import { makeHeadFloorGrid } from './head-floor-grid';
@@ -70,6 +71,9 @@ const HEAD_SCREEN_FIT_RATIO = 0.58;
 const HEAD_RELEASE_MS = 160;
 const HEAD_RENDER_DELTA_SQ = 0.0025 ** 2;
 const HEAD_GRID_FLOOR_GAP = 0.012;
+const PICK_TREE_MIN_TRIANGLES = 256;
+const DRAG_SHADOW_INTERVAL_MS = 32;
+const DRAG_SHADOW_SETTLE_MS = 65;
 
 function headOffsetChanged({ target, applied }: HeadView) {
   if (target.x === 0 && target.y === 0) return applied.x !== 0 || applied.y !== 0;
@@ -88,6 +92,10 @@ function makeGeometry(mesh: CadMesh) {
   }
   geometry.computeBoundingBox();
   geometry.boundingSphere = geometry.boundingBox!.getBoundingSphere(new Sphere());
+  if (mesh.indices.length >= PICK_TREE_MIN_TRIANGLES * 3) {
+    // The same geometry can appear in several occurrences. Keep its render indices and groups intact.
+    geometry.boundsTree = new MeshBVH(geometry, { indirect: true });
+  }
   return geometry;
 }
 
@@ -205,6 +213,9 @@ export class CadScene {
   private selection: string | null = null;
   private hovered: string[] = [];
   private frame: number | null = null;
+  private onRenderSubmitted?: (submittedAt: number) => void;
+  private shadowRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  private lastShadowAt = -Infinity;
   private modelMatricesDirty = false;
   private fitOnResize = false;
   private contextLost = false;
@@ -216,6 +227,7 @@ export class CadScene {
     private readonly canvas: HTMLCanvasElement,
     private readonly onContextChange?: (status: SceneContextStatus) => void,
   ) {
+    this.raycaster.firstHitOnly = true;
     this.renderer = new WebGLRenderer({ canvas, antialias: true, alpha: true });
     this.renderer.toneMapping = NeutralToneMapping;
     this.renderer.toneMappingExposure = 0.96;
@@ -327,6 +339,7 @@ export class CadScene {
       });
       const materials = sourceColors.map((color) => makeMaterial(color, finishes));
       const mesh = new Mesh(geometry, materials.length > 1 ? materials : materials[0]);
+      if (geometry.boundsTree) mesh.raycast = acceleratedRaycast;
       mesh.userData.occurrenceId = node.id;
       mesh.castShadow = true;
       mesh.receiveShadow = true;
@@ -635,11 +648,19 @@ export class CadScene {
     const occurrence = this.model.occurrences.get(id);
     if (!occurrence) return;
     this.resetAnimation = null;
-    applyPose(occurrence.editable, this.toLocalPose(occurrence, pose));
-    this.geometryChanged();
+    const { editable } = occurrence;
+    const next = this.toLocalPose(occurrence, pose);
+    if (editable.position.equals(next.position) && editable.quaternion.equals(next.rotation)
+      && editable.scale.x === next.scale) return;
+    applyPose(editable, next);
+    this.geometryChanged(true);
   }
 
   commitGrip(id: string, startingPose: ObjectPose) {
+    if (this.shadowRefreshTimer !== undefined) {
+      this.refreshShadow();
+      this.requestRender();
+    }
     const occurrence = this.model.occurrences.get(id);
     if (!occurrence) return;
     const before = this.toLocalPose(occurrence, startingPose);
@@ -781,10 +802,28 @@ export class CadScene {
     if (this.undoStack.length > 100) this.undoStack.shift();
   }
 
-  private geometryChanged() {
-    this.modelMatricesDirty = true;
+  private refreshShadow() {
+    clearTimeout(this.shadowRefreshTimer);
+    this.shadowRefreshTimer = undefined;
     this.keyLight.shadow.needsUpdate = true;
+  }
+
+  private geometryChanged(duringDrag = false) {
+    this.modelMatricesDirty = true;
+    if (duringDrag) {
+      // During motion, only refresh in a draw that was already needed for a pose.
+      // If motion stops with the part held, refresh the final shadow after it settles.
+      clearTimeout(this.shadowRefreshTimer);
+      this.shadowRefreshTimer = setTimeout(() => {
+        this.refreshShadow();
+        this.requestRender();
+      }, DRAG_SHADOW_SETTLE_MS);
+    } else this.refreshShadow();
     this.requestRender(true);
+  }
+
+  requestRenderMeasurement(onSubmitted: (submittedAt: number) => void) {
+    if (this.frame !== null) this.onRenderSubmitted = onSubmitted;
   }
 
   private requestRender(picksChanged = false) {
@@ -797,9 +836,16 @@ export class CadScene {
       if (view) this.updateHeadCamera(time, view);
       const camera = view ? this.viewerCamera : this.camera;
       if (this.renderedCamera !== camera) this.picks.length = 0;
+      if (this.shadowRefreshTimer !== undefined
+        && (this.keyLight.shadow.needsUpdate || time - this.lastShadowAt >= DRAG_SHADOW_INTERVAL_MS)) this.refreshShadow();
+      const refreshingShadow = this.keyLight.shadow.needsUpdate;
       this.renderer.render(this.world, camera);
+      const onSubmitted = this.onRenderSubmitted;
+      this.onRenderSubmitted = undefined;
+      if (refreshingShadow) this.lastShadowAt = time;
       this.renderedCamera = camera;
       this.modelMatricesDirty = false;
+      onSubmitted?.(performance.now());
       if (this.resetAnimation || view?.release) this.requestRender();
       if (!view?.release && view?.onApplied) {
         const notify = view.onApplied;
@@ -821,6 +867,9 @@ export class CadScene {
     this.contextLost = true;
     if (this.frame !== null) cancelAnimationFrame(this.frame);
     this.frame = null;
+    this.onRenderSubmitted = undefined;
+    clearTimeout(this.shadowRefreshTimer);
+    this.shadowRefreshTimer = undefined;
     this.onContextChange?.('lost');
   };
 
@@ -841,6 +890,8 @@ export class CadScene {
     this.canvas.removeEventListener('webglcontextlost', this.handleContextLost);
     this.canvas.removeEventListener('webglcontextrestored', this.handleContextRestored);
     if (this.frame !== null) cancelAnimationFrame(this.frame);
+    this.onRenderSubmitted = undefined;
+    clearTimeout(this.shadowRefreshTimer);
     this.resetAnimation = null;
     this.undoStack.length = 0;
     this.headFloorGrid?.geometry.dispose();

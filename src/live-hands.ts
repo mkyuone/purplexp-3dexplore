@@ -10,6 +10,9 @@ export type HandCameraSettings = {
   diagnostics?: {
     poseFps?: number; processingMs?: number; frameAgeMs?: number;
     estimatedHands?: number; depthHands?: number; trackedHands?: number;
+    queueMs?: number; inferenceMs?: number; alignmentMs?: number; fusionMs?: number;
+    processingP95Ms?: number; captureDroppedFrames?: number; depthFrameAvailable?: boolean;
+    frameAgeSource?: 'hostArrival' | 'dequeue';
   };
 };
 
@@ -24,6 +27,7 @@ export type LiveHandStatus = {
 };
 
 const poseUrl = import.meta.env?.VITE_HAND_POSE_URL || 'http://127.0.0.1:4182/poses';
+const POSE_POLL_MS = 1000 / 60;
 const POSE_RETRY_WINDOW_MS = 500;
 
 function readCameraSettings(value: unknown): HandCameraSettings {
@@ -45,6 +49,11 @@ function readCameraSettings(value: unknown): HandCameraSettings {
     diagnostics: metrics && typeof metrics === 'object' ? {
       poseFps: finiteMetric(metrics.poseFps), processingMs: finiteMetric(metrics.processingMs), frameAgeMs: finiteMetric(metrics.frameAgeMs),
       estimatedHands: handCount(metrics.estimatedHands), depthHands: handCount(metrics.depthHands), trackedHands: handCount(metrics.trackedHands),
+      queueMs: finiteMetric(metrics.queueMs), inferenceMs: finiteMetric(metrics.inferenceMs),
+      alignmentMs: finiteMetric(metrics.alignmentMs), fusionMs: finiteMetric(metrics.fusionMs),
+      processingP95Ms: finiteMetric(metrics.processingP95Ms), captureDroppedFrames: handCount(metrics.captureDroppedFrames),
+      depthFrameAvailable: typeof metrics.depthFrameAvailable === 'boolean' ? metrics.depthFrameAvailable : undefined,
+      frameAgeSource: metrics.frameAgeSource === 'hostArrival' || metrics.frameAgeSource === 'dequeue' ? metrics.frameAgeSource : undefined,
     } : undefined,
   };
 }
@@ -141,13 +150,14 @@ function validHand(value: unknown): value is HandPose {
 
 export function connectLiveHands(options: {
   navigation: HandNavigation;
-  receive: (frame: PoseFrame) => void;
+  receive: (frame: PoseFrame, receivedAt: number) => void;
   reset: () => void;
   status: (status: LiveHandStatus) => void;
 }) {
   const session = new AbortController();
   let timer: ReturnType<typeof setTimeout>;
   let sourceId: string | undefined;
+  let waitForPose = false;
   let lastSequence = -1;
   let lastCapturedAt = -Infinity;
   let lastContactAt = -Infinity;
@@ -162,13 +172,17 @@ export function connectLiveHands(options: {
   }
 
   async function poll() {
-    let delay = 33;
+    let interval = POSE_POLL_MS;
     const startedAt = performance.now();
     try {
       const currentDisplay = handDisplayKey();
       const url = new URL(poseUrl, window.location.href);
       url.searchParams.set('display', currentDisplay);
       url.searchParams.set('mode', options.navigation);
+      if (waitForPose && sourceId && currentDisplay === display) {
+        url.searchParams.set('session', sourceId);
+        url.searchParams.set('after', String(lastSequence));
+      }
       const response = await fetch(url, {
         cache: 'no-store', signal: AbortSignal.any([session.signal, AbortSignal.timeout(sourceId === undefined ? 800 : 160)]),
       });
@@ -191,10 +205,10 @@ export function connectLiveHands(options: {
         if (sourceId !== undefined) options.reset();
         sourceId = undefined;
         setStatus(next);
-        delay = next.phase === 'calibration' ? 150 : 1000;
+        interval = next.phase === 'calibration' ? 150 : 1000;
         return;
       }
-      if (typeof value?.session !== 'string' || !Number.isSafeInteger(value.sequence)
+      if (typeof value?.session !== 'string' || !Number.isSafeInteger(value.sequence) || value.sequence < 0
         || !Number.isFinite(value.ageMs) || value.ageMs < 0
         || !['tracking', 'lost', 'ambiguous'].includes(value.tracking)
         || !Array.isArray(value.hands) || value.hands.length > 2 || !value.hands.every(validHand)) {
@@ -212,11 +226,15 @@ export function connectLiveHands(options: {
       setStatus(next);
       if (value.sequence > lastSequence) {
         lastSequence = value.sequence;
-        // Age is sampled on the bridge during the request. Keep request timing
-        // jitter from making a newer capture appear older than its predecessor.
-        const capturedAt = (startedAt + receivedAt) / 2 - value.ageMs;
+        waitForPose = value.waitForPose === true;
+        if (waitForPose) interval = 0;
+        // Remove the time waiting for a pose on the bridge before estimating
+        // return transit. Older bridges respond immediately and omit bridgeMs.
+        const bridgeMs = Number.isFinite(value.bridgeMs) && value.bridgeMs >= 0 ? value.bridgeMs : 0;
+        const transitMs = Math.max(0, receivedAt - startedAt - bridgeMs) / 2;
+        const capturedAt = receivedAt - transitMs - value.ageMs;
         lastCapturedAt = Math.max(lastCapturedAt, capturedAt);
-        options.receive({ sequence: value.sequence, capturedAt: lastCapturedAt, tracking: value.tracking, hands: value.hands });
+        options.receive({ sequence: value.sequence, capturedAt: lastCapturedAt, tracking: value.tracking, hands: value.hands }, receivedAt);
       }
     } catch {
       if (session.signal.aborted) return;
@@ -226,9 +244,9 @@ export function connectLiveHands(options: {
       if (sourceId !== undefined) options.reset();
       sourceId = undefined;
       setStatus({ phase: 'offline', display });
-      delay = 1500;
+      interval = 1500;
     } finally {
-      if (!session.signal.aborted) timer = setTimeout(poll, delay);
+      if (!session.signal.aborted) timer = setTimeout(poll, Math.max(0, startedAt + interval - performance.now()));
     }
   }
 

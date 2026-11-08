@@ -1,5 +1,5 @@
 import { Box, Expand, Hand, LoaderCircle, Move, Orbit, Settings, ThumbsUp, TriangleAlert, Upload, X } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent } from 'react';
+import { memo, useEffect, useImperativeHandle, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type Ref } from 'react';
 import { importStep, readStepFile, type CadAssembly } from './cad';
 import { loadBundledAssembly, ultravioletFinishes } from './bundled-assembly';
 import { CadScene, type SurfaceFinishes } from './scene';
@@ -11,6 +11,7 @@ import { attachVisitorControls } from './visitor-controls';
 import { CalibrationPanel } from './calibration-panel';
 import { CameraPreview } from './camera-preview';
 import { HeadPerspectivePanel, useHeadPerspective } from './head-perspective-panel';
+import { HandPerformance } from './hand-performance';
 
 const startingModelName = 'Ultraviolet Full Car.step';
 const query = new URLSearchParams(window.location.search);
@@ -30,8 +31,28 @@ type Runtime = {
   nativeUntil: number;
 };
 type Exhibit = { name: string; roots: CadAssembly['roots']; revision: number };
+type GestureFeedback = Pick<GestureState, 'status' | 'target' | 'held' | 'hovered' | 'resetProgress'>;
+type CursorControls = { update: (state: GestureState) => void };
 
-function visitorCue(state: GestureState | null, simulation: boolean) {
+const HandCursors = memo(function HandCursors({ visible, controls }: { visible: boolean; controls: Ref<CursorControls> }) {
+  const [state, setState] = useState<GestureState | null>(null);
+  useImperativeHandle(controls, () => ({ update: setState }), []);
+  if (!visible) return null;
+  return <div className="hands-layer" aria-hidden="true">
+    {state?.hands.map(hand => {
+      const active = state.activeHands.includes(hand.id);
+      const movingView = active && hand.fist;
+      const scale = Math.max(0.65, Math.min(1.45, 1 + hand.depth));
+      return <div key={hand.id}
+        className={`hand-cursor${hand.id === 'right' ? ' second' : ''}${active && hand.pinched ? ' is-pinched' : ''}${movingView ? ' is-view-grip' : ''}`}
+        style={{ transform: `translate3d(${hand.x * 100}cqw, ${hand.y * 100}cqh, 0) translate(-50%, -50%) scale(${scale})` }}>
+        {movingView ? (state.status === 'both' ? <Move size={25} /> : <Orbit size={25} />) : <Hand size={25} />}
+      </div>;
+    })}
+  </div>;
+});
+
+function visitorCue(state: GestureFeedback | null, simulation: boolean) {
   if (state?.status === 'lost') return simulation
     ? 'Move your hands back into view and start with an open hand.'
     : 'Bring your hands back into view.';
@@ -40,12 +61,13 @@ function visitorCue(state: GestureState | null, simulation: boolean) {
   return 'Pinch a part to move it. Make a fist to look around.';
 }
 
-function CameraSettings({ navigation }: { navigation: HandNavigation }) {
+function CameraSettings({ navigation, performance }: { navigation: HandNavigation; performance: HandPerformance }) {
   const session = useRef<AbortController | null>(null);
   const requestVersion = useRef(0);
   const posting = useRef(false);
   const dirty = useRef(false);
   const [settings, setSettings] = useState<HandCameraSettings | null>(null);
+  const [browser, setBrowser] = useState(() => performance.read());
   const [activeFps, setActiveFps] = useState<number | null>(null);
   const [draftFps, setDraftFps] = useState<number | null>(null);
   const [sending, setSending] = useState(false);
@@ -65,6 +87,7 @@ function CameraSettings({ navigation }: { navigation: HandNavigation }) {
     session.current = controller;
     let timer: ReturnType<typeof setTimeout>;
     async function poll() {
+      setBrowser(performance.read());
       const version = requestVersion.current;
       try {
         if (posting.current) return;
@@ -86,7 +109,7 @@ function CameraSettings({ navigation }: { navigation: HandNavigation }) {
       clearTimeout(timer);
       session.current = null;
     };
-  }, []);
+  }, [performance]);
 
   const busy = sending || settings?.applying === true;
   const validDraft = draftFps !== null && settings?.frameRates.includes(draftFps);
@@ -122,8 +145,9 @@ function CameraSettings({ navigation }: { navigation: HandNavigation }) {
 
   const metrics = settings?.diagnostics;
   const issue = applyError ?? settings?.error ?? pollError;
-  const rgbOnly = navigation === 'fuzzy' && metrics?.depthHands !== undefined
-    && (metrics.trackedHands ?? 0) > metrics.depthHands;
+  const depthUnavailable = metrics?.depthFrameAvailable === false;
+  const rgbOnly = navigation === 'fuzzy' && (depthUnavailable
+    || (metrics?.depthHands !== undefined && (metrics.trackedHands ?? 0) > metrics.depthHands));
   const waitingForDepth = (metrics?.estimatedHands ?? 0) > 0 && metrics?.depthHands === 0;
   return <div className="camera-testing">
     <fieldset disabled={busy || !settings}>
@@ -147,10 +171,17 @@ function CameraSettings({ navigation }: { navigation: HandNavigation }) {
       {!busy && metrics && [metrics.estimatedHands, metrics.depthHands, metrics.trackedHands].some(value => value !== undefined) && <div><dt>Hands</dt><dd>{metrics.estimatedHands ?? '—'} seen · {metrics.depthHands ?? '—'} depth · {metrics.trackedHands ?? '—'} tracked</dd></div>}
       {!busy && metrics?.poseFps !== undefined && <div><dt>Pose rate</dt><dd>{metrics.poseFps.toFixed(1)} fps</dd></div>}
       {!busy && metrics?.processingMs !== undefined && <div><dt>Processing</dt><dd>{metrics.processingMs.toFixed(1)} ms</dd></div>}
-      {!busy && metrics?.frameAgeMs !== undefined && <div><dt>Frame age</dt><dd>{Math.round(metrics.frameAgeMs)} ms</dd></div>}
+      {!busy && metrics?.processingP95Ms !== undefined && <div><dt>Processing p95</dt><dd>{metrics.processingP95Ms.toFixed(1)} ms</dd></div>}
+      {!busy && metrics?.inferenceMs !== undefined && <div><dt>Bridge stages</dt><dd>{metrics.inferenceMs.toFixed(1)} ms inference · {metrics.alignmentMs?.toFixed(1) ?? '—'} ms align · {metrics.fusionMs?.toFixed(1) ?? '—'} ms fusion</dd></div>}
+      {!busy && metrics?.queueMs !== undefined && <div><dt>Capture queue</dt><dd>{metrics.queueMs.toFixed(1)} ms</dd></div>}
+      {!busy && metrics?.frameAgeMs !== undefined && <div><dt>Pose age</dt><dd>{Math.round(metrics.frameAgeMs)} ms at bridge{metrics.frameAgeSource ? ` from ${metrics.frameAgeSource === 'hostArrival' ? 'host arrival' : 'SDK dequeue'}` : ''}</dd></div>}
+      {!busy && metrics?.captureDroppedFrames !== undefined && <div><dt>Capture skipped</dt><dd>{metrics.captureDroppedFrames} this session</dd></div>}
+      {!busy && browser.deliveryFps !== undefined && <div><dt>Browser rate</dt><dd>{browser.deliveryFps.toFixed(1)} fps · {browser.skipped ?? 0} skipped in recent samples</dd></div>}
+      {!busy && browser.receiptToSubmitMs !== undefined && <div><dt>Last interaction</dt><dd>{browser.receiptToSubmitMs.toFixed(1)} ms from receipt · {browser.poseToSubmitMs?.toFixed(1)} ms from pose to render submission (p95)</dd></div>}
     </dl>}
-    {!busy && (rgbOnly || waitingForDepth) && <p className="camera-option-note">
-      {rgbOnly ? 'RGB tracking active. Depth movement is paused.' : 'Hand seen, waiting for palm depth.'}
+    {!busy && (rgbOnly || waitingForDepth || depthUnavailable) && <p className="camera-option-note">
+      {rgbOnly ? 'RGB tracking active. Depth movement is paused.'
+        : depthUnavailable ? 'Calibrated navigation is waiting for depth.' : 'Hand seen, waiting for palm depth.'}
     </p>}
   </div>;
 }
@@ -162,6 +193,8 @@ export function App() {
   const setupClose = useRef<HTMLButtonElement>(null);
   const picker = useRef<HTMLInputElement>(null);
   const runtime = useRef<Runtime | null>(null);
+  const cursorControls = useRef<CursorControls>(null);
+  const [handPerformance] = useState(() => new HandPerformance());
   const importAbort = useRef<AbortController | null>(null);
   const calibrationDisplay = useRef<string | null>(null);
   const modelRevision = useRef(0);
@@ -188,7 +221,7 @@ export function App() {
   const [calibrationSaved, setCalibrationSaved] = useState(false);
   const [hasExplored, setHasExplored] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
-  const [pose, setPose] = useState<GestureState | null>(null);
+  const [pose, setPose] = useState<GestureFeedback | null>(null);
   const [, setRevision] = useState(0);
   const headPerspective = useHeadPerspective(runtime, setupOpen);
   const calibrating = calibrationProgress !== null;
@@ -263,7 +296,11 @@ export function App() {
       runtime.current?.simulator?.setJoinTarget(state.join);
       scene.setHeadGripHeld(state.held !== null);
       setSelected(scene.getSelected());
-      setPose(state);
+      cursorControls.current?.update(state);
+      const { status, target, held, hovered, resetProgress } = state;
+      setPose(previous => previous?.status === status && previous.target === target && previous.held === held
+        && previous.hovered === hovered && previous.resetProgress === resetProgress
+        ? previous : { status, target, held, hovered, resetProgress });
       if (state.target) setHasExplored(true);
     }, {
       joinAnywhere: true,
@@ -317,19 +354,34 @@ export function App() {
     const active = runtime.current;
     if (simulationMode || !liveEnabled || !active) return;
     setLiveStatus({ phase: 'connecting' });
+    let latestReceipt: number | undefined;
     const disconnect = connectLiveHands({
       navigation,
-      receive: frame => {
-        if (!active.setupOpen && !active.calibrating && !active.contextLost && active.hasModel && !importAbort.current && performance.now() >= active.nativeUntil) active.gestures.receive(frame);
+      receive: (frame, receivedAt) => {
+        if (operatorMode) {
+          latestReceipt = receivedAt;
+          handPerformance.receive(frame.sequence, receivedAt);
+        }
+        if (active.setupOpen || active.calibrating || active.contextLost || !active.hasModel || importAbort.current || receivedAt < active.nativeUntil) return;
+        active.gestures.receive(frame);
+        if (operatorMode) active.scene.requestRenderMeasurement(submittedAt => {
+          if (latestReceipt === receivedAt) handPerformance.submitted(frame, receivedAt, submittedAt);
+        });
       },
-      reset: () => active.gestures.resetStream(),
+      reset: () => {
+        latestReceipt = undefined;
+        handPerformance.reset();
+        active.gestures.resetStream();
+      },
       status: setLiveStatus,
     });
     return () => {
       disconnect();
+      latestReceipt = undefined;
+      handPerformance.reset();
       if (runtime.current === active) active.gestures.cancel();
     };
-  }, [liveEnabled, navigation]);
+  }, [handPerformance, liveEnabled, navigation]);
 
   function receiveFile(file?: File) {
     if (!file) return;
@@ -511,17 +563,7 @@ export function App() {
           <button type="button" className="button" onClick={() => void loadStartingModel()}>Load Ultraviolet</button>
         </div>}
       </div>}
-      {showPose && <div className="hands-layer" aria-hidden="true">
-        {pose?.hands.map(hand => {
-          const active = pose.activeHands.includes(hand.id);
-          const movingView = active && hand.fist;
-          return <div key={hand.id}
-            className={`hand-cursor${hand.id === 'right' ? ' second' : ''}${active && hand.pinched ? ' is-pinched' : ''}${movingView ? ' is-view-grip' : ''}`}
-            style={{ left: `${hand.x * 100}%`, top: `${hand.y * 100}%`, transform: `translate(-50%, -50%) scale(${Math.max(0.65, Math.min(1.45, 1 + hand.depth))})` }}>
-            {movingView ? (dualViewGrip ? <Move size={25} /> : <Orbit size={25} />) : <Hand size={25} />}
-          </div>;
-        })}
-      </div>}
+      <HandCursors visible={showPose} controls={cursorControls} />
       {!setupOpen && !calibrating && (simulationMode || focusPart || pose?.target === 'view') && <footer className="exhibit-footer">
         {pose?.target === 'view'
           ? <div className="part-caption">{dualViewGrip ? <Move size={16} /> : <Orbit size={16} />}<span>{dualViewGrip ? 'Pan · Zoom' : 'Exhibit view'}</span></div>
@@ -546,7 +588,7 @@ export function App() {
           </div>
           <p className="setup-hint" role="status">{!liveEnabled ? 'Touch, mouse, and keyboard controls are ready.'
             : liveStatus.phase === 'ready' ? navigation === 'fuzzy' ? 'Fuzzy navigation is ready. Close Setup and move an open hand into view.' : 'Connected. Close Setup to use hand gestures.'
-            : liveStatus.phase === 'calibration' ? 'This display needs a reach profile. Choose fuzzy navigation or calibrate below.'
+            : liveStatus.phase === 'calibration' ? liveStatus.message ?? 'This display needs a reach profile. Choose fuzzy navigation or calibrate below.'
             : liveStatus.phase === 'connecting' ? 'Connecting to the local hand camera.' : liveStatus.message ?? 'Camera unavailable. Start the local camera service and check the USB connection. Retrying automatically.'}</p>
           {liveEnabled && <label className="navigation-choice">Hand navigation
             <select value={navigation} onChange={event => changeNavigation(event.target.value as HandNavigation)}>
@@ -560,7 +602,7 @@ export function App() {
           </label>}
           {liveEnabled && (liveStatus.phase === 'ready' || liveStatus.phase === 'calibration') && <button className="button camera-calibrate" type="button" disabled={calibrationBusy || !!graphicsIssue} onClick={() => void changeCalibration('begin')}>{navigation === 'fuzzy' ? 'Optional reach calibration' : 'Calibrate reach'}</button>}
           {calibrationError && <p className="setup-hint" role="alert">{calibrationError}</p>}
-          <CameraSettings navigation={navigation} />
+          <CameraSettings navigation={navigation} performance={handPerformance} />
         </section>}
         <section className="panel file-panel" aria-label="STEP import">
           <h2>Model</h2>

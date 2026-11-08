@@ -43,7 +43,7 @@ Optional calibration is saved per camera and display. If the camera or display m
 
 **Operator setup → Hand camera → Camera settings** offers 30 or 60 fps capture. Select **Apply and restart** to activate a choice. The camera uses RGB with the depth projector enabled and MediaPipe Full for hand tracking. Capture settings persist on the local camera service.
 
-Start at 30 fps. The capture setting is the sensor rate. **Pose rate** shows how many updates the tracker actually processes. When comparing 60 fps, check whether two-hand gestures feel steadier and whether **Frame age** goes down.
+Start at 30 fps. The capture setting is the sensor rate, **Pose rate** counts tracker output, and **Browser rate** counts delivered updates. When comparing 60 fps, check pose age and skipped frames as well as how the controls feel. Move a part or the view before reopening Setup to collect render-submission timings. Those timings end when the browser submits the draw, before it reaches the display.
 
 ## Try head-coupled perspective
 

@@ -8,6 +8,8 @@ const settings = {
   frameRates: [30, 60], diagnostics: {
     poseFps: 28.5, processingMs: 22.4, frameAgeMs: 8,
     estimatedHands: 2, depthHands: 1, trackedHands: 1,
+    queueMs: 2, inferenceMs: 19, alignmentMs: 2, fusionMs: 1,
+    processingP95Ms: 24, captureDroppedFrames: 2, depthFrameAvailable: true, frameAgeSource: 'hostArrival',
   },
 }
 
@@ -132,4 +134,34 @@ test('a sustained request failure marks a connected camera offline and resets it
   }))
   await offline.promise
   assert.equal(resets, initialResets + 1)
+})
+
+test('long polling requests the next sequence and excludes the bridge wait from pose age', { timeout: 1000 }, async t => {
+  withWindow(t)
+  const received = Promise.withResolvers<void>()
+  const requests: URL[] = []
+  const frames: PoseFrame[] = []
+  const session = '0123456789abcdef0123456789abcdef:fuzzy:1280x720@1:1920x1080:0,0'
+  let now = 100
+  t.mock.method(performance, 'now', () => now)
+  t.mock.method(globalThis, 'fetch', async (url: URL) => {
+    requests.push(url)
+    const bridgeMs = requests.length === 1 ? 0 : 32
+    now += bridgeMs + 2
+    return Response.json({ status: 'ready', waitForPose: true, bridgeMs, session,
+      sequence: requests.length, ageMs: 8, tracking: 'lost', hands: [] })
+  })
+  const disconnect = connectLiveHands({
+    navigation: 'fuzzy', reset: () => {}, status: () => {},
+    receive: frame => {
+      frames.push(frame)
+      if (frames.length === 2) received.resolve()
+    },
+  })
+  t.after(disconnect)
+  await received.promise
+  assert.equal(requests[0].searchParams.has('after'), false)
+  assert.equal(requests[1].searchParams.get('after'), '1')
+  assert.equal(requests[1].searchParams.get('session'), session)
+  assert.deepEqual(frames.map(frame => frame.capturedAt), [93, 127])
 })

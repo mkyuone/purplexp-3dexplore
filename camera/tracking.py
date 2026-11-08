@@ -37,6 +37,8 @@ OPTICAL_WORLD_CLEAR_OPEN_RATIO = 0.60
 GRIP_RELEASE_CONFIRM_SECONDS = 0.065
 PINCH_CLEAR_OPEN_GAP_M = 0.072
 PINCH_CLEAR_OPEN_RATIO = 0.76
+TRACK_STILL_SECONDS = 0.045
+TRACK_MOVING_SECONDS = 0.016
 
 
 @dataclass(frozen=True)
@@ -213,6 +215,12 @@ def blend_image(start: Vec2, end: Vec2, alpha: float) -> Vec2:
     return start[0] + (end[0] - start[0]) * alpha, start[1] + (end[1] - start[1]) * alpha
 
 
+def tracking_alpha(elapsed: float, travel: float, still: float, moving: float) -> float:
+    motion = min(1.0, max(0.0, (travel - still) / (moving - still)))
+    seconds = TRACK_STILL_SECONDS + (TRACK_MOVING_SECONDS - TRACK_STILL_SECONDS) * motion
+    return 1 - exp(-max(0.001, elapsed) / seconds)
+
+
 def match_cost(sample: Candidate, track: Track) -> float | None:
     side_changed = sample.side is not None and track.side is not None and sample.side != track.side
     if sample.pose is not None and track.palm is not None:
@@ -313,7 +321,6 @@ class HandTracker:
             previous = self.tracks[index] if index >= 0 else None
             resuming = previous is not None and previous.interrupted
             elapsed = at - previous.observed_at if previous is not None else 0
-            alpha = 1.0 if resuming else 1 - exp(-max(0.001, elapsed) / 0.045)
             previous_grip = previous.hand.grip if previous else 'open'
             grip = classify_grip(sample, previous_grip)
             features = sample.features
@@ -391,12 +398,17 @@ class HandTracker:
                 old = previous.hand
                 identifier = old.id
                 old_palm_anchor = old.grip == 'fist' or old.thumbs_up
-                if palm is not None and old.pose is not None:
-                    palm = blend(old.pose.palm, palm, alpha)
+                # Keep the usual smoothing when aiming or changing grip.
+                tracking_motion = old.grip == grip and grip != 'open'
+                if palm is not None and old.pose is not None and not resuming:
+                    travel = dist(old.pose.palm, palm) if tracking_motion else 0.0
+                    metric_alpha = tracking_alpha(elapsed, travel, still=0.010, moving=0.034)
+                    palm = blend(old.pose.palm, palm, metric_alpha)
                     if tip is not None and not palm_anchor and not old_palm_anchor and pointing and old.pointing:
-                        tip = blend(old.pose.tip, tip, alpha)
-                if image is not None and old.image is not None and palm_anchor == old_palm_anchor:
-                    image = blend_image(old.image, image, alpha)
+                        tip = blend(old.pose.tip, tip, metric_alpha)
+                if image is not None and old.image is not None and palm_anchor == old_palm_anchor and not resuming:
+                    travel = dist(old.image, image) if tracking_motion else 0.0
+                    image = blend_image(old.image, image, tracking_alpha(elapsed, travel, still=0.007, moving=0.025))
             else:
                 self.next_id += 1
                 identifier = f'hand-{self.next_id}'

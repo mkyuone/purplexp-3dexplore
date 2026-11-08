@@ -107,10 +107,11 @@ button svg { flex: none; }
 .reset-countdown progress::-webkit-progress-value { background: var(--violet); }
 .reset-countdown progress::-moz-progress-bar { background: var(--violet); }
 
-.hands-layer { z-index: 3; pointer-events: none; }
-.hand-cursor { position: absolute; transform: translate(-50%, -50%); }
+.hands-layer { z-index: 3; pointer-events: none; container-type: size; }
 .hand-cursor {
   --hand-color: #d6adff;
+  position: absolute;
+  inset: 0 auto auto 0;
   display: grid;
   place-items: center;
   width: 39px;
@@ -120,7 +121,6 @@ button svg { flex: none; }
   border-radius: 50%;
   background: #151025a8;
   box-shadow: 0 0 15px color-mix(in srgb, var(--hand-color) 25%, transparent);
-  transition: transform 100ms ease-out;
 }
 .hand-cursor.second { --hand-color: var(--mint); }
 .hand-cursor.is-view-grip:not(.second) { --hand-color: #a5d8ff; }
@@ -283,5 +283,4 @@ kbd { display: inline-block; padding: 2px 5px; background: #2c2339; border: 1px 
 @media (prefers-reduced-motion: reduce) {
   .message.loading svg { animation: none; }
   .camera-settings-spinner { animation: none; }
-  .hand-cursor { transition: none; }
 }

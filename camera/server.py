@@ -22,8 +22,10 @@ from options import CameraOptions, DEFAULT_SETTINGS, load_options, save_options
 from realsense import CameraFeed, CameraInfo, FRAME_MAX_AGE, Snapshot
 
 PORT = 4182
+POSE_WAIT_SECONDS = 0.09
 POSE_RECOVERY_TIMEOUT = 0.65
 WAITING_FOR_FRAMES = 'Waiting for fresh D435i frames. Check the camera connection if this persists.'
+WAITING_FOR_DEPTH = 'Waiting for the RealSense depth stream. Fuzzy navigation is available.'
 CALIBRATION_TIMEOUT = 120.0
 OPERATOR_PREVIEW_TIMEOUT = 6.0
 MAX_OPERATOR_PREVIEWS = 8
@@ -225,7 +227,9 @@ class CameraService:
             return None
         return attempt
 
-    def poses(self, display: str, mode: str = 'fuzzy') -> dict:
+    def poses(self, display: str, mode: str = 'fuzzy', *, session: str | None = None, after: int | None = None) -> dict:
+        if session is not None and after is not None:
+            self.feed.wait_for_pose(session, after, POSE_WAIT_SECONDS)
         with self.lock:
             snapshot = self.feed.snapshot()
             info, frame = snapshot.info, snapshot.frame
@@ -245,6 +249,8 @@ class CameraService:
             else:
                 if attempt := self.active_attempt(info, display):
                     return attempt_status(attempt, capture_readiness(snapshot, attempt))
+                if info.profile is None:
+                    return calibrating(message=WAITING_FOR_DEPTH)
                 calibration = self.profiles.records.get(f'{info.profile}|{display}')
                 if calibration is None:
                     return calibrating()
@@ -332,6 +338,8 @@ class CameraService:
                 return offline(message)
             info, frame = snapshot.info, snapshot.frame
             assert info is not None and frame is not None
+            if info.profile is None:
+                return offline(WAITING_FOR_DEPTH)
             key = f'{info.profile}|{display}'
             if action == 'cancel':
                 return (
@@ -433,12 +441,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(204)
 
     def do_GET(self) -> None:
+        started = monotonic()
         if not self.allowed():
             self.send_json(403, {'message': 'Only the local Explorer can access the camera bridge.'})
             return
         try:
             url = urlsplit(self.path)
-            query = parse_qs(url.query, max_num_fields=2, keep_blank_values=True)
+            query = parse_qs(url.query, max_num_fields=4 if url.path == '/poses' else 2, keep_blank_values=True)
         except ValueError:
             self.send_json(400, {'message': 'Invalid camera bridge request.'})
             return
@@ -464,7 +473,21 @@ class Handler(BaseHTTPRequestHandler):
             if len(modes) != 1 or modes[0] not in {'fuzzy', 'calibrated'}:
                 self.send_json(400, {'message': 'Choose fuzzy or calibrated hand navigation.'})
                 return
-            self.send_json(200, self.server.service.poses(display, modes[0]))
+            mode = modes[0]
+            sessions, cursors = query.get('session'), query.get('after')
+            session, after = None, None
+            if sessions is not None or cursors is not None:
+                suffix = f':{mode}:{display}'
+                if (not sessions or len(sessions) != 1 or not sessions[0].endswith(suffix)
+                        or not re.fullmatch(r'[0-9a-f]{32}', sessions[0][:-len(suffix)])
+                        or not cursors or len(cursors) != 1 or not re.fullmatch(r'[0-9]{1,16}', cursors[0])):
+                    self.send_json(400, {'message': 'A valid pose session and sequence are required.'})
+                    return
+                session, after = sessions[0][:-len(suffix)], int(cursors[0])
+            pose = self.server.service.poses(display, mode, session=session, after=after)
+            if pose['status'] == 'ready':
+                pose.update(waitForPose=True, bridgeMs=(monotonic() - started) * 1000)
+            self.send_json(200, pose)
 
     def do_POST(self) -> None:
         if not self.allowed(require_origin=True):

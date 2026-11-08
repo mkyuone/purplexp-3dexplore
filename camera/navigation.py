@@ -44,9 +44,11 @@ def depth_deadzone(previous: float, current: float) -> float:
     return previous + copysign(max(0.0, abs(change) - DEPTH_DEADZONE), change)
 
 
-def smoothing_alpha(distance: float, elapsed: float, still_seconds: float, move_seconds: float) -> float:
+def smoothing_alpha(distance: float, elapsed: float, still_seconds: float, move_seconds: float, held: bool) -> float:
     speed = distance / max(elapsed, 0.001)
-    motion = clamp((speed - 0.08) / 0.92, 0.0, 1.0)
+    # Both ranges keep the same response to small movements and noise.
+    fast_speed = 0.50 if held else 1.0
+    motion = clamp((speed - 0.08) / (fast_speed - 0.08), 0.0, 1.0)
     seconds = still_seconds + (move_seconds - still_seconds) * motion
     return 1 - exp(-elapsed / seconds)
 
@@ -113,7 +115,8 @@ class FuzzyMapper:
                     and previous.grip == target.grip and previous.thumbs_up == target.thumbs_up):
                 change = abs(depth_deadzone(previous.depth, target.depth) - previous.depth)
                 depth_change = max(depth_change, change)
-        depth_alpha = smoothing_alpha(depth_change, elapsed, DEPTH_STILL_SECONDS, DEPTH_MOVE_SECONDS)
+        depth_held = any(hand.grip != 'open' for hand in targets)
+        depth_alpha = smoothing_alpha(depth_change, elapsed, DEPTH_STILL_SECONDS, DEPTH_MOVE_SECONDS, depth_held)
 
         mapped = []
         for hand in targets:
@@ -123,7 +126,8 @@ class FuzzyMapper:
                 dx, dy = x - previous.x, y - previous.y
                 distance = hypot(dx, dy)
                 fraction = max(0.0, 1 - XY_DEADZONE / distance) if distance else 0.0
-                xy_alpha = smoothing_alpha(distance * fraction, elapsed, XY_STILL_SECONDS, XY_MOVE_SECONDS)
+                xy_alpha = smoothing_alpha(distance * fraction, elapsed, XY_STILL_SECONDS, XY_MOVE_SECONDS,
+                                           hand.grip != 'open')
                 x = x if x in (0.0, 1.0) else previous.x + dx * fraction * xy_alpha
                 y = y if y in (0.0, 1.0) else previous.y + dy * fraction * xy_alpha
                 if previous.depth_valid and hand.depth_valid:

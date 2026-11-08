@@ -43,9 +43,8 @@ class CameraSettingsTests(TestCase):
                     get_option=lambda option: value[0],
                     set_option=lambda option, selected: value.__setitem__(0, selected),
                 )
-                profile = SimpleNamespace(get_device=lambda: SimpleNamespace(first_depth_sensor=lambda: sensor))
                 rs = SimpleNamespace(option=SimpleNamespace(emitter_enabled='emitter'))
-                enable_depth_projector(rs, profile)
+                enable_depth_projector(rs, sensor)
                 self.assertEqual(value[0], 1)
 
     def test_settings_are_saved_and_invalid_old_records_fall_back(self):
