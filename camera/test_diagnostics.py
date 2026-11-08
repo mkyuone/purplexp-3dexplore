@@ -19,8 +19,11 @@ class DiagnosticFeed(StubFeed):
     def __init__(self):
         super().__init__()
         self.error = None
+        self.status_requests = 0
 
-    def snapshot(self):
+    def snapshot(self, *, watch_hand_diagnostics=False):
+        if watch_hand_diagnostics:
+            self.status_requests += 1
         return Snapshot(self.info, self.frame, (), self.error)
 
     def request_diagnostic_rgb(self):
@@ -69,9 +72,11 @@ class DiagnosticsTests(TestCase):
             self.assertEqual(request(service, 'GET', '/diagnostics/frame?stream=ir1', host='example.org:4182')[0], 403)
             self.assertEqual(request(service, 'GET', '/diagnostics/frame?stream=ir1&stream=ir2')[0], 400)
             self.assertEqual(feed.requests, [])
+            self.assertEqual(feed.status_requests, 0)
 
             status, headers, data = request(service, 'GET', '/diagnostics')
             self.assertEqual(status, 200)
+            self.assertEqual(feed.status_requests, 1)
             self.assertIn(b'Cache-Control: no-store', headers)
             self.assertEqual(loads(data), {
                 'status': 'ready', 'hands': [{'side': 'Left', 'grip': 'pinch', 'depthMm': 423, 'gapMm': 11, 'confidence': .91}],
@@ -89,6 +94,7 @@ class DiagnosticsTests(TestCase):
             clock.return_value = 10.3
             _, _, data = request(service, 'GET', '/diagnostics')
             self.assertEqual((loads(data)['status'], loads(data)['hands']), ('waiting', []))
+            self.assertEqual(feed.status_requests, 2)
             feed.error = 'Unplugged.'
             _, _, data = request(service, 'GET', '/diagnostics')
             self.assertEqual(loads(data), {'status': 'offline', 'message': 'Unplugged.', 'hands': []})

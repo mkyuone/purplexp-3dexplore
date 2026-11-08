@@ -1,12 +1,17 @@
 from collections import deque
 from contextlib import contextmanager
+from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
+from calibration import Pose
+from diagnostics import diagnostic_hands
+from estimators import EstimatedHand, HandSide
 from infrared_preview import InfraredPreview
-from realsense import CameraError, CameraFeed, CameraSample, DepthMatcher, DepthStream, PreviewEncoder, image_projector, open_depth
+from realsense import CameraError, CameraFeed, CameraInfo, CameraSample, DepthMatcher, DepthStream, PreviewEncoder, image_projector, open_depth
+from tracking import Candidate, GripFeatures
 
 
 def sample(number, timestamp, domain='camera', arrival=None):
@@ -52,7 +57,8 @@ class CaptureTests(TestCase):
         color = SimpleNamespace(try_wait_for_frame=receive)
         depth = SimpleNamespace(match=lambda _: (None, None))
         estimator = SimpleNamespace(detect=lambda image, _: detected.append(image) or [])
-        feed = SimpleNamespace(wanted=lambda _: len(published) < 2, publish=lambda frame, _: published.append(frame))
+        feed = SimpleNamespace(wanted=lambda _: len(published) < 2, publish=lambda frame, _: published.append(frame),
+                               hand_diagnostics_until=0.0)
         numpy = SimpleNamespace(ascontiguousarray=lambda data: data)
         with (
             patch('realsense.time', side_effect=lambda: base_wall + clock[0]),
@@ -64,6 +70,55 @@ class CaptureTests(TestCase):
         self.assertEqual(published[-1].diagnostics['captureDroppedFrames'], 3)
         self.assertAlmostEqual(published[-1].diagnostics['queueMs'], 3.0)
         self.assertAlmostEqual(published[-1].at, .117)
+
+    def test_hand_summaries_follow_diagnostics_viewers_and_keep_both_rgb_previews_working(self):
+        with patch('realsense.Thread'):
+            feed = CameraFeed(Path('unused-model'))
+        feed.info = CameraInfo('camera:profile', 'camera-session')
+        feed.publish = Mock(wraps=feed.publish)
+        actions = [(10.0, 'preview'), (10.1, 'watch'), (10.5, 'watch'), (10.8, 'pose'),
+                   (11.15, 'idle'), (11.2, 'overlay'), (11.23, 'idle'), (11.9, 'idle')]
+        feed.wanted = lambda _: feed.publish.call_count < len(actions)
+        inputs = iter(enumerate(actions, start=1))
+        clock = [10.0]
+
+        def receive(_):
+            number, (at, action) = next(inputs)
+            clock[0] = at
+            if action == 'preview':
+                feed.request_preview('camera-session', 0)
+            elif action == 'watch':
+                feed.snapshot(watch_hand_diagnostics=True)
+            elif action == 'pose':
+                feed.snapshot()
+            elif action == 'overlay':
+                feed.request_diagnostic_rgb()
+            return True, SimpleNamespace(number=number, get_data=lambda: number)
+
+        point = SimpleNamespace(x=.5, y=.5)
+        features = GripFeatures(.8, 0, 0)
+        estimate = EstimatedHand([point] * 21, features, (HandSide('Left', .99),))
+        candidate = Candidate(Pose((0, 0, .7), (0, .04, .7)), 'Left', features, .06, True, (.5, .5), (.5, .5))
+        estimator = SimpleNamespace(detect=lambda *_: [estimate])
+        color = SimpleNamespace(try_wait_for_frame=receive)
+        depth = SimpleNamespace(match=lambda _: (None, None))
+        numpy = SimpleNamespace(ascontiguousarray=lambda data: data)
+        preview, overlay = Mock(), Mock()
+        with (
+            patch('realsense.monotonic', side_effect=lambda: clock[0]),
+            patch('realsense.fuse_hand', return_value=candidate),
+            patch('realsense.diagnostic_hands', wraps=diagnostic_hands) as summaries,
+            patch.object(CameraSample, 'read', side_effect=lambda _, f: CameraSample(f, f.number, 0, 'camera', None)),
+        ):
+            feed.track_frames(None, numpy, estimator, color, depth, None, 0, preview, overlay)
+
+        frames = [call.args[0] for call in feed.publish.call_args_list]
+        self.assertTrue(all(frame.tracking == 'tracking' for frame in frames))
+        self.assertEqual(summaries.call_count, 4)
+        self.assertEqual([frame.at for frame in frames if frame.hand_diagnostics], [10.1, 10.5, 10.8, 11.2])
+        self.assertEqual(frames[1].hand_diagnostics[0].side, 'Left')
+        self.assertTrue(preview.submit.call_args_list[0].args[2][0].valid)
+        overlay.submit.assert_called_once_with(11.2, 6, (('Left', ((.5, .5),) * 21),))
 
     def test_failed_depth_start_retries_without_changing_the_rgb_session(self):
         attempts = []

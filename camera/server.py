@@ -417,7 +417,7 @@ class CameraService:
 
     def diagnostics(self) -> dict:
         with self.lock:
-            snapshot = self.feed.snapshot()
+            snapshot = self.feed.snapshot(watch_hand_diagnostics=True)
             if snapshot.error:
                 return {**offline(snapshot.error), 'hands': []}
             if message := camera_problem(snapshot):

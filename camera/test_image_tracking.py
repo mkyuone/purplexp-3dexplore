@@ -104,6 +104,7 @@ class FusedImageTests(TestCase):
         estimator = SimpleNamespace(detect=lambda image, at: next(detections))
         published = []
         feed = SimpleNamespace(wanted=lambda revision: len(published) < 5,
+                               hand_diagnostics_until=0.0,
                                thumb_depth_requested=lambda: False,
                                publish=lambda frame, revision: published.append(frame))
         def locate(rs, np, pixels, *args):

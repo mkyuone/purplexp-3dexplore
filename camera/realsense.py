@@ -654,6 +654,7 @@ class CameraFeed:
         self.preview_clients: dict[str, float] = {}
         self.preview_until = 0.0
         self.next_preview_at = 0.0
+        self.hand_diagnostics_until = 0.0
         self.diagnostic_rgb: Preview | None = None
         self.diagnostic_rgb_until = 0.0
         self.next_diagnostic_rgb_at = 0.0
@@ -720,9 +721,11 @@ class CameraFeed:
                 'error': self.error, 'diagnostics': diagnostics,
             }
 
-    def snapshot(self, *, include_gestures: bool = False) -> Snapshot:
+    def snapshot(self, *, include_gestures: bool = False, watch_hand_diagnostics: bool = False) -> Snapshot:
         with self.lock:
             self.last_contact = monotonic()
+            if watch_hand_diagnostics:
+                self.hand_diagnostics_until = self.last_contact + PREVIEW_LEASE
             gestures = tuple(self.gesture_history) if include_gestures else ()
             snapshot = Snapshot(self.info, self.frame, tuple(self.history), self.error, gestures)
         self.wake.set()
@@ -1032,8 +1035,14 @@ class CameraFeed:
             if not self.wanted(revision):
                 return
             tracking, hands = tracker.update(samples, at)
-            current_tracks = tuple(track for track in tracker.tracks if track.published and track.observed_at == at)
-            observed = diagnostic_hands(detections, samples, current_tracks)
+            after_tracking = monotonic()
+            preview_due = preview is not None and self.preview_due(at)
+            diagnostic_rgb_due = diagnostic_rgb is not None and self.diagnostic_rgb_due(at)
+            diagnostics_due = after_tracking < self.hand_diagnostics_until or diagnostic_rgb_due
+            current_tracks = ()
+            if preview_due or diagnostics_due:
+                current_tracks = tuple(track for track in tracker.tracks if track.published and track.observed_at == at)
+            observed = diagnostic_hands(detections, samples, current_tracks) if diagnostics_due else ()
             # Calibration observes a single depth-valid pointing hand even
             # when the live gesture classifier briefly reads a grip.
             sample = samples[0] if len(samples) == 1 else None
@@ -1045,7 +1054,7 @@ class CameraFeed:
                 'queueMs': queue_ms,
                 'inferenceMs': (after_inference - before_inference) * 1000,
                 'alignmentMs': (after_alignment - after_inference) * 1000,
-                'fusionMs': (monotonic() - after_alignment) * 1000,
+                'fusionMs': (after_tracking - after_alignment) * 1000,
                 'captureDroppedFrames': dropped,
                 'depthFrameAvailable': paired_depth is not None,
                 'frameAgeSource': 'hostArrival' if queue_ms is not None else 'dequeue',
@@ -1056,9 +1065,9 @@ class CameraFeed:
                 thumb_depth_m=sample.thumb_depth_m if sample is not None else None,
                 hand_diagnostics=observed,
             ), revision)
-            if preview is not None and self.preview_due(at):
+            if preview_due:
                 markers = preview_markers([hand.landmarks for hand in detections], samples, current_tracks,
                                           mark_thumb=measure_thumb_depth)
                 preview.submit(at, rgb, markers)
-            if diagnostic_rgb is not None and self.diagnostic_rgb_due(at):
+            if diagnostic_rgb_due:
                 diagnostic_rgb.submit(at, rgb, hand_overlay(detections, observed))
