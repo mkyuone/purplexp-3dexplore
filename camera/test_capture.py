@@ -3,9 +3,9 @@ from contextlib import contextmanager
 from threading import Event
 from types import SimpleNamespace
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from realsense import CameraError, CameraFeed, CameraSample, DepthMatcher, DepthStream, PreviewEncoder
+from realsense import CameraError, CameraFeed, CameraSample, DepthMatcher, DepthStream, PreviewEncoder, image_projector
 
 
 def sample(number, timestamp, domain='camera', arrival=None):
@@ -70,6 +70,7 @@ class CaptureTests(TestCase):
         sdk = SimpleNamespace(distortion=SimpleNamespace(modified_brown_conrady='modified'))
         color = SimpleNamespace(intrinsics=SimpleNamespace(model='none'))
         widths = []
+        projections = []
 
         @contextmanager
         def open_depth(rs, device, fps, widths):
@@ -78,8 +79,9 @@ class CaptureTests(TestCase):
                 raise CameraError('Depth unavailable')
             yield SimpleNamespace(width=lambda: 640), None
 
-        def activate(width):
+        def activate(width, project_image):
             widths.append(width)
+            projections.append(project_image)
             profile_received.set()
 
         with (
@@ -92,9 +94,30 @@ class CaptureTests(TestCase):
                 self.assertTrue(profile_received.wait(1))
                 self.assertEqual(attempts, [(848, 640), (848, 640)])
                 self.assertEqual(widths, [640])
+                self.assertTrue(callable(projections[0]))
             finally:
                 stream.close()
         self.assertFalse(stream.thread.is_alive())
+
+    def test_project_image_uses_normalized_color_pixels_at_the_supplied_depth(self):
+        intrinsics = SimpleNamespace(width=640, height=480)
+        deproject = Mock(return_value=(.15, -.1, .7))
+        sdk = SimpleNamespace(rs2_deproject_pixel_to_point=deproject)
+        project = image_projector(sdk, intrinsics)
+        self.assertEqual(project(.25, .75, .7), (.15, -.1, .7))
+        self.assertIsNone(project(float('nan'), .75, .7))
+        self.assertIsNone(project(.25, .75, .1))
+        deproject.assert_called_once_with(intrinsics, [160, 360], .7)
+
+    def test_project_image_preserves_depth_camera_space_for_modified_color_intrinsics(self):
+        calls = []
+        def depth_space(x, y, z):
+            calls.append((x, y, z))
+            return .11, -.04, z
+
+        project = image_projector(None, SimpleNamespace(width=640, height=480), depth_space)
+        self.assertEqual(project(.5, .25, .6), (.11, -.04, .6))
+        self.assertEqual(calls, [(320, 120, .6)])
 
     def test_preview_replaces_backlog_and_owns_its_frame(self):
         started, release, delivered = Event(), Event(), Event()

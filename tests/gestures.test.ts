@@ -48,8 +48,8 @@ function harness(t: { after: (cleanup: () => void) => void }, options: {
     sendAged: (age: number, ...hands: HandPose[]) => controller.receive({
       sequence: ++sequence, capturedAt: performance.now() - age, hands,
     }),
-    sendLost: (age = 0) => controller.receive({
-      sequence: ++sequence, capturedAt: performance.now() - age, hands: [], tracking: 'lost',
+    sendLost: (age = 0, tracking: 'lost' | 'ambiguous' = 'lost') => controller.receive({
+      sequence: ++sequence, capturedAt: performance.now() - age, hands: [], tracking,
     }),
     resetSequence: () => { sequence = 0 },
     replay: (hands: HandPose[], age: number, offset: number) => controller.receive({
@@ -530,7 +530,42 @@ test('a part stays frozen through loss, rebases on return, and releases on an op
   assert.equal(h.edits.length, 1)
 })
 
+test('a held pinch confirms depth again after a whole tracking interruption', async t => {
+  for (const tracking of ['lost', 'ambiguous'] as const) {
+    await t.test(tracking, subtest => {
+      let now = 1000
+      subtest.mock.method(performance, 'now', () => now)
+      const h = harness(subtest, { liveTracking: true })
+      const open = hand('first', 0.35, 0.4, false, 0.1)
+      const pinch = { ...open, pinched: true }
+      const send = (x: number, depth: number) => {
+        now += 33
+        h.send({ ...pinch, x, depth })
+      }
+      h.send(open)
+      send(0.35, 0.1)
+      send(0.4, 0.13)
+      const held = h.pose().position.clone()
+      now += 33
+      h.sendLost(0, tracking)
+
+      send(0.5, 0.48)
+      assertVector(h.pose().position, held)
+      send(0.52, 0.16)
+      assertVector(h.pose().position, held.clone().add(new Vector3(0.02, 0, 0)))
+      send(0.54, 0.17)
+      assertVector(h.pose().position, held.clone().add(new Vector3(0.04, 0, 0)))
+      send(0.56, 0.2)
+      assertVector(h.pose().position, held.clone().add(new Vector3(0.06, 0, 0.03)))
+      assert.equal(h.state().held, 'wheel')
+      assert.equal(h.edits.length, 0)
+    })
+  }
+})
+
 test('an RGB-only pinch moves in XY, rebases through depth changes and releases after tracking loss', t => {
+  let now = 1000
+  t.mock.method(performance, 'now', () => now)
   const h = harness(t, { liveTracking: true })
   const open = { ...hand('first', 0.3, 0.4), depthValid: false }
   const pinch = { ...open, pinched: true }
@@ -542,6 +577,10 @@ test('an RGB-only pinch moves in XY, rebases through depth changes and releases 
   assertVector(h.pose().position, expected(0.1, -0.1, 0))
 
   const measured = { ...pinch, x: 0.5, y: 0.5, depthValid: true, depth: 0.45 }
+  now += 33
+  h.send(measured)
+  assertVector(h.pose().position, expected(0.2, -0.1, 0))
+  now += 33
   h.send(measured)
   assertVector(h.pose().position, expected(0.2, -0.1, 0))
   h.send({ ...measured, depth: 0.6 })
@@ -568,6 +607,40 @@ test('an RGB-only pinch moves in XY, rebases through depth changes and releases 
   assert.equal(h.state().held, null)
   assert.equal(h.edits.length, 2)
   assertVector(h.pose().position, expected(0.35, -0.1, 0.15))
+})
+
+test('a held pinch keeps XY motion and rejects stale or inconsistent depth during recovery', t => {
+  let now = 1000
+  t.mock.method(performance, 'now', () => now)
+  const h = harness(t, { liveTracking: true })
+  const open = hand('first', 0.3, 0.4, false, 0.1)
+  const pinch = { ...open, pinched: true }
+  const send = (pose: HandPose, elapsed = 33) => {
+    now += elapsed
+    h.send(pose)
+  }
+  const expected = (x: number, z: number) => h.initial.position.clone().add(new Vector3(x, 0, z))
+  send(open)
+  send(pinch)
+  send({ ...pinch, x: 0.35, depth: 0.15 })
+  assertVector(h.pose().position, expected(0.05, 0.05))
+
+  send({ ...pinch, x: 0.4, depthValid: false, depth: 0 })
+  assertVector(h.pose().position, expected(0.1, 0.05))
+  const outlier = { ...pinch, x: 0.45, depth: 0.48 }
+  send(outlier)
+  send(outlier, 0)
+  assertVector(h.pose().position, expected(0.15, 0.05))
+  send({ ...pinch, x: 0.5, depth: 0.19 })
+  assertVector(h.pose().position, expected(0.2, 0.05))
+  send({ ...pinch, x: 0.55, depth: 0.21 }, 110)
+  assertVector(h.pose().position, expected(0.25, 0.05))
+  send({ ...pinch, x: 0.6, depth: 0.23 })
+  assertVector(h.pose().position, expected(0.3, 0.05))
+  send({ ...pinch, x: 0.65, depth: 0.26 })
+  assertVector(h.pose().position, expected(0.35, 0.08))
+  assert.equal(h.state().held, 'wheel')
+  assert.equal(h.edits.length, 0)
 })
 
 test('an RGB-only fist keeps orbiting while depth zoom pauses and rebases', t => {
@@ -602,6 +675,8 @@ test('an RGB-only fist keeps orbiting while depth zoom pauses and rebases', t =>
 })
 
 test('a mixed-depth pair scales and rotates in XY and restores spatial depth without a jump', t => {
+  let now = 1000
+  t.mock.method(performance, 'now', () => now)
   const h = harness(t, { joinAnywhere: true })
   const open = { ...hand('first', 0.3, 0.4), depthValid: false }
   const pinch = { ...open, pinched: true }
@@ -619,6 +694,10 @@ test('a mixed-depth pair scales and rotates in XY and restores spatial depth wit
   assert.ok(Math.abs(flat.scale - 4 / 3) < 1e-8)
 
   const measured = { ...left, depthValid: true, depth: -0.15 }
+  now += 33
+  h.send(measured, right)
+  assert.deepEqual(h.pose(), flat)
+  now += 33
   h.send(measured, right)
   assert.deepEqual(h.pose(), flat)
   h.send({ ...measured, depth: -0.05 }, { ...right, depth: 0.9 })
@@ -637,6 +716,47 @@ test('a mixed-depth pair scales and rotates in XY and restores spatial depth wit
   assert.deepEqual(h.pose(), rotated)
   h.send(top, { ...bottom, depthValid: true, depth: 0.8 })
   assert.deepEqual(h.pose(), rotated)
+})
+
+test('a close pair waits for stable depth and preserves rotation and scale through the handoff', t => {
+  let now = 1000
+  t.mock.method(performance, 'now', () => now)
+  const h = harness(t, { liveTracking: true, joinAnywhere: true })
+  const left = hand('first', 0.48, 0.4, true, 0.12)
+  const right = hand('second', 0.52, 0.4, true, 0.42)
+  const send = (first: HandPose, second: HandPose) => {
+    now += 33
+    h.send(first, second)
+  }
+  const still = (x: number, depth: number) => {
+    const { position, rotation, scale } = h.pose()
+    assertVector(position, h.initial.position.clone().add(new Vector3(x, 0, depth)))
+    assert.ok(rotation.angleTo(h.initial.rotation) < 1e-8)
+    assert.equal(scale, 1)
+    assert.equal(h.state().status, 'both')
+  }
+
+  send({ ...left, pinched: false }, { ...right, pinched: false })
+  send(left, right)
+  send({ ...left, x: 0.49, depthValid: false, depth: 0 }, { ...right, x: 0.53 })
+  still(0.01, 0)
+  send({ ...left, x: 0.50, depth: -0.45 }, { ...right, x: 0.54 })
+  still(0.02, 0)
+  send({ ...left, x: 0.51, depth: 0.38 }, { ...right, x: 0.55, depth: 0.43 })
+  still(0.03, 0)
+  send({ ...left, x: 0.52, depth: 0.39 }, { ...right, x: 0.56, depth: 0.44 })
+  still(0.04, 0)
+  send({ ...left, x: 0.53, depth: 0.4 }, { ...right, x: 0.57, depth: 0.45 })
+  still(0.05, 0.01)
+
+  // The spatial axis is usable again, but the transition frame still preserves orientation.
+  send({ ...left, x: 0.53, depth: 0.4 }, { ...right, x: 0.57, depth: 0.49 })
+  still(0.05, 0.03)
+  send({ ...left, x: 0.53, depth: 0.4 }, { ...right, x: 0.57, depth: 0.50 })
+  assertVector(h.pose().position, h.initial.position.clone().add(new Vector3(0.05, 0, 0.035)))
+  assert.ok(h.pose().rotation.angleTo(h.initial.rotation) > 0.01)
+  assert.ok(h.pose().scale > 1 && h.pose().scale < 1.15)
+  assert.equal(h.edits.length, 0)
 })
 
 test('a pair separated only in depth preserves scale when it switches to XY', t => {
@@ -1002,6 +1122,43 @@ test('live secondary pinches can join after separating and recover without resta
   assert.deepEqual(h.pose(), translated)
   h.send({ ...stillMoving, x: 0.5 })
   assertVector(h.pose().position, h.initial.position.clone().add(new Vector3(0.1, 0, 0)))
+  assert.equal(h.edits.length, 0)
+})
+
+test('a surviving pinch keeps depth and a returning second pinch confirms paired depth again', t => {
+  let now = 1000
+  t.mock.method(performance, 'now', () => now)
+  const h = harness(t, { liveTracking: true, joinAnywhere: true })
+  const first = hand('first', 0.35, 0.4, true, 0.1)
+  const second = hand('second', 0.65, 0.4, true, 0.1)
+  const send = (...hands: HandPose[]) => {
+    now += 33
+    h.send(...hands)
+  }
+  send({ ...first, pinched: false }, { ...second, pinched: false })
+  send(first, second)
+  assert.equal(h.state().status, 'both')
+  send({ ...first, x: 0.37, depth: 0.11 })
+  const surviving = { ...first, x: 0.39, depth: 0.14 }
+  send(surviving)
+  assert.equal(h.state().status, 'holding')
+  const held = h.pose()
+  assertVector(held.position, h.initial.position.clone().add(new Vector3(0.02, 0, 0.03)))
+  send(surviving, { ...second, x: 0.4, depth: 0.15 })
+  assert.equal(h.state().status, 'holding')
+
+  const returning = { ...second, x: 0.69, depth: 0.48 }
+  send(surviving, returning)
+  assert.equal(h.state().status, 'both')
+  assert.deepEqual(h.pose(), held)
+  send({ ...surviving, x: 0.4 }, { ...returning, x: 0.7, depth: 0.16 })
+  assertVector(h.pose().position, held.position.clone().add(new Vector3(0.01, 0, 0)))
+  send({ ...surviving, x: 0.41, depth: 0.15 }, { ...returning, x: 0.71, depth: 0.17 })
+  assertVector(h.pose().position, held.position.clone().add(new Vector3(0.02, 0, 0)))
+  assert.ok(h.pose().rotation.angleTo(held.rotation) < 1e-8)
+  assert.ok(Math.abs(h.pose().scale - held.scale) < 1e-8)
+  send({ ...surviving, x: 0.41, depth: 0.16 }, { ...returning, x: 0.71, depth: 0.18 })
+  assertVector(h.pose().position, held.position.clone().add(new Vector3(0.02, 0, 0.01)))
   assert.equal(h.edits.length, 0)
 })
 

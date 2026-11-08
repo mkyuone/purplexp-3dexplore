@@ -19,6 +19,8 @@ REACQUIRE_DISTANCE_M = 0.085
 MAX_IMAGE_TRAVEL = 0.10
 REACQUIRE_IMAGE_TRAVEL = 0.055
 MIN_IMAGE_PALM_SEPARATION = 0.06
+CLOSE_PAIR_IMAGE_SEPARATION = 0.025
+CLOSE_PAIR_IMAGE_TRAVEL = 0.025
 IMAGE_MATCH_PENALTY = 0.03
 PINCH_START_GAP_M = 0.024
 PINCH_END_GAP_M = 0.052
@@ -84,6 +86,8 @@ class Track:
     observed_at: float | None = None
     interrupted: bool = False
     image_palm: Vec2 | None = None
+    pinch_had_depth: bool = False
+    release_handoff: bool = False
 
 
 def grip_features(points: list[Vec3]) -> GripFeatures | None:
@@ -165,9 +169,16 @@ def uncertain_release(candidate: Candidate, previous: Grip) -> bool:
     return gap_closed != ratio_closed
 
 
-def supports_pinch_opening(features: GripFeatures, gap: float | None, optical_ratio: float | None) -> bool:
+def supports_pinch_opening(
+    features: GripFeatures, gap: float | None, optical_ratio: float | None, *, depth_handoff: bool = False,
+) -> bool:
     if features.folded == 4:
         return False
+    if depth_handoff:
+        # Losing the measured gap must not promote a previously conflicting
+        # single optical cue into a deliberate release.
+        return (optical_ratio is not None and optical_ratio >= OPTICAL_PINCH_OPEN_RATIO
+                and features.pinch_ratio > OPTICAL_WORLD_HOLD_RATIO and features.loosely_folded < 4)
     measured_open = gap is not None and gap >= PINCH_END_GAP_M
     model_open = features.pinch_ratio >= PINCH_END_RATIO
     if optical_ratio is None:
@@ -243,17 +254,19 @@ class HandTracker:
         self.tracks: tuple[Track, ...] = ()
         self.next_id = 0
         self.last_at: float | None = None
+        self.measured_pinch_pair: tuple[frozenset[str], float] | None = None
 
     def reset(self) -> None:
         self.tracks = ()
         self.last_at = None
+        self.measured_pinch_pair = None
 
     def pause(self, at: float, tracking: Tracking) -> tuple[Tracking, tuple[Hand, ...]]:
         # Keep identity privately, never publish an old pose as a current one.
         # Repeated missing frames cannot extend the last valid observation.
         if self.tracks and self.last_at is not None and 0 <= at - self.last_at < TRACK_TIMEOUT:
             self.tracks = tuple(
-                replace(track, interrupted=True) for track in self.tracks
+                replace(track, interrupted=True, release_since=None) for track in self.tracks
                 if track.observed_at is not None and 0 <= at - track.observed_at < TRACK_TIMEOUT
             )
         else:
@@ -282,6 +295,28 @@ class HandTracker:
             return None
         return assignment
 
+    def continues_measured_pair(self, samples: list[Candidate], assignment: tuple[int, ...], at: float) -> bool:
+        pair = self.measured_pinch_pair
+        if pair is None or at - pair[1] > PINCH_EVIDENCE_GRACE or any(index < 0 for index in assignment):
+            return False
+        first, second = samples
+        if (first.side is None or second.side is None or first.side == second.side
+                or not valid_image(first.image_palm) or not valid_image(second.image_palm)
+                or dist(first.image_palm, second.image_palm) < CLOSE_PAIR_IMAGE_SEPARATION):
+            return False
+        tracks = [self.tracks[index] for index in assignment]
+        if frozenset(track.hand.id for track in tracks) != pair[0] or not all(
+            track.hand.grip == 'pinch' and sample.side == track.side and valid_image(track.image_palm)
+            and dist(sample.image_palm, track.image_palm) <= CLOSE_PAIR_IMAGE_TRAVEL
+            for sample, track in zip(samples, tracks)
+        ):
+            return False
+        # Near overlap, two plausible labels must not authorize an apparent
+        # swap of the palms. Keep the normal ambiguity pause on a crossing.
+        previous_a, previous_b = (track.image_palm for track in tracks)
+        current_a, current_b = first.image_palm, second.image_palm
+        return sum((b - a) * (d - c) for a, b, c, d in zip(previous_a, previous_b, current_a, current_b)) > 0
+
     def update(self, samples: list[Candidate | None], at: float) -> tuple[Tracking, tuple[Hand, ...]]:
         if not isfinite(at) or (self.last_at is not None and at < self.last_at):
             self.reset()
@@ -296,15 +331,15 @@ class HandTracker:
         )]
         if not observed:
             return self.pause(at, 'ambiguous' if len(samples) > 1 else 'lost')
+        close_rgb_pair = False
         if len(observed) == 2:
             first, second = observed
             if first.pose is not None and second.pose is not None:
-                separated = dist(first.pose.palm, second.pose.palm) >= MIN_PALM_SEPARATION
+                if dist(first.pose.palm, second.pose.palm) < MIN_PALM_SEPARATION:
+                    return self.pause(at, 'ambiguous')
             else:
-                separated = (valid_image(first.image_palm) and valid_image(second.image_palm)
-                             and dist(first.image_palm, second.image_palm) >= MIN_IMAGE_PALM_SEPARATION)
-            if not separated:
-                return self.pause(at, 'ambiguous')
+                close_rgb_pair = not (valid_image(first.image_palm) and valid_image(second.image_palm)
+                                      and dist(first.image_palm, second.image_palm) >= MIN_IMAGE_PALM_SEPARATION)
         if self.last_at is not None and at - self.last_at >= TRACK_TIMEOUT:
             self.reset()
         self.tracks = tuple(
@@ -313,7 +348,7 @@ class HandTracker:
         )
 
         assignment = self.assignments(observed)
-        if assignment is None:
+        if assignment is None or (close_rgb_pair and not self.continues_measured_pair(observed, assignment, at)):
             return self.pause(at, 'ambiguous')
         next_tracks = []
         suspended_pinches = []
@@ -336,41 +371,66 @@ class HandTracker:
             pinch_since = None
             pinch_evidence_at = None
             release_since = None
+            pinch_had_depth = previous is not None and previous.pinch_had_depth
             recent_pinch = (
                 previous is not None and previous.pinch_evidence_at is not None
                 and at - previous.pinch_evidence_at <= PINCH_EVIDENCE_GRACE
             )
+            depth_handoff = previous_grip == 'pinch' and pinch_had_depth and gap is None and not thumbs_up
+            opening_supported = supports_pinch_opening(features, gap, optical_ratio, depth_handoff=depth_handoff)
             pinch_without_gap = (
                 previous_grip == 'pinch' and gap is None and optical_ratio is None
                 and features.folded < 4 and not thumbs_up
                 and (features.pinch_ratio < PINCH_END_RATIO if pointing
                      else optical_aim and features.pinch_ratio <= PINCH_START_RATIO)
             )
-            if pinch_without_gap:
+            if depth_handoff and grip == 'open' and not opening_supported:
+                # A short depth dropout can carry motion using only the new RGB
+                # aim. Weak evidence never extends the last confirmed pinch.
+                fresh_aim = (optical_aim and valid_image(sample.image_palm)) or (
+                    pointing and optical_ratio is None and features.pinch_ratio < PINCH_END_RATIO
+                )
+                if recent_pinch and fresh_aim and isfinite(features.pinch_ratio) and features.loosely_folded < 4:
+                    grip = 'pinch'
+                    pinch_evidence_at = previous.pinch_evidence_at
+            elif pinch_without_gap:
                 if not recent_pinch:
                     continue
                 grip = 'pinch'
                 pinch_evidence_at = previous.pinch_evidence_at
             elif grip == 'pinch':
                 pinch_evidence_at = at
+                pinch_had_depth = pinch_had_depth or gap is not None
                 if (previous is not None or optical_pinch) and previous_grip != 'pinch':
                     pinch_since = at
                     if previous and not resuming and elapsed <= PINCH_CONFIRM_MAX_INTERVAL and previous.pinch_since is not None:
                         pinch_since = previous.pinch_since
                     if at - pinch_since < PINCH_CONFIRM_SECONDS:
                         grip = 'open'
-            if previous is not None and grip == 'open' and uncertain_release(sample, previous_grip):
-                release_since = previous.release_since if not resuming and previous.release_since is not None else at
-                if at - release_since < GRIP_RELEASE_CONFIRM_SECONDS and (previous_grip != 'pinch' or recent_pinch):
-                    grip = previous_grip
-                    pinch_evidence_at = previous.pinch_evidence_at
+            confirm_handoff_release = depth_handoff and opening_supported and not clear_pinch_opening(sample)
+            if previous is not None and grip == 'open' and (
+                confirm_handoff_release or (not depth_handoff and uncertain_release(sample, previous_grip))
+            ):
+                release_since = previous.release_since if previous.release_handoff == confirm_handoff_release else None
+                if release_since is None:
+                    release_since = at
+                if at - release_since < GRIP_RELEASE_CONFIRM_SECONDS:
+                    if previous_grip != 'pinch' or recent_pinch:
+                        grip = previous_grip
+                        pinch_evidence_at = previous.pinch_evidence_at
+                    elif confirm_handoff_release:
+                        # Opening can finish confirming without exposing motion
+                        # from a hold whose evidence window has already expired.
+                        suspended_pinches.append(replace(previous, interrupted=True, pinch_evidence_at=None,
+                                                         release_since=release_since, release_handoff=True))
+                        continue
             released_pinch = previous is not None and previous_grip == 'pinch' and grip == 'open'
-            opening_supported = supports_pinch_opening(features, gap, optical_ratio)
             if released_pinch and not (thumbs_up or opening_supported):
                 # The hold grace can expire without evidence that the fingers
                 # opened. Keep the ID privately, requiring fresh grip evidence
                 # to resume. Never publish or refresh the old pose.
-                suspended_pinches.append(replace(previous, interrupted=True, pinch_evidence_at=None))
+                suspended_pinches.append(replace(previous, interrupted=True, pinch_evidence_at=None,
+                                                 release_since=None))
                 continue
             known_open = previous is not None and previous.published and previous_grip == 'open'
             clearly_open = grip == 'open' and (
@@ -421,16 +481,22 @@ class HandTracker:
             next_tracks.append(Track(
                 hand, measured.palm if measured is not None else None, side, pinch_since, pinch_evidence_at,
                 release_since, published, at, image_palm=sample.image_palm,
+                pinch_had_depth=grip == 'pinch' and pinch_had_depth,
+                release_handoff=confirm_handoff_release,
             ))
 
         hands = tuple(track.hand for track in sorted(next_tracks, key=lambda track: track.hand.id) if track.published)
+        if any(hand.grip != 'pinch' for hand in hands):
+            self.measured_pinch_pair = None
+        elif len(hands) == 2 and all(hand.pose is not None for hand in hands):
+            self.measured_pinch_pair = frozenset(hand.id for hand in hands), at
         next_tracks.extend(suspended_pinches)
         # A missing hand retains identity for a bounded return, but its old
         # position never appears in this frame or refreshes its observation time.
         if all(index >= 0 for index in assignment):
             observed_ids = {track.hand.id for track in next_tracks}
             next_tracks.extend(
-                replace(track, interrupted=True) for track in self.tracks
+                replace(track, interrupted=True, release_since=None) for track in self.tracks
                 if track.hand.id not in observed_ids
             )
         self.last_at = at

@@ -150,8 +150,60 @@ class CalibrationBridgeTests(TestCase):
             self.assertEqual(len(service.poses(display)['hands']), 1)
             self.assertEqual(service.poses(display, 'calibrated')['tracking'], 'lost')
             self.assertEqual(service.poses(display, 'calibrated')['hands'], [])
-            feed.replace_sample(-1, hands=(replace(hand, grip='fist'),))
+            feed.replace_sample(-1, hands=(replace(hand, grip='fist'),), sequence=7)
             self.assertTrue(service.poses(display, 'calibrated')['hands'][0]['fist'])
+
+    def test_calibrated_pinch_follows_rgb_through_depth_loss_and_releases_without_depth(self):
+        display = '1280x720@1'
+        feed = StubFeed()
+        points = []
+        for target in TARGETS:
+            feed.set_target(target)
+            points.append(feed.history[-1].calibration_pose)
+
+        def project_image(x, y, z):
+            return (0.5 - x) * 0.68 * z / 0.70, (y - 0.5) * 0.48 * z / 0.70, z
+
+        def snapshot():
+            return Snapshot(CameraInfo('camera:profile', 'session-1', project_image), feed.history[-1], feed.history, None)
+
+        with (TemporaryDirectory() as folder, patch('server.monotonic', lambda: feed.now),
+              patch.object(feed, 'snapshot', snapshot)):
+            profiles = Profiles(Path(folder) / 'profiles.json')
+            profiles.save(f'camera:profile|{display}', fit(points))
+            service = CameraService(feed, profiles)
+            measured = replace(feed.history[-1].hands[0], image=(0.5, 0.5), grip='pinch')
+            optical = replace(measured, pose=None, pointing=False, image=(0.56, 0.56))
+
+            def publish(hand, elapsed=0.033):
+                feed.now += elapsed
+                feed.replace_sample(-1, hands=(hand,), at=feed.now, sequence=feed.history[-1].sequence + 1)
+                return service.poses(display, 'calibrated')['hands']
+
+            self.assertEqual(publish(optical), [])  # No calibrated target for an unanchored pinch.
+            initial, = publish(measured)
+            held, = publish(optical)
+            self.assertEqual((held['id'], held['pinched'], held['depthValid']), (initial['id'], True, False))
+            self.assertAlmostEqual(held['x'], initial['x'] - 0.06)
+            self.assertAlmostEqual(held['y'], initial['y'] + 0.06)
+            self.assertEqual(service.poses(display, 'calibrated')['hands'], [held])
+
+            palm_only = replace(optical, pose=Pose(measured.pose.palm, measured.pose.palm), image=(0.60, 0.56))
+            moved, = publish(palm_only)
+            self.assertFalse(moved['depthValid'])
+            self.assertAlmostEqual(moved['x'], initial['x'] - 0.10)
+
+            deeper = Pose((0, 0, 0.80), (0, 0.04, 0.82))
+            restored, = publish(replace(measured, image=palm_only.image, pose=deeper))
+            self.assertTrue(restored['depthValid'])
+            self.assertAlmostEqual(restored['x'], moved['x'])
+            self.assertAlmostEqual(restored['y'], moved['y'])
+            released, = publish(replace(optical, grip='open'))
+            self.assertEqual((released['pinched'], released['depthValid']), (False, False))
+            self.assertEqual(publish(optical), [])
+
+            publish(measured)
+            self.assertEqual(publish(optical, elapsed=0.30), [])
 
     def test_fuzzy_navigation_is_ready_without_any_calibration(self):
         display = '1280x720@1'
@@ -200,7 +252,7 @@ class CalibrationBridgeTests(TestCase):
 
             feed.now += 0.04
             feed.set_target(TARGETS[-1])
-            feed.replace_sample(-1, hands=(measured,))
+            feed.replace_sample(-1, hands=(measured,), sequence=7)
             self.assertTrue(service.poses(display)['hands'][0]['depthValid'])
             hand, = service.poses(display, 'calibrated')['hands']
             self.assertEqual((hand['id'], hand['depthValid'], hand['fist']), (measured.id, True, True))

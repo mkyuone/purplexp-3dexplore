@@ -125,6 +125,45 @@ class TrackingRecoveryTests(TestCase):
         _, after_timeout = tracker.update(separated, 1.36)
         self.assertTrue({hand.id for hand in before}.isdisjoint(hand.id for hand in after_timeout))
 
+    def test_close_rgb_palms_keep_a_recent_measured_pair_with_distinct_steady_identities(self):
+        tracker = HandTracker()
+        left = replace(candidate(-.02, side='Left'), optical_pinch_ratio=.16)
+        right = replace(candidate(.02, side='Right'), pose=Pose((.02, 0, .85), (.02, .04, .87)),
+                        optical_pinch_ratio=.16)
+        _, before = tracker.update([left, right], 1.00)
+        self.assertEqual(len(before), 2)
+        rgb = [replace(hand, pose=None, pinch_gap=None, pointing=False) for hand in (left, right)]
+        for at, observations in ((1.04, [rgb[1], left]), (1.08, rgb[::-1])):
+            status, hands = tracker.update(observations, at)
+            self.assertEqual(status, 'tracking')
+            self.assertEqual([(hand.id, hand.grip) for hand in hands], [(hand.id, 'pinch') for hand in before])
+        self.assertEqual(tracker.update(rgb, 1.13), ('ambiguous', ()))
+        _, recovered = tracker.update([right, left], 1.16)
+        self.assertEqual([(hand.id, hand.grip) for hand in recovered], [(hand.id, 'pinch') for hand in before])
+
+    def test_close_rgb_pair_without_confirmed_ownership_remains_ambiguous(self):
+        left = replace(candidate(-.02, side='Left'), optical_pinch_ratio=.16)
+        right = replace(candidate(.02, side='Right'), pose=Pose((.02, 0, .85), (.02, .04, .87)),
+                        optical_pinch_ratio=.16)
+        rgb = [replace(hand, pose=None, pinch_gap=None, pointing=False) for hand in (left, right)]
+        self.assertEqual(HandTracker().update(rgb, 1.00), ('ambiguous', ()))
+        for unclear in (replace(rgb[1], side=None), replace(rgb[1], side='Left'),
+                        replace(rgb[1], image_palm=rgb[0].image_palm)):
+            with self.subTest(unclear=unclear):
+                tracker = HandTracker()
+                tracker.update([left, right], 1.00)
+                self.assertEqual(tracker.update([rgb[0], unclear], 1.04), ('ambiguous', ()))
+
+    def test_close_rgb_pair_pauses_when_labels_swap_at_nearby_palms(self):
+        tracker = HandTracker()
+        left = replace(candidate(-.007, side='Left'), optical_pinch_ratio=.16)
+        right = replace(candidate(.007, side='Right'), pose=Pose((.007, 0, .85), (.007, .04, .87)),
+                        optical_pinch_ratio=.16)
+        tracker.update([left, right], 1.00)
+        swapped = [replace(hand, pose=None, pinch_gap=None, pointing=False, side=side, image_palm=(x, .5))
+                   for hand, side, x in ((left, 'Right', .486), (right, 'Left', .514))]
+        self.assertEqual(tracker.update(swapped, 1.04), ('ambiguous', ()))
+
     def test_two_missing_frames_at_a_slower_camera_rate_can_recover_identity(self):
         tracker = HandTracker()
         _, (before,) = tracker.update([candidate()], 1.00)

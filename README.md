@@ -31,7 +31,7 @@ Open the [operator view](http://localhost:4180/?operator=1), then use **Setup â†
 
 A short tracking interruption pauses the held part or view. Returning the same grip resumes from that position. If you move out of frame, come back and hold a pinch over a part to grab it again. When one hand drops out during a two-hand grip, the hand still in view can keep moving the part.
 
-In fuzzy navigation, a visible hand can still orbit the view with a fist or drag a part across the screen with a pinch when palm depth drops out. Two fists can still pan and zoom from their positions on screen. Push/pull zoom and depth movement pause until depth returns, then resume from the current position. Calibrated navigation uses measured depth to map your hand to the display.
+In fuzzy navigation, a visible hand can still orbit the view with a fist or drag a part across the screen with a pinch when palm depth drops out. Two fists can still pan and zoom from their positions on screen. Push/pull zoom and depth movement pause until depth returns. An established part grip waits for two consistent depth samples before resuming depth movement from its current position. Calibrated navigation can also keep an established pinch moving across the screen using the last measured reach and the live RGB image.
 
 Hold a thumbs-up with either hand for 1.5 seconds to restore the assembly and its starting view. Curl your fingers and extend your thumb above your knuckles. A compact countdown appears during the hold. Lower the gesture before resetting again.
 

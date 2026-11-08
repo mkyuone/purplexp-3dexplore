@@ -1,6 +1,7 @@
 """Capture aligned D435i frames locally and expose only timestamped hand poses."""
 
 from collections import deque
+from collections.abc import Callable
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from math import dist, hypot, isfinite
@@ -32,6 +33,7 @@ FINGERTIP_DEPTH_DISAGREEMENT_M = 0.035
 FINGERTIP_GAP_CHECK_M = 0.032
 FINGERTIP_GAP_CHECK_OPTICAL_RATIO = 0.28
 PALM_LENGTH_SCALE = 0.65
+ImageProjector = Callable[[float, float, float], Vec3 | None]
 
 
 class CameraError(RuntimeError):
@@ -48,6 +50,7 @@ def enable_depth_projector(rs, sensor) -> None:
 class CameraInfo:
     profile: str | None
     session: str
+    project_image: ImageProjector | None = None
 
 
 @dataclass(frozen=True)
@@ -398,9 +401,9 @@ class DepthStream:
                     if self.stop.is_set():
                         return
                     width = profile.width()
-                    self.on_profile(width)
                     modified = self.color.intrinsics.model == self.rs.distortion.modified_brown_conrady
                     projector = depth_space_projector(self.rs, self.color, profile) if modified else None
+                    self.on_profile(width, image_projector(self.rs, self.color.intrinsics, projector))
                     matcher = DepthMatcher(self.rs, queue, self.fps)
                     with self.lock:
                         self.source = (matcher, projector)
@@ -487,6 +490,20 @@ def depth_space_projector(rs, color, depth):
         return None
 
     return deproject
+
+
+def image_projector(rs, intrinsics, depth_space=None) -> ImageProjector:
+    def project(x: float, y: float, z: float) -> Vec3 | None:
+        if not valid_image((x, y)) or not MIN_DEPTH_M <= z <= MAX_DEPTH_M:
+            return None
+        pixel_x, pixel_y = x * intrinsics.width, y * intrinsics.height
+        if depth_space is not None:
+            return depth_space(pixel_x, pixel_y, z)
+        a, b, c = rs.rs2_deproject_pixel_to_point(intrinsics, [pixel_x, pixel_y], z)
+        point = (float(a), float(b), float(c))
+        return point if valid_point(point) else None
+
+    return project
 
 
 class PreviewEncoder:
@@ -778,10 +795,11 @@ class CameraFeed:
                 self.active_options = options
                 self.error = None
 
-            def set_depth_profile(width):
+            def set_depth_profile(width: int, project_image: ImageProjector):
+                profile = profile_key(width)
                 with self.lock:
-                    if self.info is not None and self.info.session == session:
-                        self.info = CameraInfo(profile_key(width), session)
+                    if self.info is not None and self.info.session == session and self.info.profile != profile:
+                        self.info = CameraInfo(profile, session, project_image)
 
             depth = DepthStream(rs, device, color, options.fps, set_depth_profile)
             resources.callback(depth.close)

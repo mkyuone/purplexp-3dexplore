@@ -49,6 +49,79 @@ class PinchTrackingTests(TestCase):
         _, (released,) = tracker.update([opening], 1.16)
         self.assertEqual((released.id, released.grip), (held.id, 'open'))
 
+    def test_depth_dropout_keeps_fresh_aim_without_promoting_conflicting_cues_to_open(self):
+        for lose_palm in (False, True):
+            for optical_ratio, model_ratio in ((None, .55), (.46, .55), (.63, .48)):
+                with self.subTest(lose_palm=lose_palm, optical_ratio=optical_ratio):
+                    tracker, held, closed = self.pinch()
+                    measured = replace(closed, optical_pinch_ratio=optical_ratio, features=GripFeatures(model_ratio, 1, 2))
+                    _, (still_held,) = tracker.update([measured], 1.12)
+                    self.assertEqual((still_held.id, still_held.grip), (held.id, 'pinch'))
+                    lost_depth = replace(
+                        measured, pose=None if lose_palm else Pose(measured.pose.palm, measured.pose.palm),
+                        pointing=False, pinch_gap=None, image_index=(.54, .42),
+                    )
+                    for at in (1.16, 1.20, 1.23):
+                        _, (continued,) = tracker.update([lost_depth], at)
+                        self.assertEqual((continued.id, continued.grip), (held.id, 'pinch'))
+                        self.assertGreater(continued.image[0], held.image[0])
+                        self.assertEqual(continued.pose is None, lose_palm)
+                    for at in (1.25, 1.29):
+                        self.assertEqual(tracker.update([lost_depth], at), ('lost', ()))
+                    _, (recovered,) = tracker.update([closed], 1.33)
+                    self.assertEqual((recovered.id, recovered.grip), (held.id, 'pinch'))
+
+    def test_clear_opening_releases_after_the_same_depth_pinch_continues_on_rgb(self):
+        tracker, held, closed = self.pinch()
+        rgb = replace(closed, pose=None, pointing=False, pinch_gap=None, optical_pinch_ratio=.16)
+        _, (continued,) = tracker.update([rgb], 1.12)
+        self.assertEqual((continued.id, continued.grip), (held.id, 'pinch'))
+        conflicting = replace(rgb, optical_pinch_ratio=.63, features=GripFeatures(.55, 1, 2))
+        _, (still_held,) = tracker.update([conflicting], 1.16)
+        self.assertEqual((still_held.id, still_held.grip), (held.id, 'pinch'))
+        opening = replace(conflicting, features=GripFeatures(.62, 1, 2))
+        _, (released,) = tracker.update([opening], 1.20)
+        self.assertEqual((released.id, released.grip), (held.id, 'open'))
+        self.assertIsNone(released.pose)
+
+    def test_nonclear_opening_must_persist_after_measured_pinch_loses_depth(self):
+        for image_ratio, model_ratio in ((.55, .57), (.63, .55)):
+            with self.subTest(image_ratio=image_ratio, model_ratio=model_ratio):
+                tracker, held, closed = self.pinch()
+                opening = replace(closed, pose=None, pointing=False, pinch_gap=None,
+                                  optical_pinch_ratio=image_ratio, features=GripFeatures(model_ratio, 1, 2))
+                for at in (1.12, 1.16):
+                    _, (continued,) = tracker.update([opening], at)
+                    self.assertEqual((continued.id, continued.grip), (held.id, 'pinch'))
+                _, (released,) = tracker.update([opening], 1.19)
+                self.assertEqual((released.id, released.grip), (held.id, 'open'))
+
+    def test_late_moderate_opening_confirms_privately_and_does_not_count_missing_frames(self):
+        tracker, held, closed = self.pinch()
+        rgb = replace(closed, pose=None, pointing=False, pinch_gap=None)
+        unclear = replace(rgb, optical_pinch_ratio=.46, features=GripFeatures(.55, 1, 2))
+        opening = replace(rgb, optical_pinch_ratio=.55, features=GripFeatures(.57, 1, 2))
+        _, (continued,) = tracker.update([unclear], 1.18)
+        self.assertEqual(continued.grip, 'pinch')
+        self.assertEqual(tracker.update([opening], 1.21), ('lost', ()))
+        self.assertEqual(tracker.update([], 1.24), ('lost', ()))
+        self.assertEqual(tracker.update([opening], 1.28), ('lost', ()))
+        self.assertEqual(tracker.update([opening], 1.32), ('lost', ()))
+        _, (released,) = tracker.update([opening], 1.35)
+        self.assertEqual((released.id, released.grip), (held.id, 'open'))
+
+    def test_conflicting_measured_frame_interrupts_optical_release_confirmation(self):
+        tracker, held, closed = self.pinch()
+        opening = replace(closed, pose=None, pointing=False, pinch_gap=None,
+                          optical_pinch_ratio=.55, features=GripFeatures(.57, 1, 2))
+        conflicting_depth = replace(closed, pinch_gap=.057)
+        for at, observation in ((1.10, opening), (1.14, conflicting_depth), (1.18, opening)):
+            _, (continued,) = tracker.update([observation], at)
+            self.assertEqual((continued.id, continued.grip), (held.id, 'pinch'))
+        self.assertEqual(tracker.update([opening], 1.22), ('lost', ()))
+        _, (released,) = tracker.update([opening], 1.25)
+        self.assertEqual((released.id, released.grip), (held.id, 'open'))
+
     def test_fresh_rgb_only_pinch_confirms_and_releases_with_other_fingers_curled(self):
         tracker = HandTracker()
         closed = replace(optical_sample(), pose=None)
@@ -305,7 +378,7 @@ class PinchTrackingTests(TestCase):
         self.assertEqual((released.id, released.grip), (held.id, 'open'))
 
         tracker, held, closed = self.pinch()
-        visible_opening = replace(closed, pinch_gap=None, features=OPEN)
+        visible_opening = replace(closed, pinch_gap=None, features=OPEN, optical_pinch_ratio=.70)
         _, (released,) = tracker.update([visible_opening], 1.12)
         self.assertEqual((released.id, released.grip), (held.id, 'open'))
 
@@ -344,7 +417,7 @@ class PinchTrackingTests(TestCase):
 
     def test_clearly_open_optical_aim_releases_without_index_depth(self):
         tracker, held, _ = self.pinch()
-        opening = replace(sample(), pointing=False, pinch_gap=None)
+        opening = replace(sample(), pointing=False, pinch_gap=None, optical_pinch_ratio=.70)
         _, (released,) = tracker.update([opening], 1.12)
         self.assertEqual((released.id, released.grip), (held.id, 'open'))
         self.assertFalse(released.pointing)

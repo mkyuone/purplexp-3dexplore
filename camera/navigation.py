@@ -1,11 +1,12 @@
-"""Map tracked hands into a forgiving interaction region without saved calibration."""
+"""Map tracked hands into the exhibit's interaction region."""
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from math import copysign, exp, hypot, isfinite
 from statistics import median
 
-from tracking import Grip, Hand
+from calibration import Calibration, Vec3
+from tracking import TRACK_TIMEOUT, Grip, Hand, Vec2, valid_image
 
 
 IMAGE_LEFT = 0.14
@@ -137,4 +138,76 @@ class FuzzyMapper:
 
         self.output = tuple(mapped)
         self.previous = {hand.id: hand for hand in mapped}
+        return self.output
+
+
+@dataclass(frozen=True)
+class _CalibratedAnchor:
+    xy: Vec2
+    image_aim: Vec2 | None
+    tip_z: float
+    offset: Vec2
+    optical_only: bool = False
+
+
+class CalibratedMapper:
+    def __init__(self, calibration: Calibration, project_image: Callable[[float, float, float], Vec3 | None] | None) -> None:
+        self.calibration = calibration
+        self.project_image = project_image
+        self.last_at = float('-inf')
+        self.last_sequence = -1
+        self.anchors: dict[str, _CalibratedAnchor] = {}
+        self.output: tuple[MappedHand, ...] = ()
+
+    def image_aim(self, image: Vec2 | None, z: float) -> Vec2 | None:
+        if self.project_image is None or not valid_image(image):
+            return None
+        point = self.project_image(*image, z)
+        return self.calibration.aim(point) if point is not None else None
+
+    def follow_rgb(self, previous: _CalibratedAnchor, image: Vec2 | None) -> _CalibratedAnchor:
+        aim = self.image_aim(image, previous.tip_z)
+        if previous.image_aim is None or aim is None:
+            return replace(previous, optical_only=True)
+        x, y = previous.xy
+        old_x, old_y = previous.image_aim
+        xy = clamp(x + aim[0] - old_x, 0, 1), clamp(y + aim[1] - old_y, 0, 1)
+        return replace(previous, xy=xy, image_aim=aim, optical_only=True)
+
+    def update(self, hands: Sequence[Hand], at: float, sequence: int) -> tuple[MappedHand, ...]:
+        if sequence == self.last_sequence:
+            return self.output
+        if at - self.last_at >= TRACK_TIMEOUT:
+            self.anchors.clear()
+        anchors: dict[str, _CalibratedAnchor] = {}
+        mapped = []
+        for hand in hands:
+            previous = self.anchors.get(hand.id)
+            if hand.pose is not None and (hand.pointing or hand.grip == 'fist' or hand.thumbs_up):
+                projected = self.calibration.project(hand.pose)
+                if projected is None:
+                    continue
+                x, y, depth = projected
+                if hand.grip == 'pinch':
+                    offset = previous.offset if previous else (0.0, 0.0)
+                    if previous and previous.optical_only:
+                        # Keep the calibrated drag continuous even if the hand
+                        # moved in depth while only its RGB ray was available.
+                        continued = self.follow_rgb(previous, hand.image).xy
+                        offset = continued[0] - x, continued[1] - y
+                    x, y = clamp(x + offset[0], 0, 1), clamp(y + offset[1], 0, 1)
+                    z = hand.pose.tip[2]
+                    anchors[hand.id] = _CalibratedAnchor((x, y), self.image_aim(hand.image, z), z, offset)
+                mapped.append(MappedHand(hand.id, x, y, depth, hand.grip, hand.thumbs_up))
+            elif previous and hand.grip in ('pinch', 'open'):
+                anchor = self.follow_rgb(previous, hand.image)
+                if hand.grip == 'pinch':
+                    if not valid_image(hand.image):
+                        continue
+                    anchors[hand.id] = anchor
+                mapped.append(MappedHand(hand.id, *anchor.xy, 0, hand.grip, depth_valid=False))
+
+        self.anchors = anchors
+        self.last_at, self.last_sequence = at, sequence
+        self.output = tuple(mapped)
         return self.output

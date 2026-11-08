@@ -17,7 +17,7 @@ import re
 import signal
 
 from calibration import CENTER, Calibration, CalibrationFitError, Pose, TARGETS, fit, fit_corners, median_point
-from navigation import FuzzyMapper
+from navigation import CalibratedMapper, FuzzyMapper
 from options import CameraOptions, DEFAULT_SETTINGS, load_options, save_options
 from realsense import CameraFeed, CameraInfo, FRAME_MAX_AGE, Snapshot
 
@@ -202,6 +202,8 @@ class CameraService:
         self.operator_previews: dict[str, OperatorPreview] = {}
         self.fuzzy = FuzzyMapper()
         self.fuzzy_session: str | None = None
+        self.calibrated: dict[str, CalibratedMapper] = {}
+        self.calibrated_session: str | None = None
         self.settings_path = settings_path
 
     def settings(self, value: dict | None = None) -> dict:
@@ -241,11 +243,7 @@ class CameraService:
                 if self.fuzzy_session != info.session:
                     self.fuzzy.reset()
                     self.fuzzy_session = info.session
-                hands = [{
-                    'id': hand.id, 'x': hand.x, 'y': hand.y, 'depth': hand.depth, 'depthValid': hand.depth_valid,
-                    'pinched': hand.grip == 'pinch' and not hand.thumbs_up,
-                    'fist': hand.grip == 'fist' and not hand.thumbs_up, 'thumbsUp': hand.thumbs_up,
-                } for hand in self.fuzzy.update(frame.hands, frame.at)]
+                mapped = self.fuzzy.update(frame.hands, frame.at)
             else:
                 if attempt := self.active_attempt(info, display):
                     return attempt_status(attempt, capture_readiness(snapshot, attempt))
@@ -254,18 +252,18 @@ class CameraService:
                 calibration = self.profiles.records.get(f'{info.profile}|{display}')
                 if calibration is None:
                     return calibrating()
-                hands = []
-                for hand in frame.hands:
-                    if hand.pose is None or (not hand.pointing and hand.grip != 'fist' and not hand.thumbs_up):
-                        continue
-                    projected = calibration.project(hand.pose)
-                    if projected is not None:
-                        x, y, depth = projected
-                        hands.append({
-                            'id': hand.id, 'x': x, 'y': y, 'depth': depth, 'depthValid': True,
-                            'pinched': hand.grip == 'pinch' and not hand.thumbs_up,
-                            'fist': hand.grip == 'fist' and not hand.thumbs_up, 'thumbsUp': hand.thumbs_up,
-                        })
+                if self.calibrated_session != info.session:
+                    self.calibrated.clear()
+                    self.calibrated_session = info.session
+                mapper = self.calibrated.get(display)
+                if mapper is None or mapper.calibration is not calibration or mapper.project_image is not info.project_image:
+                    mapper = self.calibrated[display] = CalibratedMapper(calibration, info.project_image)
+                mapped = mapper.update(frame.hands, frame.at, frame.sequence)
+            hands = [{
+                'id': hand.id, 'x': hand.x, 'y': hand.y, 'depth': hand.depth, 'depthValid': hand.depth_valid,
+                'pinched': hand.grip == 'pinch' and not hand.thumbs_up,
+                'fist': hand.grip == 'fist' and not hand.thumbs_up, 'thumbsUp': hand.thumbs_up,
+            } for hand in mapped]
             age = monotonic() - frame.at
             if stale := stale_pose(age):
                 return stale
@@ -347,6 +345,7 @@ class CameraService:
                     if key in self.profiles.records else calibrating(message='Calibration canceled.')
                 )
             if action == 'begin':
+                self.calibrated.pop(display, None)
                 attempt = Attempt(info.session, frame.at, monotonic())
                 self.attempts[display] = attempt
                 return {

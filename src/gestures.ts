@@ -65,6 +65,8 @@ interface PartGrip {
   base: ObjectPose
   startFirst: Vector3
   pair: { startSecond: Vector3; direction: Vector3; rotation: Quaternion } | null
+  useDepth: boolean
+  depthCandidate: { capturedAt: number; first: number; second: number | null } | null
 }
 
 interface SecondaryGrip {
@@ -72,6 +74,7 @@ interface SecondaryGrip {
   observedAt: number
   heldMs: number
   missing: boolean
+  recoverDepth?: boolean
 }
 
 interface ClosedCandidate {
@@ -104,6 +107,8 @@ const TARGET_GRACE_PX = 28
 const TRACKING_GRACE_MS = 150
 const CLOSED_GRIP_CONFIRM_MS = 100
 const PINCH_REIDENTIFY_DISTANCE = 0.08
+const DEPTH_RECOVERY_TOLERANCE = 0.05 // In viewport widths, like HandPose.depth.
+const DEPTH_RECOVERY_MAX_GAP_MS = 100
 const VIEW_ORBIT_DEADZONE = 0.005
 const VIEW_DEPTH_DEADZONE = 0.006
 const VIEW_DEPTH_ZOOM_GAIN = 2
@@ -278,10 +283,11 @@ export class GestureController {
       const first = hands.find(hand => hand.id === grip.first.id)
       const second = grip.second && hands.find(hand => hand.id === grip.second?.id)
       if (this.interruption || quiet || !first || (grip.second && !second)) {
+        const recoverDepth = this.interruption !== null || quiet
         if ((first && !matchesGrip(grip, first)) || (second && !matchesGrip(grip, second))) {
           const remaining = [first, second].find(hand => hand && matchesGrip(grip, hand))
           this.interruption = null
-          if (remaining) this.rebase(grip, remaining, null)
+          if (remaining) this.rebase(grip, remaining, null, recoverDepth)
           else this.endGrip()
           this.armed = new Set(hands.filter(isNeutral).map(hand => hand.id))
           this.recovering = false
@@ -291,7 +297,7 @@ export class GestureController {
         if (first && matchesGrip(grip, first)
           && (!grip.second || (second && matchesGrip(grip, second)))) {
           this.interruption = null
-          this.rebase(grip, first, second || null)
+          this.rebase(grip, first, second || null, true)
           if (!grip.second) {
             if (grip.secondaryGrip) grip.secondaryGrip.missing = true
             this.tryJoin(grip, hands, [])
@@ -305,10 +311,10 @@ export class GestureController {
             const missing = first ? grip.second : grip.first
             grip.secondaryGrip = {
               id: missing.id, observedAt: interruption?.capturedAt ?? previousCapture,
-              heldMs: CLOSED_GRIP_CONFIRM_MS, missing: true,
+              heldMs: CLOSED_GRIP_CONFIRM_MS, missing: true, recoverDepth: true,
             }
             this.interruption = null
-            this.rebase(grip, remaining, null)
+            this.rebase(grip, remaining, null, recoverDepth)
             this.updateState(hands)
             return
           }
@@ -320,7 +326,7 @@ export class GestureController {
             && hand.pinched && this.handAxis(grip.first, hand).lengthSq() <= PINCH_REIDENTIFY_DISTANCE ** 2)
           if (nearby.length === 1) {
             this.interruption = null
-            this.rebase(grip, nearby[0], null)
+            this.rebase(grip, nearby[0], null, true)
             this.updateState(hands)
             return
           }
@@ -470,7 +476,10 @@ export class GestureController {
       if (!id) return false
       const pose = this.scene.getPose(id)
       if (!pose) return false
-      part = { id, original: pose, base: pose, startFirst: this.worldPoint(first, pose), pair: null }
+      part = {
+        id, original: pose, base: pose, startFirst: this.worldPoint(first, pose), pair: null,
+        useDepth: first.depthValid, depthCandidate: null,
+      }
       this.scene.select(id)
     }
 
@@ -565,53 +574,12 @@ export class GestureController {
       if (grip.second) return
     }
 
-    const dualView = second !== null && !grip.part
-    const useDepth = !dualView && hasDepth(first, second)
-    if (!dualView && useDepth !== hasDepth(grip.first, grip.second)) {
-      if (grip.part) {
-        // Keep the old XY anchors so this frame still moves in the screen plane.
-        // Anchor depth to this sample so its change in availability adds no motion.
-        const anchorFirst = { ...first, x: grip.first.x, y: grip.first.y }
-        const anchorSecond = second && grip.second
-          ? { ...second, x: grip.second.x, y: grip.second.y } : null
-        if (!this.rebasePart(grip.part, anchorFirst, anchorSecond)) return
-        grip.first = anchorFirst
-        grip.second = anchorSecond
-        if (anchorSecond && this.handAxis(anchorFirst, anchorSecond).lengthSq() < MIN_HAND_SEPARATION ** 2) {
-          grip.pairBlocked = true
-        }
-      } else grip.viewAnchor.depth = first.depth
-    }
-
-    if (!samePosition(grip.first, first, useDepth) || (grip.second && second && !samePosition(grip.second, second, useDepth))) {
-      if (second && grip.part) {
-        this.updatePair(grip, first, second)
-      } else if (grip.part) {
-        this.movePart(grip.part, first, null)
-      } else if (second) {
+    if (grip.part) this.updatePartGrip(grip, grip.part, first, second)
+    else if (second && grip.second) {
+      if (!samePosition(grip.first, first, false) || !samePosition(grip.second, second, false)) {
         this.updateViewPair(grip, first, second)
-      } else {
-        const anchor = grip.viewAnchor
-        const dx = first.x - anchor.x
-        const dy = first.y - anchor.y
-        const travel = Math.hypot(dx, dy)
-        if (travel > VIEW_ORBIT_DEADZONE) {
-          const fraction = 1 - VIEW_ORBIT_DEADZONE / travel
-          this.scene.orbit(dx * fraction, dy * fraction)
-          anchor.x += dx * fraction
-          anchor.y += dy * fraction
-        }
-        if (useDepth) {
-          const depth = first.depth - anchor.depth
-          const excess = Math.max(0, Math.abs(depth) - VIEW_DEPTH_DEADZONE)
-          if (excess > 0) {
-            const applied = Math.sign(depth) * excess
-            this.scene.zoom(Math.exp(applied * VIEW_DEPTH_ZOOM_GAIN))
-            anchor.depth += applied
-          }
-        }
       }
-    }
+    } else this.updateViewGrip(grip, first)
 
     grip.first = first
     grip.second = second
@@ -632,6 +600,7 @@ export class GestureController {
     }
 
     let confirmed = fresh.includes(second) || (recent?.id === second.id && recent.heldMs >= CLOSED_GRIP_CONFIRM_MS)
+    const recoverDepth = recent?.id === second.id && recent.recoverDepth === true
     if (this.liveTracking) {
       if (!confirmed && recent?.missing && recent.heldMs >= CLOSED_GRIP_CONFIRM_MS && recent.id !== second.id) return
       const heldMs = recent?.id === second.id
@@ -639,14 +608,15 @@ export class GestureController {
       confirmed ||= heldMs >= CLOSED_GRIP_CONFIRM_MS
       grip.secondaryGrip = {
         id: second.id, observedAt: this.lastCapture,
-        heldMs: confirmed ? CLOSED_GRIP_CONFIRM_MS : heldMs, missing: false,
+        heldMs: confirmed ? CLOSED_GRIP_CONFIRM_MS : heldMs, missing: false, recoverDepth,
       }
     }
-    const canJoin = !grip.part || (this.handAxis(first, second).lengthSq() >= MIN_HAND_SEPARATION ** 2
+    const useDepth = grip.part?.useDepth === true && hasDepth(first, second)
+    const canJoin = !grip.part || (this.handAxis(first, second, useDepth).lengthSq() >= MIN_HAND_SEPARATION ** 2
       && (this.joinAnywhere || isInsideJoin(this.joinTarget(grip), second.x, second.y)))
     if (confirmed && canJoin) {
       grip.secondaryGrip = null
-      this.rebase(grip, first, second)
+      this.rebase(grip, first, second, recoverDepth)
     }
   }
 
@@ -657,6 +627,32 @@ export class GestureController {
       (second.y - first.y) * this.viewportHeight / this.viewportWidth,
       useDepth ? second.depth - first.depth : 0,
     )
+  }
+
+  private updateViewGrip(grip: ActiveGrip, first: HandPose) {
+    const anchor = grip.viewAnchor
+    const useDepth = first.depthValid
+    if (useDepth !== grip.first.depthValid) anchor.depth = first.depth
+    if (samePosition(grip.first, first, useDepth)) return
+
+    const dx = first.x - anchor.x
+    const dy = first.y - anchor.y
+    const travel = Math.hypot(dx, dy)
+    if (travel > VIEW_ORBIT_DEADZONE) {
+      const fraction = 1 - VIEW_ORBIT_DEADZONE / travel
+      this.scene.orbit(dx * fraction, dy * fraction)
+      anchor.x += dx * fraction
+      anchor.y += dy * fraction
+    }
+    if (useDepth) {
+      const depth = first.depth - anchor.depth
+      const excess = Math.max(0, Math.abs(depth) - VIEW_DEPTH_DEADZONE)
+      if (excess > 0) {
+        const applied = Math.sign(depth) * excess
+        this.scene.zoom(Math.exp(applied * VIEW_DEPTH_ZOOM_GAIN))
+        anchor.depth += applied
+      }
+    }
   }
 
   private updateViewPair(grip: ActiveGrip, first: HandPose, second: HandPose) {
@@ -688,21 +684,58 @@ export class GestureController {
     anchor.y = y
   }
 
-  private updatePair(grip: ActiveGrip, first: HandPose, second: HandPose) {
-    const previous = this.handAxis(grip.first, grip.second!)
-    const axis = this.handAxis(first, second)
+  private updatePartGrip(grip: ActiveGrip, part: PartGrip, first: HandPose, second: HandPose | null) {
+    if (part.useDepth && !hasDepth(first, second)) {
+      // Keep the old XY anchors so the first missing-depth frame still moves in the screen plane.
+      if (!this.rebasePart(part, grip.first, grip.second, false)) return
+      if (grip.second && this.handAxis(grip.first, grip.second, false).lengthSq() < MIN_HAND_SEPARATION ** 2) {
+        grip.pairBlocked = true
+      }
+    }
+
+    if (!samePosition(grip.first, first, part.useDepth)
+      || (grip.second && second && !samePosition(grip.second, second, part.useDepth))) {
+      if (second) this.updatePair(grip, part, first, second)
+      else this.movePart(part, first, null)
+    }
+
+    if (!part.useDepth && this.confirmDepth(part, first, second)) {
+      // Apply this sample's XY motion before anchoring Z to its confirmed depth.
+      if (!this.rebasePart(part, first, second, true)) return
+      const minimum = grip.pairBlocked ? RESUME_HAND_SEPARATION : MIN_HAND_SEPARATION
+      grip.pairBlocked = second !== null && this.handAxis(first, second, true).lengthSq() < minimum ** 2
+    }
+  }
+
+  private depthSample(first: HandPose, second: HandPose | null) {
+    return hasDepth(first, second) ? { capturedAt: this.lastCapture, first: first.depth, second: second?.depth ?? null } : null
+  }
+
+  private confirmDepth(part: PartGrip, first: HandPose, second: HandPose | null) {
+    const current = this.depthSample(first, second)
+    const previous = part.depthCandidate
+    if (current && previous && current.capturedAt <= previous.capturedAt) return false
+    part.depthCandidate = current
+    return current !== null && previous !== null
+      && current.capturedAt - previous.capturedAt <= DEPTH_RECOVERY_MAX_GAP_MS
+      && Math.abs(current.first - previous.first) <= DEPTH_RECOVERY_TOLERANCE
+      && (current.second === null || (previous.second !== null
+        && Math.abs(current.second - previous.second) <= DEPTH_RECOVERY_TOLERANCE))
+  }
+
+  private updatePair(grip: ActiveGrip, part: PartGrip, first: HandPose, second: HandPose) {
+    const previous = this.handAxis(grip.first, grip.second!, part.useDepth)
+    const axis = this.handAxis(first, second, part.useDepth)
     const separation = axis.length()
     const interrupted = grip.pairBlocked || crossedBetweenFrames(previous, axis)
     const blocked = separation < (interrupted ? RESUME_HAND_SEPARATION : MIN_HAND_SEPARATION)
     const recover = !blocked && interrupted
-    if (grip.part) {
-      this.movePart(grip.part, first, second, blocked || recover)
-    }
-    if (recover) this.rebase(grip, first, second)
+    this.movePart(part, first, second, blocked || recover)
+    if (recover) this.rebasePart(part, first, second, part.useDepth)
     grip.pairBlocked = blocked
   }
 
-  private rebase(grip: ActiveGrip, first: HandPose, second: HandPose | null) {
+  private rebase(grip: ActiveGrip, first: HandPose, second: HandPose | null, recoverDepth = false) {
     this.closedCandidate = null
     grip.first = first
     grip.second = second
@@ -713,21 +746,26 @@ export class GestureController {
     }
     const viewSeparation = !grip.part && second ? this.handAxis(first, second, false).length() : 0
     grip.viewPairLogSeparation = viewSeparation >= RESUME_HAND_SEPARATION ? Math.log(viewSeparation) : null
-    grip.pairBlocked = grip.part !== null && second !== null && this.handAxis(first, second).lengthSq() < MIN_HAND_SEPARATION ** 2
     if (!second) {
       grip.joinSide = first.x <= 0.64 ? 1 : -1
       grip.joinVertical = first.y <= 0.5 ? 1 : -1
     }
-    if (grip.part) this.rebasePart(grip.part, first, second)
+    if (grip.part) {
+      const useDepth = !recoverDepth && grip.part.useDepth && hasDepth(first, second)
+      grip.part.depthCandidate = useDepth ? null : this.depthSample(first, second)
+      grip.pairBlocked = second !== null && this.handAxis(first, second, useDepth).lengthSq() < MIN_HAND_SEPARATION ** 2
+      this.rebasePart(grip.part, first, second, useDepth)
+    }
   }
 
-  private rebasePart(part: PartGrip, first: HandPose, second: HandPose | null) {
+  private rebasePart(part: PartGrip, first: HandPose, second: HandPose | null, useDepth: boolean) {
     const pose = this.scene.getPose(part.id)
     if (!pose) {
       this.endGrip()
       return false
     }
-    const useDepth = hasDepth(first, second)
+    part.useDepth = useDepth
+    if (useDepth) part.depthCandidate = null
     part.base = pose
     part.startFirst = this.worldPoint(first, pose, useDepth)
     const startSecond = second && this.worldPoint(second, pose, useDepth)
@@ -744,15 +782,14 @@ export class GestureController {
   }
 
   private movePart(part: PartGrip, first: HandPose, second: HandPose | null, preserveOrientation = false) {
-    const useDepth = hasDepth(first, second)
-    const point = this.worldPoint(first, part.base, useDepth)
+    const point = this.worldPoint(first, part.base, part.useDepth)
     const pair = part.pair
     if (!second || !pair) {
       this.scene.setPose(part.id, { ...part.base, position: point.sub(part.startFirst).add(part.base.position) })
       return
     }
 
-    const secondPoint = this.worldPoint(second, part.base, useDepth)
+    const secondPoint = this.worldPoint(second, part.base, part.useDepth)
     const midpointOffset = point.clone().add(secondPoint).sub(part.startFirst).sub(pair.startSecond).multiplyScalar(0.5)
     const position = part.base.position.clone().add(midpointOffset)
     if (preserveOrientation) {
