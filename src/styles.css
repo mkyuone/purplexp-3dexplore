@@ -15,7 +15,7 @@
 body { margin: 0; min-width: 280px; }
 button { font: inherit; color: inherit; cursor: pointer; }
 button:disabled { opacity: .45; cursor: default; }
-button:focus-visible, .exhibit:focus-visible { outline: 2px solid var(--violet); outline-offset: 4px; }
+button:focus-visible { outline: 2px solid var(--violet); outline-offset: 4px; }
 button svg { flex: none; }
 .sr-only {
   position: absolute;
@@ -44,8 +44,7 @@ button svg { flex: none; }
   touch-action: none;
   user-select: none;
 }
-.exhibit:focus { outline: none; }
-.exhibit:focus-visible { outline: 2px solid #c6a2ff88; outline-offset: -2px; }
+.exhibit:focus, .model:focus { outline: none; }
 .stage-light, .model, .hands-layer { position: absolute; inset: 0; width: 100%; height: 100%; }
 .stage-light {
   pointer-events: none;
@@ -55,7 +54,6 @@ button svg { flex: none; }
     #100c1c;
 }
 .model { display: block; }
-.model:focus-visible { outline: 2px solid #c6a2ff88; outline-offset: -2px; }
 .setup-trigger {
   position: absolute;
   inset: clamp(12px, 2vw, 24px) clamp(14px, 2.5vw, 34px) auto auto;
