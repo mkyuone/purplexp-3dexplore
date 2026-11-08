@@ -361,9 +361,8 @@ export function App() {
 
   function resetExhibit(cancelGestures = true) {
     edit(scene => {
-      scene.reset();
+      scene.resetExhibit();
       scene.select(null);
-      scene.fit('isometric');
       setSelected(null);
     }, cancelGestures);
   }

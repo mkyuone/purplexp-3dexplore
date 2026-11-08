@@ -34,6 +34,17 @@ interface SceneModel {
 }
 
 interface CameraFrame { position: Vector3; target: Vector3 }
+interface PartReset { node: Group; before: ObjectPose; initial: ObjectPose }
+interface ResetAnimation {
+  startedAt: number;
+  parts: PartReset[];
+  fromCenter: Vector3;
+  fromOrbit: Spherical;
+  fromPan: Vector2;
+  fromScreenDistance: number;
+  framing: CameraFrame;
+  aspect: number;
+}
 interface HeadView {
   target: Vector2;
   applied: Vector2;
@@ -53,6 +64,8 @@ const cameraDirections: Record<CameraView, Vector3> = {
   side: new Vector3(1, 0, 0),
   isometric: new Vector3(0.82, 0.48, 1.25).normalize(),
 };
+const isometricAngles = new Spherical().setFromVector3(cameraDirections.isometric);
+const RESET_DURATION_MS = 1500;
 const HEAD_SCREEN_FIT_RATIO = 0.58;
 const HEAD_RELEASE_MS = 160;
 const HEAD_RENDER_DELTA_SQ = 0.0025 ** 2;
@@ -188,6 +201,7 @@ export class CadScene {
     }),
   );
   private readonly undoStack: Array<() => void> = [];
+  private resetAnimation: ResetAnimation | null = null;
   private selection: string | null = null;
   private hovered: string[] = [];
   private frame: number | null = null;
@@ -269,6 +283,7 @@ export class CadScene {
     }
 
     const previous = this.model;
+    this.resetAnimation = null;
     this.world.remove(previous.root);
     this.world.add(draft.root);
     this.model = draft;
@@ -360,6 +375,7 @@ export class CadScene {
       : this.orbitOffset.clone().normalize();
     const framing = this.frameModel(this.model, direction);
     if (!framing) return;
+    this.resetAnimation = null;
     this.applyFraming(framing);
     this.requestRender(true);
   }
@@ -404,6 +420,7 @@ export class CadScene {
   }
 
   orbit(dx: number, dy: number) {
+    this.resetAnimation = null;
     const angles = new Spherical().setFromVector3(this.orbitOffset);
     angles.theta -= dx * Math.PI * 1.7;
     angles.phi = MathUtils.clamp(angles.phi - dy * Math.PI * 1.4, 0.05, Math.PI - 0.05);
@@ -415,6 +432,7 @@ export class CadScene {
 
   pan(dx: number, dy: number) {
     if (!Number.isFinite(dx) || !Number.isFinite(dy) || (dx === 0 && dy === 0)) return;
+    this.resetAnimation = null;
     this.panOffset.set(this.panOffset.x + dx, this.panOffset.y + dy);
     this.fitOnResize = false;
     this.aimCamera();
@@ -423,6 +441,7 @@ export class CadScene {
 
   zoom(factor: number) {
     if (!(factor > 0) || !Number.isFinite(factor)) return;
+    this.resetAnimation = null;
     this.orbitOffset.setLength(MathUtils.clamp(this.orbitOffset.length() / factor, 1.4, 300));
     this.fitOnResize = false;
     this.aimCamera();
@@ -555,6 +574,7 @@ export class CadScene {
   }
 
   select(id: string | null) {
+    if (id !== null) this.resetAnimation = null;
     if (this.selection === id) return;
     const previous = this.selection;
     this.selection = id;
@@ -614,6 +634,7 @@ export class CadScene {
   setPose(id: string, pose: ObjectPose) {
     const occurrence = this.model.occurrences.get(id);
     if (!occurrence) return;
+    this.resetAnimation = null;
     applyPose(occurrence.editable, this.toLocalPose(occurrence, pose));
     this.geometryChanged();
   }
@@ -638,6 +659,7 @@ export class CadScene {
   }
 
   color(id: string, cssHex: string) {
+    this.resetAnimation = null;
     const next = new Color(cssHex);
     const restore: Array<() => void> = [];
     for (const occurrence of this.model.occurrences.values()) {
@@ -654,6 +676,33 @@ export class CadScene {
   }
 
   reset(id?: string) {
+    this.resetAnimation = null;
+    this.restoreParts(id);
+    this.geometryChanged();
+  }
+
+  resetExhibit() {
+    if (this.resetAnimation || !this.model.meshes.length) return;
+    const parts = this.restoreParts();
+    const framing = this.frameModel(this.model, cameraDirections.isometric);
+    const atRest = framing && !parts.length && !this.panOffset.lengthSq()
+      && this.orbitCenter.distanceToSquared(framing.target) < 1e-10
+      && this.camera.position.distanceToSquared(framing.position) < 1e-10;
+    if (framing && !atRest && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      // Fit the restored assembly first, then start the animation from the visible poses.
+      for (const { node, before } of parts) applyPose(node, before);
+      this.resetAnimation = {
+        startedAt: performance.now(), parts, framing, aspect: this.camera.aspect,
+        fromCenter: this.orbitCenter.clone(), fromOrbit: new Spherical().setFromVector3(this.orbitOffset),
+        fromPan: this.panOffset.clone(), fromScreenDistance: this.screenDistance,
+      };
+      this.fitOnResize = false;
+    } else if (framing) this.applyFraming(framing);
+    this.geometryChanged();
+  }
+
+  private restoreParts(id?: string): PartReset[] {
+    const parts: PartReset[] = [];
     const restore: Array<() => void> = [];
     for (const occurrence of this.model.occurrences.values()) {
       if (id !== undefined && !this.isWithin(occurrence.id, id)) continue;
@@ -661,6 +710,7 @@ export class CadScene {
       const before = localPose(occurrence.editable);
       if (!samePose(before, initial)) {
         applyPose(occurrence.editable, initial);
+        parts.push({ node: occurrence.editable, before, initial });
         restore.push(() => applyPose(occurrence.editable, before));
       }
       for (const [index, { color }] of materialsOf(occurrence.mesh).entries()) {
@@ -672,7 +722,46 @@ export class CadScene {
       }
     }
     if (restore.length) this.pushUndo(() => restore.forEach((undo) => undo()));
-    this.geometryChanged();
+    return parts;
+  }
+
+  private advanceReset(time: number) {
+    const animation = this.resetAnimation;
+    if (!animation) return;
+    if (animation.aspect !== this.camera.aspect) {
+      for (const { node, initial } of animation.parts) applyPose(node, initial);
+      animation.framing = this.frameModel(this.model, cameraDirections.isometric) ?? animation.framing;
+      animation.aspect = this.camera.aspect;
+    }
+
+    const progress = MathUtils.smoothstep(time - animation.startedAt, 0, RESET_DURATION_MS);
+    for (const { node, before, initial } of animation.parts) {
+      node.position.lerpVectors(before.position, initial.position, progress);
+      node.quaternion.slerpQuaternions(before.rotation, initial.rotation, progress);
+      node.scale.setScalar(MathUtils.lerp(before.scale, initial.scale, progress));
+    }
+    if (animation.parts.length) this.keyLight.shadow.needsUpdate = true;
+    this.picks.length = 0;
+
+    const { framing, fromCenter, fromOrbit, fromPan, fromScreenDistance } = animation;
+    if (progress === 1) {
+      this.resetAnimation = null;
+      this.applyFraming(framing);
+      return;
+    }
+
+    const distance = framing.position.distanceTo(framing.target);
+    const turn = MathUtils.euclideanModulo(isometricAngles.theta - fromOrbit.theta + Math.PI, 2 * Math.PI) - Math.PI;
+    // Follow the orbit instead of cutting through the pivot when turning from behind.
+    this.orbitOffset.setFromSphericalCoords(
+      fromOrbit.radius * (distance / fromOrbit.radius) ** progress,
+      MathUtils.lerp(fromOrbit.phi, isometricAngles.phi, progress),
+      fromOrbit.theta + turn * progress,
+    );
+    this.orbitCenter.lerpVectors(fromCenter, framing.target, progress);
+    this.panOffset.copy(fromPan).multiplyScalar(1 - progress);
+    this.screenDistance = MathUtils.lerp(fromScreenDistance, distance * HEAD_SCREEN_FIT_RATIO, progress);
+    this.aimCamera();
   }
 
   canUndo() {
@@ -682,6 +771,7 @@ export class CadScene {
   undo() {
     const restore = this.undoStack.pop();
     if (!restore) return;
+    this.resetAnimation = null;
     restore();
     this.geometryChanged();
   }
@@ -702,6 +792,7 @@ export class CadScene {
     if (this.contextLost || this.frame !== null) return;
     this.frame = requestAnimationFrame((time) => {
       this.frame = null;
+      this.advanceReset(time);
       const view = this.headView;
       if (view) this.updateHeadCamera(time, view);
       const camera = view ? this.viewerCamera : this.camera;
@@ -709,9 +800,8 @@ export class CadScene {
       this.renderer.render(this.world, camera);
       this.renderedCamera = camera;
       this.modelMatricesDirty = false;
-      if (view?.release) {
-        this.requestRender();
-      } else if (view?.onApplied) {
+      if (this.resetAnimation || view?.release) this.requestRender();
+      if (!view?.release && view?.onApplied) {
         const notify = view.onApplied;
         view.onApplied = undefined;
         notify(performance.now());
@@ -751,6 +841,7 @@ export class CadScene {
     this.canvas.removeEventListener('webglcontextlost', this.handleContextLost);
     this.canvas.removeEventListener('webglcontextrestored', this.handleContextRestored);
     if (this.frame !== null) cancelAnimationFrame(this.frame);
+    this.resetAnimation = null;
     this.undoStack.length = 0;
     this.headFloorGrid?.geometry.dispose();
     this.headFloorGrid?.material.dispose();
