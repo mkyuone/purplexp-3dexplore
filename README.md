@@ -51,13 +51,9 @@ Optional calibration is saved per camera and display. If the camera or display m
 
 Start at 30 fps. The capture setting is the sensor rate, **Pose rate** counts tracker output, and **Browser rate** counts delivered updates. When comparing 60 fps, check pose age and skipped frames as well as how the controls feel. Move a part or the view in the exhibit, then use the browser’s Back button to return to the operator page and see render-submission timings. Those timings end when the browser submits the draw, before it reaches the display.
 
-## Try head-coupled perspective
+## Head-coupled perspective experiment
 
-In [Operator settings](http://localhost:4180/operator), choose **Head-coupled perspective → Start** and allow camera access. Use the integrated RGB webcam or another webcam separate from the D435i. Face it until the view centers, then choose **Open exhibit** and move your head sideways or up and down. **Recenter** sets a new resting position. The preview and controls are on the operator page, and the experiment starts off on reload.
-
-The webcam tracks one viewer locally at a fixed virtual viewing distance. The RealSense hand controls work alongside it. While you pinch and hold a part, the head perspective stays steady and catches up after release. The webcam pauses when you switch away from the tab and centers again when you return.
-
-The head diagnostics show webcam and pose rates, inference time, and the interval from a browser video frame callback to render submission. Move your head to collect render timings. For physical latency, film your head movement and the display in the same high-frame-rate recording.
+The experiment is disabled. The webcam tracker, projection, and operator panel remain in the source for future development.
 
 ## Simulate the hands
 

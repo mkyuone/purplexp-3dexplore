@@ -12,7 +12,6 @@ import { attachVisitorControls } from './visitor-controls';
 import { CalibrationPanel } from './calibration-panel';
 import { CameraPreview } from './camera-preview';
 import { DepthRangePanel } from './depth-range-panel';
-import { HeadPerspectivePanel, useHeadPerspective } from './head-perspective-panel';
 import { HandPerformance } from './hand-performance';
 import { collectPartNameRows, exportPartNames, importPartNames } from './part-names';
 
@@ -280,7 +279,6 @@ export function App() {
   const [, setRevision] = useState(0);
   const calibrating = operatorMode && calibrationProgress !== null;
   const setupOpen = operatorMode ? !calibrating : simulatorSetupOpen;
-  const headPerspective = useHeadPerspective(runtime, setupOpen);
   const calibrationDisplayChanged = calibrating && liveStatus.display !== undefined && liveStatus.display !== calibrationProgress.display;
   const matchingCalibrationPoll = liveStatus.phase === 'calibration' && liveStatus.display === calibrationProgress?.display
     && liveStatus.step === calibrationProgress?.step ? liveStatus : null;
@@ -416,7 +414,6 @@ export function App() {
     }
     const gestures = new GestureController(scene, state => {
       runtime.current?.simulator?.setJoinTarget(state.join);
-      scene.setHeadGripHeld(state.held !== null);
       setSelected(scene.getSelected());
       cursorControls.current?.update(state);
       const { status, target, held, hovered, resetProgress } = state;
@@ -709,10 +706,9 @@ export function App() {
   const dualViewGrip = pose?.target === 'view' && pose.status === 'both';
   const resetProgress = showPose && !loading && !graphicsIssue ? Math.max(0, Math.min(1, pose?.resetProgress ?? 0)) : 0;
   const resetSeconds = Math.max(0.1, (1 - resetProgress) * RESET_HOLD_MS / 1000).toFixed(1);
-  const immersiveHeadView = headPerspective.enabled && !setupOpen;
   const showCameraPreview = liveEnabled && !calibrating
     && (operatorMode || (visitorPreviewVisible && liveStatus.phase === 'ready'));
-  const visibleHint = !immersiveHeadView && !resetProgress && !setupOpen && !calibrating && exhibit && !contextLost && (calibrationSaved || !hasExplored) && (!simulationMode || enabled);
+  const visibleHint = !resetProgress && !setupOpen && !calibrating && exhibit && !contextLost && (calibrationSaved || !hasExplored) && (!simulationMode || enabled);
   const hint = calibrationSaved ? 'Calibration saved. Point at the model to try it.'
     : handsEnabled ? visitorCue(pose, simulationMode) : 'Drag to look around. Tap a part to inspect it.';
 
@@ -767,7 +763,6 @@ export function App() {
           : <button ref={setupClose} className="button icon-button" type="button" aria-label="Close setup" onClick={closeSetup}><X size={20} /></button>}
       </div>
       <div className="setup-scroll" onDragOver={event => { if (event.dataTransfer.types.includes('Files')) event.preventDefault(); }} onDrop={onDrop}>
-        {operatorMode && <HeadPerspectivePanel controls={headPerspective} unavailable={!!graphicsIssue || !exhibit} />}
         {operatorMode && <section className="panel" aria-label="Live hand camera">
           <div className="panel-heading"><h2>Hand camera</h2>
             <div className="hand-camera-actions">
