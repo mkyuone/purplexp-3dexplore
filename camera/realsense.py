@@ -1,4 +1,4 @@
-"""Capture aligned D435i frames locally and expose only timestamped hand poses."""
+"""Capture aligned D435i frames and provide the shared hand tracking pipeline."""
 
 from collections import deque
 from collections.abc import Callable
@@ -223,7 +223,7 @@ def fuse_hand(
     if depth is None:
         return optical_sample
 
-    intrinsics = aligned_depth.profile.as_video_stream_profile().intrinsics
+    intrinsics = aligned_depth.profile.as_video_stream_profile().intrinsics if deproject is None else None
     units = aligned_depth.get_units()
     projection = {} if deproject is None else {'deproject': deproject}
 
@@ -383,6 +383,7 @@ class CameraSample:
     timestamp: float
     domain: object
     arrival: float | None
+    captured_at: float | None = None
 
     @classmethod
     def read(cls, rs, frame):
@@ -637,6 +638,10 @@ class PreviewEncoder:
 
 
 class CameraFeed:
+    camera_name = 'RealSense D435i'
+    frame_rates = (30, 60)
+    infrared_count = len(INFRARED_INDEXES)
+
     def __init__(self, model: Path, serial: str | None = None, options: CameraOptions = CameraOptions()) -> None:
         self.model = model
         self.serial = serial
@@ -660,13 +665,14 @@ class CameraFeed:
         self.next_diagnostic_rgb_at = 0.0
         self.thumb_depth_until = 0.0
         self.error: str | None = None
+        self.depth_error: str | None = None
         self.options = options
         self.active_options: CameraOptions | None = None
         self.revision = 0
         self.frame_times: deque[float] = deque(maxlen=60)
         self.processing_times: deque[float] = deque(maxlen=60)
         self.processing_ms = 0.0
-        self.thread = Thread(target=self.run, name='D435i capture', daemon=True)
+        self.thread = Thread(target=self.run, name=f'{self.camera_name} capture', daemon=True)
         self.thread.start()
 
     def configure(self, options: CameraOptions) -> None:
@@ -687,6 +693,7 @@ class CameraFeed:
             self.processing_times.clear()
             self.processing_ms = 0.0
             self.error = None
+            self.depth_error = None
             self.last_contact = monotonic()
             self.changed.notify_all()
         self.wake.set()
@@ -715,10 +722,11 @@ class CameraFeed:
                     diagnostics[key] = last[key]
             return {
                 **self.options.to_dict(),
+                'cameraName': self.camera_name,
                 'sources': [{'value': 'rgb', 'label': 'RGB'}],
-                'trackers': tracker_choices(self.model), 'frameRates': [30, 60],
+                'trackers': tracker_choices(self.model), 'frameRates': list(self.frame_rates),
                 'applying': self.error is None and (self.active_options != self.options or self.info is None or frame is None),
-                'error': self.error, 'diagnostics': diagnostics,
+                'error': self.error, 'depthError': self.depth_error, 'diagnostics': diagnostics,
             }
 
     def snapshot(self, *, include_gestures: bool = False, watch_hand_diagnostics: bool = False) -> Snapshot:
@@ -747,7 +755,7 @@ class CameraFeed:
         self.thread.join(timeout=4)
 
     def request_infrared(self, index: int) -> bytes | None:
-        if index not in INFRARED_INDEXES:
+        if not 1 <= index <= self.infrared_count:
             return None
         image = self.infrared.request(index)
         with self.lock:
@@ -881,8 +889,8 @@ class CameraFeed:
             except CameraError as error:
                 message = str(error)
             except Exception:
-                logging.exception('D435i capture stopped')
-                message = 'D435i tracking stopped. Check the USB cable and the camera bridge terminal.'
+                logging.exception('%s capture stopped', self.camera_name)
+                message = f'{self.camera_name} tracking stopped. Check the USB cable and the camera bridge terminal.'
             finally:
                 with self.lock:
                     if revision != self.revision:
@@ -903,6 +911,7 @@ class CameraFeed:
                     self.next_diagnostic_rgb_at = 0.0
                     self.thumb_depth_until = 0.0
                     self.error = message
+                    self.depth_error = None
                     self.changed.notify_all()
             if message is not None:
                 self.stop.wait(2)
@@ -945,38 +954,52 @@ class CameraFeed:
             color, color_queue = resources.enter_context(open_color(rs, device, options.fps))
             alignment = 'depth' if color.intrinsics.model == rs.distortion.modified_brown_conrady else 'color'
             align = depth_aligner(rs)
-            session = uuid4().hex
-
             def profile_key(width):
                 return f'{serial}:{RGB_SIZE[0]}x{RGB_SIZE[1]}:{width}:{options.fps}:{alignment}'
 
-            with self.lock:
-                if revision != self.revision:
-                    return
-                self.info = CameraInfo(None, session, serial=serial)
-                self.active_options = options
-                self.error = None
+            session = self.begin_session(revision, options, serial)
+            if session is None:
+                return
 
             def set_depth_profile(width: int, project_image: ImageProjector):
-                profile = profile_key(width)
-                with self.lock:
-                    if self.info is not None and self.info.session == session and self.info.profile != profile:
-                        self.info = CameraInfo(profile, session, project_image, serial)
+                self.set_depth_profile(session, profile_key(width), project_image)
 
             depth = DepthStream(rs, device, color, options.fps, set_depth_profile,
                                 infrared=self.infrared, cv2=cv2, np=np)
             resources.callback(depth.close)
-            preview = diagnostic_rgb = None
-            if cv2 is not None:
-                preview = PreviewEncoder(cv2, lambda at, jpeg: self.publish_preview(at, jpeg, session))
-                resources.callback(preview.close)
-                diagnostic_rgb = PreviewEncoder(cv2, lambda at, jpeg: self.publish_diagnostic_rgb(at, jpeg, session),
-                                                encode=encode_diagnostic_rgb)
-                resources.callback(diagnostic_rgb.close)
+            preview, diagnostic_rgb = self.open_previews(resources, cv2, session)
             self.track_frames(rs, np, estimator, color_queue, depth, align, revision, preview, diagnostic_rgb)
 
+    def begin_session(self, revision: int, options: CameraOptions, serial: str) -> str | None:
+        with self.lock:
+            if revision != self.revision:
+                return None
+            session = uuid4().hex
+            self.info = CameraInfo(None, session, serial=serial)
+            self.active_options = options
+            self.error = self.depth_error = None
+            return session
+
+    def set_depth_profile(self, session: str, profile: str, project_image: ImageProjector) -> None:
+        with self.lock:
+            if self.info is not None and self.info.session == session and self.info.profile != profile:
+                self.info = replace(self.info, profile=profile, project_image=project_image)
+
+    def open_previews(self, resources: ExitStack, cv2, session: str):
+        if cv2 is None:
+            return None, None
+        preview = PreviewEncoder(cv2, lambda at, jpeg: self.publish_preview(at, jpeg, session))
+        resources.callback(preview.close)
+        diagnostic = PreviewEncoder(cv2, lambda at, jpeg: self.publish_diagnostic_rgb(at, jpeg, session),
+                                    encode=encode_diagnostic_rgb)
+        resources.callback(diagnostic.close)
+        return preview, diagnostic
+
     def track_frames(self, rs, np, estimator, color_queue, depth_stream, align, revision,
-                     preview=None, diagnostic_rgb=None) -> None:
+                     preview=None, diagnostic_rgb=None, *, read_color=None) -> None:
+        if read_color is None:
+            def read_color(frame):
+                return CameraSample.read(rs, frame)
         tracker = HandTracker()
         sequence = 0
         previous_number = None
@@ -988,17 +1011,20 @@ class CameraFeed:
             found, frame = color_queue.try_wait_for_frame(100)
             dequeued_at = monotonic()
             if dequeued_at - last_rgb_at > STREAM_TIMEOUT:
-                raise CameraError('D435i RGB frames stopped. Check the USB connection.')
+                raise CameraError('RGB frames stopped. Check the camera USB connection.')
             if not found or not frame:
                 continue
-            color = CameraSample.read(rs, frame)
+            color = read_color(frame)
             if color.number == previous_number:
                 continue
             if previous_number is not None:
                 dropped += max(0, color.number - previous_number - 1)
             previous_number = color.number
             last_rgb_at = dequeued_at
-            queue_ms = time() * 1000 - color.arrival if color.arrival is not None else None
+            if color.captured_at is not None:
+                queue_ms = (dequeued_at - color.captured_at) * 1000
+            else:
+                queue_ms = time() * 1000 - color.arrival if color.arrival is not None else None
             if queue_ms is None or not isfinite(queue_ms) or abs(queue_ms) > 3_600_000:
                 # Unsupported clock origins cannot be compared with wall time.
                 queue_ms = None
@@ -1057,7 +1083,7 @@ class CameraFeed:
                 'fusionMs': (after_tracking - after_alignment) * 1000,
                 'captureDroppedFrames': dropped,
                 'depthFrameAvailable': paired_depth is not None,
-                'frameAgeSource': 'hostArrival' if queue_ms is not None else 'dequeue',
+                'frameAgeSource': 'hostArrival' if color.captured_at is None and queue_ms is not None else 'dequeue',
             }
             self.publish(Frame(
                 sequence, at, tracking, hands, calibration_pose, len(samples),

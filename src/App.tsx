@@ -202,32 +202,36 @@ function CameraSettings({ navigation, performance }: { navigation: HandNavigatio
     <fieldset disabled={busy || !settings}>
       <legend>Camera settings</legend>
       {settings && draftFps !== null ? <>
+        {settings.cameraName && <p className="camera-option-note">{settings.cameraName}</p>}
         <label className="navigation-choice">Capture rate
-          <select value={draftFps} onChange={event => editDraft(Number(event.target.value))}>
+          <select value={draftFps} disabled={settings.frameRates.length === 1} onChange={event => editDraft(Number(event.target.value))}>
             {settings.frameRates.map(fps => <option key={fps} value={fps}>{fps} fps</option>)}
           </select>
         </label>
-        <p className="camera-option-note">Changing the capture rate restarts the camera.</p>
-        <button className="button" type="button" disabled={!changed || !validDraft} onClick={() => void apply()}>
-          {busy && <LoaderCircle size={15} className="camera-settings-spinner" />}{busy ? 'Applying…' : 'Apply and restart'}
-        </button>
+        {settings.frameRates.length > 1 && <>
+          <p className="camera-option-note">Changing the capture rate restarts the camera.</p>
+          <button className="button" type="button" disabled={!changed || !validDraft} onClick={() => void apply()}>
+            {busy && <LoaderCircle size={15} className="camera-settings-spinner" />}{busy ? 'Applying…' : 'Apply and restart'}
+          </button>
+        </>}
       </> : <p className="camera-option-note">Loading camera settings…</p>}
     </fieldset>
     {busy && <p className="camera-option-note" role="status">Restarting the camera with the requested settings…</p>}
     {issue && <p className="camera-settings-error" role="alert">{issue}</p>}
     {activeFps !== null && <dl className="camera-diagnostics" aria-label="Active camera diagnostics">
-      <div><dt>Active capture</dt><dd>{activeFps} fps</dd></div>
+      <div><dt>Configured capture</dt><dd>{activeFps} fps</dd></div>
       {!busy && metrics && [metrics.estimatedHands, metrics.depthHands, metrics.trackedHands].some(value => value !== undefined) && <div><dt>Hands</dt><dd>{metrics.estimatedHands ?? '—'} seen · {metrics.depthHands ?? '—'} depth · {metrics.trackedHands ?? '—'} tracked</dd></div>}
       {!busy && metrics?.poseFps !== undefined && <div><dt>Pose rate</dt><dd>{metrics.poseFps.toFixed(1)} fps</dd></div>}
       {!busy && metrics?.processingMs !== undefined && <div><dt>Processing</dt><dd>{metrics.processingMs.toFixed(1)} ms</dd></div>}
       {!busy && metrics?.processingP95Ms !== undefined && <div><dt>Processing p95</dt><dd>{metrics.processingP95Ms.toFixed(1)} ms</dd></div>}
       {!busy && metrics?.inferenceMs !== undefined && <div><dt>Bridge stages</dt><dd>{metrics.inferenceMs.toFixed(1)} ms inference · {metrics.alignmentMs?.toFixed(1) ?? '—'} ms align · {metrics.fusionMs?.toFixed(1) ?? '—'} ms fusion</dd></div>}
       {!busy && metrics?.queueMs !== undefined && <div><dt>Capture queue</dt><dd>{metrics.queueMs.toFixed(1)} ms</dd></div>}
-      {!busy && metrics?.frameAgeMs !== undefined && <div><dt>Pose age</dt><dd>{Math.round(metrics.frameAgeMs)} ms at bridge{metrics.frameAgeSource ? ` from ${metrics.frameAgeSource === 'hostArrival' ? 'host arrival' : 'SDK dequeue'}` : ''}</dd></div>}
+      {!busy && metrics?.frameAgeMs !== undefined && <div><dt>Pose age</dt><dd>{Math.round(metrics.frameAgeMs)} ms at bridge{metrics.frameAgeSource ? ` from ${metrics.frameAgeSource === 'hostArrival' ? 'host arrival' : 'capture dequeue'}` : ''}</dd></div>}
       {!busy && metrics?.captureDroppedFrames !== undefined && <div><dt>Capture skipped</dt><dd>{metrics.captureDroppedFrames} this session</dd></div>}
       {!busy && browser.deliveryFps !== undefined && <div><dt>Browser rate</dt><dd>{browser.deliveryFps.toFixed(1)} fps · {browser.skipped ?? 0} skipped in recent samples</dd></div>}
       {!busy && browser.receiptToSubmitMs !== undefined && <div><dt>Last interaction</dt><dd>{browser.receiptToSubmitMs.toFixed(1)} ms from receipt · {browser.poseToSubmitMs?.toFixed(1)} ms from pose to render submission (p95)</dd></div>}
     </dl>}
+    {!busy && settings?.depthError && <p className="camera-settings-error" role="status">{settings.depthError}</p>}
     {!busy && (rgbOnly || waitingForDepth || depthUnavailable) && <p className="camera-option-note">
       {rgbOnly ? 'RGB tracking active. Depth movement is paused.'
         : depthUnavailable ? 'Calibrated navigation is waiting for depth.' : 'Hand seen, waiting for palm depth.'}

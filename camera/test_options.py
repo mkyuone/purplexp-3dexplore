@@ -17,6 +17,7 @@ class SettingsFeed(StubFeed):
         self.options = CameraOptions()
         self.changes = 0
         self.model_available = True
+        self.frame_rates = [30, 60]
 
     def configure(self, options):
         self.options = options
@@ -29,11 +30,22 @@ class SettingsFeed(StubFeed):
         return {
             **self.options.to_dict(), 'applying': self.changes > 0,
             'sources': [{'value': 'rgb', 'label': 'RGB'}],
-            'trackers': [tracker], 'frameRates': [30, 60],
+            'trackers': [tracker], 'frameRates': self.frame_rates,
         }
 
 
 class CameraSettingsTests(TestCase):
+    def test_unsupported_capture_rate_leaves_settings_unchanged(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / 'settings.json'
+            feed = SettingsFeed()
+            feed.frame_rates = [30]
+            service = CameraService(feed, Profiles(Path(directory) / 'profiles.json'), path)
+            with self.assertRaisesRegex(ValueError, 'capture rate is unavailable'):
+                service.settings(CameraOptions(fps=60).to_dict())
+            self.assertFalse(path.exists())
+            self.assertEqual(feed.changes, 0)
+
     def test_depth_projector_is_enabled_even_if_it_was_previously_off(self):
         for initial in (0, 1):
             with self.subTest(initial=initial):

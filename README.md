@@ -19,7 +19,7 @@ Select a part or assembly to edit its **Display name**. To edit several at once,
 
 The startup mesh is generated from `src/models/ultraviolet-full-car.step` and preserves its assembly and face colors. Its default display names come from `src/models/ultraviolet-part-display-names.csv`. Run `npm run model:generate` after editing the STEP. The production build checks that the generated mesh and display names match the assembly.
 
-## Set up a RealSense hand camera
+## Set up the hand camera
 
 Install the camera service in a Python environment that supports the pinned RealSense and MediaPipe packages. Run these commands from the project directory after activating that environment.
 
@@ -28,6 +28,23 @@ python -m pip install -r camera/requirements.txt
 python camera/download_rgb_models.py
 python -B camera/server.py --model .runtime/camera/hand_landmarker.task
 ```
+
+This command uses the RealSense D435i by default.
+
+### Orbbec Astra Pro on Linux
+
+The original Astra Pro exposes its RGB camera (USB `2bc5:0501`) through V4L2 and its depth camera (`2bc5:0403`) through OpenNI2. The bridge pairs the devices through the Astra Pro's internal USB hub and requests 640×480 at 30 fps.
+
+Extract the Linux [Orbbec OpenNI2 2.3.0.86 SDK](https://www.orbbec.com/developers/openni-sdk/) for your CPU architecture. Pass the extracted `sdk/libs` directory, including its `OpenNI2/Drivers` subdirectory, to the bridge. If the SDK is under `.runtime/camera/openni2/sdk`, the flag is optional.
+
+```sh
+python -B camera/server.py --camera astra --model .runtime/camera/hand_landmarker.task \
+  --openni2-dir /path/to/OpenNI/sdk/libs
+```
+
+The bridge runs as your regular user. If Linux denies access to depth, grant that user read/write access to the `2bc5:0403` USB node or configure a udev rule for that ID. Operator settings reports the device path when access is denied. RGB tracking works in fuzzy navigation while depth is unavailable. The Astra Pro uses its own saved camera and calibration settings. Use `--astra-usb-port` to select a hub if multiple Astra Pros are connected.
+
+### Connect and calibrate
 
 Open [Operator settings](http://localhost:4180/operator) and use **Hand camera → Connect**. It starts in **Fuzzy · no calibration** mode with a live mirrored preview on the operator page. The visitor preview is off by default. Enable **Show hand camera preview in the exhibit** to show it for visitors. The browser remembers that choice. Choose **Open exhibit** and bring one relaxed open hand into view. Move it across the central camera area to aim, pinch to move a part, or make a fist to orbit. With one fist held, pull your hand toward yourself to zoom in and push it toward the camera to zoom out. With two fists, move them together to pan or change the distance between them to zoom. Add a second pinch to resize and rotate a part. The cursor is mirrored and smoothed, with a small dead zone to reduce jitter. Depth adapts while your hands are open and stays fixed during a grip.
 
@@ -45,11 +62,11 @@ Optional calibration is saved per camera and display. If the camera or display m
 
 ### Camera settings
 
-**Operator settings → Hand camera → Camera settings** offers 30 or 60 fps capture. Select **Apply and restart** to activate a choice. The camera uses RGB with the depth projector enabled and MediaPipe Full for hand tracking. Capture settings persist on the local camera service.
+**Operator settings → Hand camera → Camera settings** shows the active camera and configured capture rate. The RealSense D435i offers 30 or 60 fps. Select **Apply and restart** to change it. The Astra Pro uses the 30 fps capture mode. Both use RGB and MediaPipe Full for hand tracking. Capture settings persist on the local camera service.
 
-**Operator settings → Hand camera → Diagnostics** opens [a separate page](http://localhost:4180/diagnostics) with live MediaPipe landmarks on RGB, per-hand grip and depth readings, and the two infrared previews. Camera diagnostics stay local and do not record frames.
+**Operator settings → Hand camera → Diagnostics** opens [a separate page](http://localhost:4180/diagnostics) with live MediaPipe landmarks on RGB and per-hand grip and depth readings. The Astra Pro supplies one infrared preview and the D435i supplies two. Infrared previews start on demand when Diagnostics is visible. Camera diagnostics stay local and do not record frames.
 
-Start at 30 fps. The capture setting is the sensor rate, **Pose rate** counts tracker output, and **Browser rate** counts delivered updates. When comparing 60 fps, check pose age and skipped frames as well as how the controls feel. Move a part or the view in the exhibit, then use the browser’s Back button to return to the operator page and see render-submission timings. Those timings end when the browser submits the draw, before it reaches the display.
+Start at 30 fps. The capture setting is the requested sensor rate, **Pose rate** counts tracker output, and **Browser rate** counts delivered updates. When comparing 60 fps, check pose age and skipped frames as well as how the controls feel. Move a part or the view in the exhibit, then use the browser’s Back button to return to the operator page and see render-submission timings. Those timings end when the browser submits the draw, before it reaches the display.
 
 ## Head-coupled perspective experiment
 

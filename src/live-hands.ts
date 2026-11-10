@@ -3,10 +3,12 @@ import type { HandPose, PoseFrame } from './gestures';
 export type HandNavigation = 'fuzzy' | 'calibrated';
 
 export type HandCameraSettings = {
+  cameraName?: string;
   fps: number;
   frameRates: number[];
   applying: boolean;
   error?: string;
+  depthError?: string;
   diagnostics?: {
     poseFps?: number; processingMs?: number; frameAgeMs?: number;
     estimatedHands?: number; depthHands?: number; trackedHands?: number;
@@ -62,9 +64,11 @@ function readCameraSettings(value: unknown): HandCameraSettings {
   const finiteMetric = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
   const handCount = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
   return {
+    cameraName: typeof settings.cameraName === 'string' ? settings.cameraName : undefined,
     fps: settings.fps,
     frameRates: settings.frameRates,
     applying: settings.applying, error: typeof settings.error === 'string' ? settings.error : undefined,
+    depthError: typeof settings.depthError === 'string' ? settings.depthError : undefined,
     diagnostics: metrics && typeof metrics === 'object' ? {
       poseFps: finiteMetric(metrics.poseFps), processingMs: finiteMetric(metrics.processingMs), frameAgeMs: finiteMetric(metrics.frameAgeMs),
       estimatedHands: handCount(metrics.estimatedHands), depthHands: handCount(metrics.depthHands), trackedHands: handCount(metrics.trackedHands),

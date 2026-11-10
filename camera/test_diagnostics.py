@@ -16,6 +16,8 @@ from tracking import Candidate, GripFeatures, Hand, Track
 
 
 class DiagnosticFeed(StubFeed):
+    infrared_count = 2
+
     def __init__(self):
         super().__init__()
         self.error = None
@@ -80,7 +82,7 @@ class DiagnosticsTests(TestCase):
             self.assertIn(b'Cache-Control: no-store', headers)
             self.assertEqual(loads(data), {
                 'status': 'ready', 'hands': [{'side': 'Left', 'grip': 'pinch', 'depthMm': 423, 'gapMm': 11, 'confidence': .91}],
-                'unassignedHands': 1, 'infraredMessage': 'Waiting for IR 2.',
+                'unassignedHands': 1, 'infraredCount': 2, 'infraredMessage': 'Waiting for IR 2.',
             })
             self.assertEqual(request(service, 'OPTIONS', '/diagnostics/frame?stream=rgb')[0], 204)
             for stream in ('rgb', 'ir1'):

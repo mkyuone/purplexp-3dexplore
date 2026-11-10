@@ -1,4 +1,4 @@
-"""Loopback bridge for the Spatial CAD Explorer's D435i pose and calibration API."""
+"""Loopback bridge for the Spatial CAD Explorer's hand pose and calibration API."""
 
 from argparse import ArgumentParser
 from collections.abc import Callable
@@ -28,8 +28,8 @@ from realsense import CameraFeed, CameraInfo, FRAME_MAX_AGE, Frame, Snapshot
 PORT = 4182
 POSE_WAIT_SECONDS = 0.09
 POSE_RECOVERY_TIMEOUT = 0.65
-WAITING_FOR_FRAMES = 'Waiting for fresh D435i frames. Check the camera connection if this persists.'
-WAITING_FOR_DEPTH = 'Waiting for the RealSense depth stream. Fuzzy navigation is available.'
+WAITING_FOR_FRAMES = 'Waiting for fresh camera frames. Check the camera connection if this persists.'
+WAITING_FOR_DEPTH = 'Waiting for the camera depth stream. Fuzzy navigation is available.'
 CALIBRATION_TIMEOUT = 120.0
 OPERATOR_PREVIEW_TIMEOUT = 6.0
 MAX_OPERATOR_PREVIEWS = 8
@@ -255,8 +255,11 @@ class CameraService:
         with self.lock:
             if value is not None:
                 options = CameraOptions.from_dict(value)
+                settings = self.feed.settings()
+                if options.fps not in settings['frameRates']:
+                    raise ValueError('The selected capture rate is unavailable for this camera.')
                 available = next(
-                    (choice for choice in self.feed.settings()['trackers'] if choice['value'] == options.tracker),
+                    (choice for choice in settings['trackers'] if choice['value'] == options.tracker),
                     None,
                 )
                 if available is None or not available['available']:
@@ -426,7 +429,10 @@ class CameraService:
             reset_suppressed = self.suppress_capture_thumb(snapshot.info, snapshot.frame)
         observations = snapshot.frame.hand_diagnostics
         hands = [hand.row() for hand in observations if hand.side is not None]
-        result = {'status': 'ready', 'hands': hands, 'unassignedHands': len(observations) - len(hands)}
+        result = {
+            'status': 'ready', 'hands': hands, 'unassignedHands': len(observations) - len(hands),
+            'infraredCount': self.feed.infrared_count,
+        }
         if reset_suppressed:
             result['resetSuppressed'] = True
         if message := self.feed.infrared_status():
@@ -734,9 +740,18 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class BridgeServer(ThreadingHTTPServer):
-    def __init__(self, model: Path, serial: str | None, profiles: Path, port: int = PORT, settings: Path = DEFAULT_SETTINGS) -> None:
+    def __init__(
+        self, model: Path, serial: str | None, profiles: Path, port: int = PORT,
+        settings: Path = DEFAULT_SETTINGS, *, camera: str = 'realsense',
+        openni2_dir: Path | None = None, astra_usb_port: str | None = None,
+    ) -> None:
         super().__init__(('127.0.0.1', port), Handler)
-        self.feed = CameraFeed(model, serial, load_options(settings))
+        options = load_options(settings)
+        if camera == 'astra':
+            from astra import AstraFeed
+            self.feed = AstraFeed(model, options, openni2_dir, astra_usb_port)
+        else:
+            self.feed = CameraFeed(model, serial, options)
         self.service = CameraService(self.feed, Profiles(profiles), settings)
 
     def get_request(self):
@@ -753,17 +768,30 @@ class BridgeServer(ThreadingHTTPServer):
 def main() -> None:
     parser = ArgumentParser(description=__doc__)
     parser.add_argument('--model', required=True, type=Path, help='MediaPipe Hand Landmarker task file.')
+    parser.add_argument('--camera', choices=('realsense', 'astra'), default='realsense', help='Hand camera backend (default: realsense).')
     parser.add_argument('--serial', help='RealSense D435i serial number if more than one is connected.')
+    parser.add_argument('--openni2-dir', type=Path, help='Directory containing Orbbec OpenNI2 libOpenNI2.so and OpenNI2/Drivers.')
+    parser.add_argument('--astra-usb-port', help='Linux USB hub name for the Astra Pro if more than one is connected, e.g. 3-1.')
     parser.add_argument('--profiles', type=Path, default=DEFAULT_PROFILES, help='Path for saved calibration profiles.')
-    parser.add_argument('--settings', type=Path, default=DEFAULT_SETTINGS, help='Path for operator camera settings.')
+    parser.add_argument('--settings', type=Path, help='Override the settings file for the selected camera backend.')
     args = parser.parse_args()
+    if args.camera == 'astra' and args.serial:
+        parser.error('--serial applies to RealSense. Use --astra-usb-port for Astra Pro.')
+    if args.camera == 'realsense' and (args.openni2_dir or args.astra_usb_port):
+        parser.error('--openni2-dir and --astra-usb-port require --camera astra.')
+    settings = args.settings or (
+        DEFAULT_SETTINGS.with_name('settings-astra.json') if args.camera == 'astra' else DEFAULT_SETTINGS
+    )
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     def stop(signum, frame):
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, stop)
-    with BridgeServer(args.model.expanduser(), args.serial, args.profiles.expanduser(), settings=args.settings.expanduser()) as server:
-        logging.info('D435i pose bridge on http://127.0.0.1:%d', PORT)
+    with BridgeServer(
+        args.model.expanduser(), args.serial, args.profiles.expanduser(), settings=settings.expanduser(),
+        camera=args.camera, openni2_dir=args.openni2_dir, astra_usb_port=args.astra_usb_port,
+    ) as server:
+        logging.info('%s pose bridge on http://127.0.0.1:%d', server.feed.camera_name, PORT)
         try:
             server.serve_forever()
         except KeyboardInterrupt:

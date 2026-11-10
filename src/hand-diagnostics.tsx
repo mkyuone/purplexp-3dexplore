@@ -26,6 +26,7 @@ type HandReading = {
 type DiagnosticsStatus = {
   status: 'ready' | 'offline' | 'waiting';
   message?: string;
+  infraredCount?: number;
   infraredMessage?: string;
   unassignedHands?: number;
   resetSuppressed?: boolean;
@@ -210,6 +211,9 @@ export default function HandDiagnostics() {
   const reading = useDiagnosticsStatus(visible);
   const enabled = visible && reading?.status !== 'offline';
   const placeholder = visible ? 'Camera offline' : 'Preview paused';
+  const hasSecondInfrared = reading?.infraredCount !== 1;
+  const secondInfraredPlaceholder = !enabled ? placeholder
+    : hasSecondInfrared ? 'Waiting for frames…' : 'This camera has one infrared sensor.';
   const phase = !visible ? 'paused' : reading?.status ?? 'waiting';
   const status = !visible ? 'Previews paused' : reading?.message || (
     phase === 'ready' ? 'Camera connected' : phase === 'offline' ? 'Camera offline' : 'Connecting to the camera…'
@@ -230,7 +234,8 @@ export default function HandDiagnostics() {
       <CameraTile stream="ir1" title="Infrared 1" alt="Live preview from infrared sensor 1"
         enabled={enabled} placeholder={placeholder} unavailable={reading?.infraredMessage} />
       <CameraTile stream="ir2" title="Infrared 2" alt="Live preview from infrared sensor 2"
-        enabled={enabled} placeholder={placeholder} unavailable={reading?.infraredMessage} />
+        enabled={enabled && reading?.status === 'ready' && hasSecondInfrared}
+        placeholder={secondInfraredPlaceholder} unavailable={reading?.infraredMessage} />
     </div>
   </main>;
 }
