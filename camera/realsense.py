@@ -13,7 +13,7 @@ from uuid import uuid4
 import logging
 
 from calibration import MAX_DEPTH_M, MIN_DEPTH_M, Pose, Vec3, median_point, valid_point
-from diagnostics import DiagnosticHand, diagnostic_hands, encode_diagnostic_rgb, hand_overlay, matching_track
+from diagnostics import DiagnosticHand, HandDiagnosticNotes, diagnostic_hands, encode_diagnostic_rgb, hand_overlay, matching_track
 from estimators import is_thumbs_up
 from infrared_preview import INFRARED_INDEXES, InfraredEncoder, InfraredPreview
 from options import CameraOptions
@@ -70,6 +70,7 @@ class Frame:
     diagnostics: dict | None = None
     thumb_depth_m: float | None = None
     hand_diagnostics: tuple[DiagnosticHand, ...] = ()
+    visitor: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -157,6 +158,40 @@ def patch_depth(np, depth, x: int, y: int, units: float, near: float | None = No
     return center
 
 
+def visitor_hand_image(np, rgb, body):
+    points = [point for arm in (body.left, body.right)
+              for point in (arm.shoulder, arm.elbow, arm.wrist) if valid_image(point)]
+    points.append(body.center)
+    padding = max(.16, body.scale * .85)
+    height, width = rgb.shape[:2]
+    x, y = zip(*points)
+    left, right = max(0, int((min(x) - padding) * width)), min(width, round((max(x) + padding) * width))
+    top, bottom = max(0, int((min(y) - padding) * height)), min(height, round((max(y) + padding) * height))
+    if left == top == 0 and right == width and bottom == height:
+        return rgb
+    # Keep MediaPipe's previous hand rectangles in the same coordinate system.
+    masked = np.zeros_like(rgb)
+    masked[top:bottom, left:right] = rgb[top:bottom, left:right]
+    return masked
+
+
+def visitor_pose_depth(np, depth, bodies):
+    pixels = np.asanyarray(depth.get_data())
+    height, width = pixels.shape
+    units = depth.get_units()
+
+    def measure(point):
+        if point is None or not all(0 <= value < 1 for value in point):
+            return None
+        return patch_depth(np, pixels, int(point[0] * width), int(point[1] * height), units)
+
+    return tuple(replace(
+        body, depth_m=measure(body.center),
+        left=replace(body.left, wrist_depth_m=measure(body.left.wrist)),
+        right=replace(body.right, wrist_depth_m=measure(body.right.wrist)),
+    ) for body in bodies)
+
+
 def locate_depth(
     rs, np, depth, intrinsics, units: float, x: float, y: float, near: float | None,
     sample: tuple[float, float] | None = None, *, deproject=None,
@@ -180,11 +215,16 @@ def locate_depth(
 def fuse_hand(
     rs, np, image_landmarks, world_landmarks, handedness, aligned_depth,
     features_override=None, *, image_size=RGB_SIZE, deproject=None, measure_thumb_depth=False,
+    notes: HandDiagnosticNotes | None = None,
 ) -> Candidate | None:
     if len(image_landmarks) != 21:
+        if notes is not None:
+            notes.rejection = 'Incomplete RGB landmarks.'
         return None
     features = features_override or grip_features([(point.x, point.y, point.z) for point in world_landmarks])
     if features is None:
+        if notes is not None:
+            notes.rejection = 'MediaPipe hand shape was unusable.'
         return None
     depth = np.asanyarray(aligned_depth.get_data()) if aligned_depth else None
     width, height = image_size if depth is None else (depth.shape[1], depth.shape[0])
@@ -220,7 +260,11 @@ def fuse_hand(
     visible_palm = (valid_image((wrist.x, wrist.y)) and valid_image(image_palm)
                     and sum(valid_image((base.x, base.y)) for base in palm_bases) >= 2)
     optical_sample = sample if visible_palm else None
+    if notes is not None and not visible_palm:
+        notes.rejection = 'Wrist or palm landmarks are missing or outside the RGB frame.'
     if depth is None:
+        if notes is not None:
+            notes.depth_issue = 'No aligned depth frame.'
         return optical_sample
 
     intrinsics = aligned_depth.profile.as_video_stream_profile().intrinsics if deproject is None else None
@@ -232,9 +276,13 @@ def fuse_hand(
 
     palm_points = [point for x, y in palm_rays if (point := locate(x, y)) is not None]
     if len(palm_points) < 2:
+        if notes is not None:
+            notes.depth_issue = 'Too few valid palm depth samples.'
         return optical_sample
     palm = median_point(palm_points)
     if sum(abs(point[2] - palm[2]) <= 0.055 for point in palm_points) < 2:
+        if notes is not None:
+            notes.depth_issue = 'Palm depth samples disagree.'
         return optical_sample
 
     def fingertip_pad(tip_index: int, joint_index: int) -> Vec3 | None:
@@ -286,6 +334,13 @@ def fuse_hand(
             measured_thumb = thumb_pad
         if measured_thumb is not None and valid_point(measured_thumb):
             thumb_depth_m = measured_thumb[2]
+    if notes is not None:
+        if tip is None:
+            notes.depth_issue = 'No valid index fingertip depth.'
+        elif thumb_tip is None:
+            notes.depth_issue = 'No valid thumb depth.'
+        elif gap is None:
+            notes.depth_issue = 'Fingertip depth samples disagree.'
     return replace(
         sample, pose=Pose(tip or palm, palm), pinch_gap=gap, pointing=tip is not None,
         thumbs_up=thumbs_up, thumb_depth_m=thumb_depth_m, pinch_gap_corroborated=gap_corroborated,
@@ -664,6 +719,7 @@ class CameraFeed:
         self.diagnostic_rgb_until = 0.0
         self.next_diagnostic_rgb_at = 0.0
         self.thumb_depth_until = 0.0
+        self.reach_calibration_until = 0.0
         self.error: str | None = None
         self.depth_error: str | None = None
         self.options = options
@@ -687,6 +743,7 @@ class CameraFeed:
             self.diagnostic_rgb = None
             self.next_diagnostic_rgb_at = 0.0
             self.thumb_depth_until = 0.0
+            self.reach_calibration_until = 0.0
             self.history.clear()
             self.gesture_history.clear()
             self.frame_times.clear()
@@ -823,6 +880,10 @@ class CameraFeed:
         with self.lock:
             self.thumb_depth_until = monotonic() + THUMB_DEPTH_LEASE
 
+    def request_reach_calibration(self) -> None:
+        with self.lock:
+            self.reach_calibration_until = monotonic() + THUMB_DEPTH_LEASE
+
     def thumb_depth_requested(self) -> bool:
         with self.lock:
             return monotonic() < self.thumb_depth_until
@@ -910,6 +971,7 @@ class CameraFeed:
                     self.diagnostic_rgb = None
                     self.next_diagnostic_rgb_at = 0.0
                     self.thumb_depth_until = 0.0
+                    self.reach_calibration_until = 0.0
                     self.error = message
                     self.depth_error = None
                     self.changed.notify_all()
@@ -928,7 +990,6 @@ class CameraFeed:
             cv2 = None
             logging.warning('Camera preview requires OpenCV, installed with MediaPipe.')
 
-        from estimators import create_estimator
         with self.lock:
             options = self.options
         context = rs.context()
@@ -944,10 +1005,7 @@ class CameraFeed:
 
         serial = devices[0].get_info(rs.camera_info.serial_number)
         with ExitStack() as resources:
-            try:
-                estimator = resources.enter_context(create_estimator(options.tracker, self.model))
-            except (RuntimeError, ValueError) as error:
-                raise CameraError(str(error)) from error
+            estimator, pose_estimator, visitor_estimator = self.open_estimators(resources, options)
             if not self.wanted(revision):
                 return
             device = devices[0]
@@ -968,7 +1026,22 @@ class CameraFeed:
                                 infrared=self.infrared, cv2=cv2, np=np)
             resources.callback(depth.close)
             preview, diagnostic_rgb = self.open_previews(resources, cv2, session)
-            self.track_frames(rs, np, estimator, color_queue, depth, align, revision, preview, diagnostic_rgb)
+            self.track_frames(rs, np, estimator, color_queue, depth, align, revision, preview, diagnostic_rgb,
+                              pose_estimator=pose_estimator, visitor_estimator=visitor_estimator)
+
+    def open_estimators(self, resources: ExitStack, options: CameraOptions):
+        from estimators import create_estimator
+        try:
+            pose_estimator = None
+            visitor_estimator = None
+            if options.interaction == 'visitors':
+                from visitor_pose import create_pose_estimator
+                pose_estimator = resources.enter_context(create_pose_estimator())
+                visitor_estimator = resources.enter_context(create_estimator(options.tracker, self.model, num_hands=4))
+            estimator = resources.enter_context(create_estimator(options.tracker, self.model))
+            return estimator, pose_estimator, visitor_estimator
+        except (RuntimeError, ValueError) as error:
+            raise CameraError(str(error)) from error
 
     def begin_session(self, revision: int, options: CameraOptions, serial: str) -> str | None:
         with self.lock:
@@ -996,11 +1069,17 @@ class CameraFeed:
         return preview, diagnostic
 
     def track_frames(self, rs, np, estimator, color_queue, depth_stream, align, revision,
-                     preview=None, diagnostic_rgb=None, *, read_color=None) -> None:
+                     preview=None, diagnostic_rgb=None, *, read_color=None, pose_estimator=None,
+                     visitor_estimator=None) -> None:
         if read_color is None:
             def read_color(frame):
                 return CameraSample.read(rs, frame)
         tracker = HandTracker()
+        ownership = None
+        if pose_estimator is not None:
+            from visitor_ownership import VisitorOwnership
+            ownership = VisitorOwnership()
+        setup_active = False
         sequence = 0
         previous_number = None
         previous_timestamp = -1
@@ -1042,7 +1121,28 @@ class CameraFeed:
             previous_timestamp = timestamp
             rgb = np.ascontiguousarray(frame.get_data())
             before_inference = monotonic()
-            detections = estimator.detect(rgb, timestamp)
+            bodies = ()
+            pose_sample = None
+            thumb_depth = None
+            hand_estimator = estimator
+            hand_image = rgb
+            if ownership is not None:
+                thumb_depth = self.thumb_depth_requested()
+                in_setup = thumb_depth or before_inference < self.reach_calibration_until
+                if in_setup != setup_active:
+                    tracker.reset()
+                    if in_setup:
+                        ownership.suspend()
+                    setup_active = in_setup
+                if not setup_active:
+                    pose_sample = pose_estimator.update(rgb, at)
+                    bodies = pose_sample.bodies if pose_sample is not None else ()
+                    owner = ownership.preview_owner(bodies, at)
+                    if owner is not None:
+                        hand_image = visitor_hand_image(np, rgb, owner)
+                    elif visitor_estimator is not None:
+                        hand_estimator = visitor_estimator
+            detections = hand_estimator.detect(hand_image, timestamp)
             after_inference = monotonic()
             try:
                 paired_depth, project = depth_stream.match(color)
@@ -1052,23 +1152,50 @@ class CameraFeed:
                 # the frame was queued. Keep publishing the fresh RGB pose.
                 depth = paired_depth = project = None
             after_alignment = monotonic()
-            measure_thumb_depth = len(detections) == 1 and self.thumb_depth_requested()
+            measure_thumb_depth = len(detections) == 1 and (
+                self.thumb_depth_requested() if thumb_depth is None else thumb_depth
+            )
+            notes = [HandDiagnosticNotes() for _ in detections] if after_alignment < self.hand_diagnostics_until else None
             samples = [
                 fuse_hand(rs, np, hand.landmarks, [], hand.handedness, depth, hand.features,
-                          deproject=project, measure_thumb_depth=measure_thumb_depth)
-                for hand in detections
+                          deproject=project, measure_thumb_depth=measure_thumb_depth,
+                          notes=notes[index] if notes is not None else None)
+                for index, hand in enumerate(detections)
             ]
             if not self.wanted(revision):
                 return
-            tracking, hands = tracker.update(samples, at)
+            rejections = {} if notes is not None else None
+            visitor = None
+            tracking_samples = samples
+            if ownership is not None:
+                if setup_active:
+                    visitor = {'phase': 'ready', 'revision': ownership.revision,
+                               'reason': 'Camera setup is in progress.'}
+                else:
+                    if depth is not None and pose_sample is not None and 0 <= at - pose_sample.at <= .11:
+                        bodies = visitor_pose_depth(np, depth, bodies)
+                    previous_turn = ownership.revision
+                    turn = ownership.update(bodies, detections, samples, at)
+                    visitor = turn.to_dict()
+                    if turn.revision != previous_turn:
+                        tracker.reset()
+                    tracking_samples = [samples[index] for index in turn.indices]
+                    if rejections is not None:
+                        for index, sample in enumerate(samples):
+                            if sample is not None and index not in turn.indices:
+                                rejections[id(sample)] = turn.reason or 'Hand is outside the active visitor’s turn.'
+            tracking, hands = tracker.update(tracking_samples, at, rejections=rejections)
+            if visitor is not None and visitor['phase'] == 'paused':
+                tracking = 'ambiguous'
             after_tracking = monotonic()
             preview_due = preview is not None and self.preview_due(at)
             diagnostic_rgb_due = diagnostic_rgb is not None and self.diagnostic_rgb_due(at)
-            diagnostics_due = after_tracking < self.hand_diagnostics_until or diagnostic_rgb_due
+            diagnostics_due = notes is not None or diagnostic_rgb_due
             current_tracks = ()
             if preview_due or diagnostics_due:
                 current_tracks = tuple(track for track in tracker.tracks if track.published and track.observed_at == at)
-            observed = diagnostic_hands(detections, samples, current_tracks) if diagnostics_due else ()
+            observed = diagnostic_hands(detections, samples, current_tracks, notes=notes,
+                                        rejections=rejections) if diagnostics_due else ()
             # Calibration observes a single depth-valid pointing hand even
             # when the live gesture classifier briefly reads a grip.
             sample = samples[0] if len(samples) == 1 else None
@@ -1076,7 +1203,7 @@ class CameraFeed:
             sequence += 1
             diagnostics = {
                 'depthHands': sum(sample is not None and sample.pose is not None for sample in samples),
-                'model': dict(getattr(estimator, 'diagnostics', {})),
+                'model': dict(getattr(hand_estimator, 'diagnostics', {})),
                 'queueMs': queue_ms,
                 'inferenceMs': (after_inference - before_inference) * 1000,
                 'alignmentMs': (after_alignment - after_inference) * 1000,
@@ -1090,6 +1217,7 @@ class CameraFeed:
                 (monotonic() - dequeued_at) * 1000, diagnostics,
                 thumb_depth_m=sample.thumb_depth_m if sample is not None else None,
                 hand_diagnostics=observed,
+                visitor=visitor,
             ), revision)
             if preview_due:
                 markers = preview_markers([hand.landmarks for hand in detections], samples, current_tracks,

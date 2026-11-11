@@ -85,6 +85,7 @@
 
 .diagnostics-hands thead th { color: var(--muted); font-weight: 550; }
 .diagnostics-hands tbody th { font-weight: 650; white-space: nowrap; }
+.diagnostics-grip-reason { display: block; margin-block-start: 3px; color: var(--muted); font-size: 12px; line-height: 1.4; }
 
 .diagnostics-hand-dot {
   display: inline-block;

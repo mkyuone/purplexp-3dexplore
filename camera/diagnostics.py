@@ -19,6 +19,12 @@ HAND_COLORS = {'Left': (193, 239, 111), 'Right': (255, 166, 204), None: (91, 207
 HandOverlay = tuple[str | None, tuple[Vec2 | None, ...]]
 
 
+@dataclass(slots=True)
+class HandDiagnosticNotes:
+    rejection: str | None = None
+    depth_issue: str | None = None
+
+
 @dataclass(frozen=True)
 class DiagnosticHand:
     side: str | None
@@ -26,11 +32,14 @@ class DiagnosticHand:
     depth_mm: int | None
     gap_mm: int | None
     confidence: float | None
+    reason: str | None = None
 
     def row(self) -> dict:
         data = {'side': self.side, 'grip': self.grip, 'depthMm': self.depth_mm, 'gapMm': self.gap_mm}
         if self.confidence is not None:
             data['confidence'] = self.confidence
+        if self.reason is not None:
+            data['reason'] = self.reason
         return data
 
 
@@ -44,10 +53,11 @@ def matching_track(sample: Candidate | None, tracks: tuple[Track, ...]) -> Track
 
 def diagnostic_hands(
     detections: list[EstimatedHand], samples: list[Candidate | None], tracks: tuple[Track, ...],
+    *, notes: list[HandDiagnosticNotes] | None = None, rejections: dict[int, str] | None = None,
 ) -> tuple[DiagnosticHand, ...]:
     result = []
     assigned = {}
-    for estimate, sample in zip(detections, samples):
+    for index, (estimate, sample) in enumerate(zip(detections, samples)):
         track = matching_track(sample, tracks)
         label = estimate.handedness[0] if estimate.handedness else None
         side = track.side if track is not None and track.side in ('Left', 'Right') else None
@@ -58,12 +68,22 @@ def diagnostic_hands(
             if side == label.category_name:
                 confidence = round(label.score, 3)
         grip = 'untracked'
+        reason = None
         if track is not None:
             hand = track.hand
             grip = 'thumbs up' if hand.thumbs_up else 'pinch pending' if hand.pinch_pending else hand.grip
+        elif notes is not None:
+            note = notes[index]
+            if sample is None:
+                reason = note.rejection
+            elif rejections is not None:
+                reason = rejections.get(id(sample))
+            reason = reason or 'No fresh track matched this observation.'
+            if note.depth_issue:
+                reason = f'{reason} {note.depth_issue}'
         depth = sample.pose.palm[2] if sample is not None and sample.pose is not None else None
         gap = sample.pinch_gap if sample is not None else None
-        row = DiagnosticHand(side, grip, to_mm(depth), to_mm(gap), confidence)
+        row = DiagnosticHand(side, grip, to_mm(depth), to_mm(gap), confidence, reason)
         if side is not None and side in assigned:
             previous = assigned[side]
             prior = result[previous]

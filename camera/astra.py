@@ -10,7 +10,6 @@ import logging
 
 from astra_depth import AstraDepthError, open_depth
 from astra_rgb import AstraRgbError, discover_astra, open_rgb
-from estimators import create_estimator
 from infrared_preview import InfraredPreview
 from options import CameraOptions
 from realsense import CameraError, CameraFeed, CameraSample, DEPTH_QUEUE_SIZE, DEPTH_RETRY_DELAY, ImageProjector, RGB_SIZE, STREAM_TIMEOUT
@@ -162,10 +161,7 @@ class AstraFeed(CameraFeed):
         try:
             device = discover_astra(usb_parent=self.usb_port)
             with ExitStack() as resources:
-                try:
-                    estimator = resources.enter_context(create_estimator(options.tracker, self.model))
-                except (RuntimeError, ValueError) as error:
-                    raise CameraError(str(error)) from error
+                estimator, pose_estimator, visitor_estimator = self.open_estimators(resources, options)
                 if not self.wanted(revision):
                     return
                 color = resources.enter_context(open_rgb(cv2, device))
@@ -189,7 +185,8 @@ class AstraFeed(CameraFeed):
                 resources.callback(depth.close)
                 preview, diagnostic_rgb = self.open_previews(resources, cv2, session)
                 self.track_frames(None, np, estimator, color, depth, align_depth, revision, preview, diagnostic_rgb,
-                                  read_color=read_color)
+                                  read_color=read_color, pose_estimator=pose_estimator,
+                                  visitor_estimator=visitor_estimator)
         except AstraRgbError as error:
             raise CameraError(str(error)) from error
 

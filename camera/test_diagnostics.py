@@ -7,12 +7,12 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from calibration import Pose
-from diagnostics import DiagnosticHand, diagnostic_hands, hand_overlay
+from diagnostics import DiagnosticHand, HandDiagnosticNotes, diagnostic_hands, hand_overlay
 from estimators import EstimatedHand, HandSide
-from realsense import CameraFeed, CameraInfo, Frame, Snapshot
+from realsense import CameraFeed, CameraInfo, Frame, Snapshot, fuse_hand
 from server import CameraService, Handler, Profiles
 from test_preview import JPEG, StubFeed, request
-from tracking import Candidate, GripFeatures, Hand, Track
+from tracking import Candidate, GripFeatures, Hand, HandTracker, Track
 
 
 class DiagnosticFeed(StubFeed):
@@ -41,6 +41,49 @@ class DiagnosticFeed(StubFeed):
 
 
 class DiagnosticsTests(TestCase):
+    def test_untracked_reason_distinguishes_fusion_failure_from_pending_pinch(self):
+        tracker = HandTracker()
+        features = GripFeatures(.8, 0, 0)
+        point = SimpleNamespace(x=.3, y=.5)
+        wrist_outside = [SimpleNamespace(x=-.1, y=.5), *([point] * 20)]
+        notes = [HandDiagnosticNotes(), HandDiagnosticNotes()]
+        clipped = fuse_hand(None, None, wrist_outside, [], [], None, features, notes=notes[0])
+        pinch = Candidate(None, 'Right', GripFeatures(.17, 0, 0), None, False, (.7, .45), (.7, .5), .12)
+        estimates = [
+            EstimatedHand(wrist_outside, features, (HandSide('Left', .95),)),
+            EstimatedHand([point] * 21, pinch.features, (HandSide('Right', .94),)),
+        ]
+        samples = [clipped, pinch]
+        rejections = {}
+        tracker.update(samples, 1.0, rejections=rejections)
+        current = tuple(track for track in tracker.tracks if track.published and track.observed_at == 1.0)
+        rows = diagnostic_hands(estimates, samples, current, notes=notes, rejections=rejections)
+        self.assertEqual(rows[0].row()['reason'],
+                         'Wrist or palm landmarks are missing or outside the RGB frame. No aligned depth frame.')
+        self.assertEqual(rows[1].row()['reason'], 'Waiting for pinch confirmation.')
+        self.assertTrue(all(row.grip == 'untracked' for row in rows))
+
+        tracker.update(samples, 1.05, rejections={})
+        current = tuple(track for track in tracker.tracks if track.published and track.observed_at == 1.05)
+        tracked = diagnostic_hands(estimates, samples, current, notes=notes)
+        self.assertEqual(tracked[1].grip, 'pinch')
+        self.assertNotIn('reason', tracked[1].row())
+
+    def test_overlapping_hands_report_ambiguity_despite_measured_depth(self):
+        tracker = HandTracker()
+        features = GripFeatures(.8, 0, 0)
+        samples = [
+            Candidate(Pose((x, 0, .6), (x, .04, .6)), side, features, .06, True, (.5, .4), (.5, .5))
+            for x, side in [(0, 'Left'), (.02, 'Right')]
+        ]
+        estimates = [EstimatedHand([], features, (HandSide(sample.side, .95),)) for sample in samples]
+        rejections = {}
+        self.assertEqual(tracker.update(samples, 1.0, rejections=rejections), ('ambiguous', ()))
+        rows = diagnostic_hands(estimates, samples, (), notes=[HandDiagnosticNotes(), HandDiagnosticNotes()],
+                                rejections=rejections)
+        self.assertEqual([row.row()['reason'] for row in rows], ['Palms are too close together in 3D.'] * 2)
+        self.assertEqual([row.depth_mm for row in rows], [600, 600])
+
     def test_reports_stable_anatomical_side_and_distinguishes_detection_from_tracking(self):
         pose = Pose((.1, .2, .4), (.12, .21, .423))
         features = GripFeatures(.2, 1, 2)

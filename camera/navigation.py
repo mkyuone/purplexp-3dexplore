@@ -41,6 +41,11 @@ def soft_axis(value: float, low: float, high: float) -> float:
     return value
 
 
+def fuzzy_image_aim(image: Vec2) -> Vec2:
+    x, y = image
+    return 1 - soft_axis(x, IMAGE_LEFT, IMAGE_RIGHT), soft_axis(y, IMAGE_TOP, IMAGE_BOTTOM)
+
+
 def depth_deadzone(previous: float, current: float) -> float:
     change = current - previous
     return previous + copysign(max(0.0, abs(change) - DEPTH_DEADZONE), change)
@@ -103,9 +108,7 @@ class FuzzyMapper:
 
         targets = []
         for hand in valid:
-            image_x, image_y = hand.image
-            x = 1 - soft_axis(image_x, IMAGE_LEFT, IMAGE_RIGHT)
-            y = soft_axis(image_y, IMAGE_TOP, IMAGE_BOTTOM)
+            x, y = fuzzy_image_aim(hand.image)
             depth = 0.0
             if hand.pose is not None:
                 if self.depth_range is None:

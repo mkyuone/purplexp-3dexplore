@@ -1,5 +1,5 @@
 import { memo, useEffect, useState, useSyncExternalStore } from 'react';
-import { handCameraUrl } from './live-hands';
+import { handCameraUrl, readVisitorTurn } from './live-hands';
 import './hand-diagnostics.css';
 
 const gripNames = {
@@ -20,6 +20,7 @@ type Stream = 'rgb' | 'ir1' | 'ir2';
 type HandReading = {
   side: Side;
   grip: keyof typeof gripNames;
+  reason?: string;
   depthMm: number | null;
   gapMm?: number | null;
 };
@@ -30,6 +31,7 @@ type DiagnosticsStatus = {
   infraredMessage?: string;
   unassignedHands?: number;
   resetSuppressed?: boolean;
+  visitor?: unknown;
   hands: HandReading[];
 };
 
@@ -177,17 +179,26 @@ function millimeters(value: number | null | undefined) {
 }
 
 function HandStatus({ reading }: { reading: DiagnosticsStatus | null }) {
+  const visitor = readVisitorTurn(reading?.visitor);
+  const visitorLabel = visitor?.phase === 'ready' ? 'Waiting for a visitor'
+    : visitor?.phase === 'claiming' ? 'Claiming control'
+      : visitor?.phase === 'active' ? 'Visitor has control' : 'Visitor control paused';
   return <section className="diagnostics-tile diagnostics-hands" aria-labelledby="diagnostics-hands-title">
     <h2 id="diagnostics-hands-title">Hand status</h2>
+    {visitor && <p className="diagnostics-hand-note">{visitorLabel}{visitor.reason ? ` · ${visitor.reason}` : ''}</p>}
     <table>
       <thead><tr><th scope="col">Hand</th><th scope="col">Grip</th><th scope="col">Palm depth</th><th scope="col">Pinch gap</th></tr></thead>
       <tbody>{sides.map(side => {
         const hand = reading?.status === 'ready' ? reading.hands.find(item => item?.side === side) : undefined;
         const grip = hand && Object.hasOwn(gripNames, hand.grip) ? gripNames[hand.grip] : undefined;
+        const reason = hand?.grip === 'untracked' && typeof hand.reason === 'string' ? hand.reason : undefined;
 
         return <tr key={side}>
           <th scope="row"><span className="diagnostics-hand-dot" data-side={side} aria-hidden="true" />{side}</th>
-          <td>{grip ?? (reading?.status === 'ready' ? 'Not detected' : '—')}</td>
+          <td>
+            {grip ?? (reading?.status === 'ready' ? 'Not detected' : '—')}
+            {reason && <span className="diagnostics-grip-reason">{reason}</span>}
+          </td>
           <td>{millimeters(hand?.depthMm)}</td>
           <td>{millimeters(hand?.gapMm)}</td>
         </tr>;

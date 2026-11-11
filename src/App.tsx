@@ -7,7 +7,7 @@ import { CadScene, type SurfaceFinishes } from './scene';
 import { GestureController, RESET_HOLD_MS, type GestureState } from './gestures';
 import { HandSimulator } from './simulator';
 import { AssemblyPanel, indexOccurrences, PartPanel } from './panels';
-import { applyHandCameraSettings, calibrateHands, connectLiveHands, fetchHandCameraSettings, handDisplayKey, type HandCameraSettings, type HandNavigation, type LiveHandStatus } from './live-hands';
+import { applyHandCameraSettings, calibrateHands, connectLiveHands, fetchHandCameraSettings, handDisplayKey, type HandCameraSettings, type HandInteraction, type HandNavigation, type LiveHandStatus, type VisitorTurn } from './live-hands';
 import { attachVisitorControls } from './visitor-controls';
 import { CalibrationPanel } from './calibration-panel';
 import { CameraPreview } from './camera-preview';
@@ -82,6 +82,7 @@ type LoadedAssembly = {
 };
 type GestureFeedback = Pick<GestureState, 'status' | 'target' | 'held' | 'hovered' | 'resetProgress'>;
 type CursorControls = { update: (state: GestureState) => void };
+type VisitorTurnControls = { update: (turn: VisitorTurn | undefined) => void };
 
 const HandCursors = memo(function HandCursors({ visible, controls }: { visible: boolean; controls: Ref<CursorControls> }) {
   const [state, setState] = useState<GestureState | null>(null);
@@ -98,6 +99,34 @@ const HandCursors = memo(function HandCursors({ visible, controls }: { visible: 
         {movingView ? (state.status === 'both' ? <Move size={25} /> : <Orbit size={25} />) : <Hand size={25} />}
       </div>;
     })}
+  </div>;
+});
+
+const VisitorTurnOverlay = memo(function VisitorTurnOverlay({
+  visible, controls,
+}: { visible: boolean; controls: Ref<VisitorTurnControls> }) {
+  const [turn, setTurn] = useState<VisitorTurn>();
+  useImperativeHandle(controls, () => ({ update: setTurn }), []);
+  if (!visible || !turn) return null;
+
+  if (turn.phase === 'active') {
+    return <>
+      <div className="visitor-pass" data-aiming={turn.passCursor !== undefined}>
+        <strong>Pass control</strong>
+        <span>Hold an open hand here</span>
+        <progress aria-label="Pass control progress" max={1} value={turn.passProgress ?? 0} />
+      </div>
+      {turn.passCursor && <div aria-hidden="true" className="visitor-pass-cursor"
+        style={{ left: `${turn.passCursor.x * 100}%`, top: `${turn.passCursor.y * 100}%` }}><Hand size={19} /></div>}
+    </>;
+  }
+
+  const message = turn.phase === 'ready' ? 'Stand in the center and raise an open hand to start.'
+    : turn.phase === 'claiming' ? 'Keep your hand open to start.'
+      : 'Control paused. Bring your hands back into view.';
+  return <div className="visitor-turn-hint">
+    <p role="status">{message}</p>
+    {turn.phase === 'claiming' && <progress aria-label="Claim control progress" max={1} value={turn.progress ?? 0} />}
   </div>;
 });
 
@@ -119,6 +148,7 @@ function CameraSettings({ navigation, performance }: { navigation: HandNavigatio
   const [browser, setBrowser] = useState(() => performance.read());
   const [activeFps, setActiveFps] = useState<number | null>(null);
   const [draftFps, setDraftFps] = useState<number | null>(null);
+  const [draftInteraction, setDraftInteraction] = useState<HandInteraction>();
   const [sending, setSending] = useState(false);
   const [pollError, setPollError] = useState<string | null>(null);
   const [applyError, setApplyError] = useState<string | null>(null);
@@ -127,8 +157,14 @@ function CameraSettings({ navigation, performance }: { navigation: HandNavigatio
     setSettings(next);
     if (!next.applying) {
       if (!next.error) setActiveFps(next.fps);
-      if (!dirty.current) setDraftFps(next.fps);
-    } else setDraftFps(current => current ?? next.fps);
+      if (!dirty.current) {
+        setDraftFps(next.fps);
+        setDraftInteraction(next.interaction);
+      }
+    } else {
+      setDraftFps(current => current ?? next.fps);
+      setDraftInteraction(current => current ?? next.interaction);
+    }
   }
 
   useEffect(() => {
@@ -162,11 +198,17 @@ function CameraSettings({ navigation, performance }: { navigation: HandNavigatio
 
   const busy = sending || settings?.applying === true;
   const validDraft = draftFps !== null && settings?.frameRates.includes(draftFps);
-  const changed = draftFps !== activeFps;
+  const changed = draftFps !== activeFps || draftInteraction !== settings?.interaction;
 
   function editDraft(fps: number) {
     dirty.current = true;
     setDraftFps(fps);
+    setApplyError(null);
+  }
+
+  function editInteraction(interaction: HandInteraction) {
+    dirty.current = true;
+    setDraftInteraction(interaction);
     setApplyError(null);
   }
 
@@ -178,10 +220,11 @@ function CameraSettings({ navigation, performance }: { navigation: HandNavigatio
     setSending(true);
     setApplyError(null);
     try {
-      const next = await applyHandCameraSettings(draftFps, controller.signal);
+      const next = await applyHandCameraSettings(draftFps, controller.signal, draftInteraction);
       if (controller.signal.aborted) return;
       dirty.current = false;
       setDraftFps(next.fps);
+      setDraftInteraction(next.interaction);
       receive(next);
       setPollError(null);
     } catch (cause) {
@@ -208,8 +251,14 @@ function CameraSettings({ navigation, performance }: { navigation: HandNavigatio
             {settings.frameRates.map(fps => <option key={fps} value={fps}>{fps} fps</option>)}
           </select>
         </label>
-        {settings.frameRates.length > 1 && <>
-          <p className="camera-option-note">Changing the capture rate restarts the camera.</p>
+        {settings.interaction !== undefined && <label className="navigation-choice">Visitor interaction
+          <select value={draftInteraction ?? settings.interaction} onChange={event => editInteraction(event.target.value as HandInteraction)}>
+            <option value="visitors">Visitor turns</option>
+            <option value="single-user">Single-user</option>
+          </select>
+        </label>}
+        {(settings.frameRates.length > 1 || settings.interaction !== undefined) && <>
+          <p className="camera-option-note">Applying camera settings restarts the camera.</p>
           <button className="button" type="button" disabled={!changed || !validDraft} onClick={() => void apply()}>
             {busy && <LoaderCircle size={15} className="camera-settings-spinner" />}{busy ? 'Applying…' : 'Apply and restart'}
           </button>
@@ -242,6 +291,7 @@ function CameraSettings({ navigation, performance }: { navigation: HandNavigatio
 export function App() {
   const viewport = useRef<HTMLElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
+  const visitorTurnControls = useRef<VisitorTurnControls>(null);
   const setupClose = useRef<HTMLButtonElement>(null);
   const operatorTitle = useRef<HTMLHeadingElement>(null);
   const picker = useRef<HTMLInputElement>(null);
@@ -477,6 +527,7 @@ export function App() {
     const active = runtime.current;
     if (simulationMode || !liveEnabled || !active) return;
     setLiveStatus({ phase: 'connecting' });
+    visitorTurnControls.current?.update(undefined);
     let latestReceipt: number | undefined;
     const disconnect = connectLiveHands({
       navigation,
@@ -494,9 +545,10 @@ export function App() {
       reset: reason => {
         latestReceipt = undefined;
         handPerformance.reset();
-        active.gestures.resetStream(reason === 'depth-range' ? false : undefined);
+        active.gestures.resetStream(reason ? false : undefined);
       },
       status: setLiveStatus,
+      visitor: turn => visitorTurnControls.current?.update(turn),
     });
     return () => {
       disconnect();
@@ -712,7 +764,10 @@ export function App() {
   const resetSeconds = Math.max(0.1, (1 - resetProgress) * RESET_HOLD_MS / 1000).toFixed(1);
   const showCameraPreview = liveEnabled && !calibrating
     && (operatorMode || (visitorPreviewVisible && liveStatus.phase === 'ready'));
-  const visibleHint = !resetProgress && !setupOpen && !calibrating && exhibit && !contextLost && (calibrationSaved || !hasExplored) && (!simulationMode || enabled);
+  const visitorPhase = liveEnabled && !simulationMode ? liveStatus.visitorPhase : undefined;
+  const visitorNeedsTurnHint = visitorPhase !== undefined && visitorPhase !== 'active';
+  const visibleHint = !visitorNeedsTurnHint && !resetProgress && !setupOpen && !calibrating
+    && exhibit && !contextLost && (calibrationSaved || !hasExplored) && (!simulationMode || enabled);
   const hint = calibrationSaved ? 'Calibration saved. Point at the model to try it.'
     : handsEnabled ? visitorCue(pose, simulationMode) : 'Drag to look around. Tap a part to inspect it.';
 
@@ -727,7 +782,7 @@ export function App() {
       <canvas ref={canvas} className="model" tabIndex={simulationMode ? undefined : 0} aria-label="3D CAD assembly" aria-describedby={simulationMode ? undefined : 'canvas-help'} />
       {!simulationMode && <p id="canvas-help" className="sr-only">Use the arrow keys to orbit, plus and minus to zoom, Enter to select the part in the center, Escape to clear selection, or Home to reset the view.</p>}
       {simulationMode && !setupOpen && <button className="setup-trigger" type="button" onClick={() => setSimulatorSetupOpen(true)}><Settings size={22} /> Setup</button>}
-      <p id="visitor-cue" className={visibleHint ? `visitor-hint${simulationMode ? ' simulator-hint' : ''}` : 'sr-only'} aria-live="polite">{hint}</p>
+      <p id="visitor-cue" className={visibleHint ? `visitor-hint${simulationMode ? ' simulator-hint' : ''}` : 'sr-only'} aria-live={visitorNeedsTurnHint ? 'off' : 'polite'}>{hint}</p>
       {resetProgress > 0 && <div className="reset-countdown">
         <ThumbsUp size={21} aria-hidden="true" />
         <div>
@@ -738,6 +793,7 @@ export function App() {
           <progress value={resetProgress} max={1} aria-hidden="true" />
         </div>
       </div>}
+      <VisitorTurnOverlay visible={showPose && !loading && !graphicsIssue && !resetProgress} controls={visitorTurnControls} />
       {showCameraPreview && <CameraPreview className="navigation-preview" display={liveStatus.display ?? handDisplayKey()} />}
       {!setupOpen && !calibrating && (stageMessage || !exhibit) && <div className="stage-message">
         {stageMessage}
@@ -775,7 +831,7 @@ export function App() {
             </div>
           </div>
           <p className="setup-hint" role="status">{!liveEnabled ? 'Touch, mouse, and keyboard controls are ready.'
-            : liveStatus.phase === 'ready' ? navigation === 'fuzzy' ? 'Fuzzy navigation is ready. Open the exhibit and move an open hand into view.' : 'Connected. Open the exhibit to use hand gestures.'
+            : liveStatus.phase === 'ready' ? 'Connected. Open the exhibit to use hand gestures.'
             : liveStatus.phase === 'calibration' ? liveStatus.message ?? 'This display needs a reach profile. Choose fuzzy navigation or calibrate below.'
             : liveStatus.phase === 'connecting' ? 'Connecting to the local hand camera.' : liveStatus.message ?? 'Camera unavailable. Start the local camera service and check the USB connection. Retrying automatically.'}</p>
           {liveEnabled && <label className="navigation-choice">Hand navigation

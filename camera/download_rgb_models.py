@@ -1,4 +1,4 @@
-"""Install the checksum-verified MediaPipe Full hand model locally."""
+"""Install the checksum-verified MediaPipe hand and pose models locally."""
 
 from argparse import ArgumentParser
 from hashlib import sha256
@@ -6,9 +6,13 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from urllib.request import urlopen
 
+from visitor_pose import POSE_MODEL_NAME
+
 DIRECTORY = Path(__file__).resolve().parents[1] / '.runtime' / 'camera'
 FULL_URL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task'
 FULL_SHA = 'fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1'
+POSE_URL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task'
+POSE_SHA = '59929e1d1ee95287735ddd833b19cf4ac46d29bc7afddbbf6753c459690d574a'
 
 
 def verified_file(path: Path, digest: str) -> bool:
@@ -38,7 +42,10 @@ def download(directory: Path) -> None:
     full = directory / 'hand_landmarker.task'
     if not verified_file(full, FULL_SHA):
         save(full, fetch(FULL_URL, FULL_SHA))
-    print('Verified MediaPipe Full bundle.')
+    pose = directory / POSE_MODEL_NAME
+    if not verified_file(pose, POSE_SHA):
+        save(pose, fetch(POSE_URL, POSE_SHA))
+    print('Verified MediaPipe hand and pose bundles.')
 
 
 if __name__ == '__main__':

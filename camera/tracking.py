@@ -365,18 +365,31 @@ class HandTracker:
         current_a, current_b = first.image_palm, second.image_palm
         return sum((b - a) * (d - c) for a, b, c, d in zip(previous_a, previous_b, current_a, current_b)) > 0
 
-    def update(self, samples: list[Candidate | None], at: float) -> tuple[Tracking, tuple[Hand, ...]]:
+    def update(self, samples: list[Candidate | None], at: float, *,
+               rejections: dict[int, str] | None = None) -> tuple[Tracking, tuple[Hand, ...]]:
         if not isfinite(at) or (self.last_at is not None and at < self.last_at):
+            if rejections is not None:
+                rejections.update((id(sample), 'Invalid or out-of-order camera timestamp.')
+                                  for sample in samples if sample is not None)
             self.reset()
             return 'lost', ()
         if not samples:
             return self.pause(at, 'lost')
         if len(samples) > 2:
+            if rejections is not None:
+                rejections.update((id(sample), 'More than two hands were detected.')
+                                  for sample in samples if sample is not None)
             self.reset()
             return 'ambiguous', ()
         observed = [sample for sample in samples if sample is not None and (
             sample.pose.valid() if sample.pose is not None else valid_image(sample.image_palm)
         )]
+        if rejections is not None and len(observed) != len(samples):
+            observed_ids = {id(sample) for sample in observed}
+            for sample in samples:
+                if sample is not None and id(sample) not in observed_ids:
+                    rejections[id(sample)] = ('Invalid measured hand pose.' if sample.pose is not None
+                                              else 'No usable palm position in the RGB image.')
         if not observed:
             return self.pause(at, 'ambiguous' if len(samples) > 1 else 'lost')
         close_rgb_pair = False
@@ -384,6 +397,8 @@ class HandTracker:
             first, second = observed
             if first.pose is not None and second.pose is not None:
                 if dist(first.pose.palm, second.pose.palm) < MIN_PALM_SEPARATION:
+                    if rejections is not None:
+                        rejections.update((id(sample), 'Palms are too close together in 3D.') for sample in observed)
                     return self.pause(at, 'ambiguous')
             else:
                 close_rgb_pair = not (valid_image(first.image_palm) and valid_image(second.image_palm)
@@ -406,6 +421,14 @@ class HandTracker:
             )
         assignment = self.assignments(observed, allow_side_disagreement=allow_side_disagreement)
         if assignment is None or (close_rgb_pair and not self.continues_measured_pair(observed, assignment, at)):
+            if rejections is not None:
+                if assignment is None:
+                    reason = 'Could not tell which hand matches the previous pose.'
+                elif all(valid_image(sample.image_palm) for sample in observed):
+                    reason = 'Hands are too close together in the RGB image.'
+                else:
+                    reason = 'Could not separate the two palm positions in the RGB image.'
+                rejections.update((id(sample), reason) for sample in observed)
             return self.pause(at, 'ambiguous')
         next_tracks = []
         suspended_pinches = []
@@ -454,6 +477,8 @@ class HandTracker:
                     pinch_evidence_at = previous.pinch_evidence_at
             elif pinch_without_gap:
                 if not recent_pinch:
+                    if rejections is not None:
+                        rejections[id(sample)] = 'Pinch evidence timed out.'
                     continue
                 grip = 'pinch'
                 pinch_evidence_at = previous.pinch_evidence_at
@@ -487,6 +512,8 @@ class HandTracker:
                         # from a hold whose evidence window has already expired.
                         suspended_pinches.append(replace(previous, interrupted=True, pinch_evidence_at=None,
                                                          release_since=release_since, release_handoff=True))
+                        if rejections is not None:
+                            rejections[id(sample)] = 'Waiting to confirm the pinch release.'
                         continue
             released_pinch = previous is not None and previous_grip == 'pinch' and grip == 'open'
             if released_pinch and not (thumbs_up or opening_supported):
@@ -495,6 +522,8 @@ class HandTracker:
                 # to resume. Never publish or refresh the old pose.
                 suspended_pinches.append(replace(previous, interrupted=True, pinch_evidence_at=None,
                                                  release_since=None))
+                if rejections is not None:
+                    rejections[id(sample)] = 'Pinch release is unclear.'
                 continue
             known_open = previous is not None and previous.published and previous_grip == 'open'
             clearly_open = grip == 'open' and (
@@ -507,10 +536,16 @@ class HandTracker:
             # A hand first seen already closed has no neutral observation to
             # publish. Keep its identity private until it confirms or opens.
             published = not (private_candidate and grip == 'open' and not (clearly_open or thumbs_up))
+            if not published and rejections is not None:
+                rejections[id(sample)] = ('Waiting for pinch confirmation.' if pinch_since is not None
+                                          else 'Waiting for a clear pinch or open hand.')
             palm_anchor = grip == 'fist' or thumbs_up
             if published and not pointing and not palm_anchor and (
                 not optical_aim or (grip == 'open' and not (clearly_open or optical_pinch))
             ):
+                if rejections is not None:
+                    rejections[id(sample)] = ('Could not confirm an open hand without fingertip depth.' if optical_aim
+                                              else 'No usable index fingertip position.')
                 continue
 
             tip = measured.tip if measured is not None else None

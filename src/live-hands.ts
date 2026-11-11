@@ -1,11 +1,22 @@
 import type { HandPose, PoseFrame } from './gestures';
 
 export type HandNavigation = 'fuzzy' | 'calibrated';
+export type HandInteraction = 'visitors' | 'single-user';
+
+export type VisitorTurn = {
+  phase: 'ready' | 'claiming' | 'active' | 'paused';
+  revision: number;
+  progress?: number;
+  passProgress?: number;
+  passCursor?: { x: number; y: number };
+  reason?: string;
+};
 
 export type HandCameraSettings = {
   cameraName?: string;
   fps: number;
   frameRates: number[];
+  interaction?: HandInteraction;
   applying: boolean;
   error?: string;
   depthError?: string;
@@ -26,6 +37,7 @@ export type LiveHandStatus = {
   captureReady?: boolean;
   captureHint?: string;
   previewToken?: string;
+  visitorPhase?: VisitorTurn['phase'];
 };
 
 export type DepthRange = { nearM: number; farM: number };
@@ -51,6 +63,23 @@ export function handCameraUrl(path: string) {
   return new URL(path, new URL(poseUrl, window.location.href));
 }
 
+export function readVisitorTurn(value: unknown): VisitorTurn | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const turn = value as Partial<VisitorTurn>;
+  const { phase, revision, passCursor } = turn;
+  if ((phase !== 'ready' && phase !== 'claiming' && phase !== 'active' && phase !== 'paused')
+    || typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0) return undefined;
+  const isFraction = (part: unknown): part is number =>
+    typeof part === 'number' && Number.isFinite(part) && part >= 0 && part <= 1;
+  return {
+    phase, revision,
+    progress: isFraction(turn.progress) ? turn.progress : undefined,
+    passProgress: isFraction(turn.passProgress) ? turn.passProgress : undefined,
+    passCursor: isFraction(passCursor?.x) && isFraction(passCursor?.y) ? passCursor : undefined,
+    reason: typeof turn.reason === 'string' ? turn.reason : undefined,
+  };
+}
+
 function readCameraSettings(value: unknown): HandCameraSettings {
   if (!value || typeof value !== 'object') throw new Error('The local hand camera returned invalid settings.');
   const settings = value as HandCameraSettings;
@@ -67,6 +96,7 @@ function readCameraSettings(value: unknown): HandCameraSettings {
     cameraName: typeof settings.cameraName === 'string' ? settings.cameraName : undefined,
     fps: settings.fps,
     frameRates: settings.frameRates,
+    interaction: settings.interaction === 'visitors' || settings.interaction === 'single-user' ? settings.interaction : undefined,
     applying: settings.applying, error: typeof settings.error === 'string' ? settings.error : undefined,
     depthError: typeof settings.depthError === 'string' ? settings.depthError : undefined,
     diagnostics: metrics && typeof metrics === 'object' ? {
@@ -81,13 +111,13 @@ function readCameraSettings(value: unknown): HandCameraSettings {
   };
 }
 
-async function cameraSettingsRequest(fps: number | undefined, signal: AbortSignal): Promise<HandCameraSettings> {
+async function cameraSettingsRequest(fps: number | undefined, signal: AbortSignal, interaction?: HandInteraction): Promise<HandCameraSettings> {
   const updating = fps !== undefined;
   const response = await fetch(new URL('./settings', new URL(poseUrl, window.location.href)), {
     method: updating ? 'POST' : 'GET', cache: 'no-store',
     ...(updating ? {
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ source: 'rgb', tracker: 'mediapipe', fps }),
+      body: JSON.stringify({ source: 'rgb', tracker: 'mediapipe', fps, interaction }),
     } : {}),
     signal: AbortSignal.any([signal, AbortSignal.timeout(2200)]),
   });
@@ -101,8 +131,8 @@ export function fetchHandCameraSettings(signal: AbortSignal) {
   return cameraSettingsRequest(undefined, signal);
 }
 
-export function applyHandCameraSettings(fps: number, signal: AbortSignal) {
-  return cameraSettingsRequest(fps, signal);
+export function applyHandCameraSettings(fps: number, signal: AbortSignal, interaction?: HandInteraction) {
+  return cameraSettingsRequest(fps, signal, interaction);
 }
 
 export async function requestDepthRange(signal: AbortSignal, action?: DepthRangeAction): Promise<DepthRangeStatus> {
@@ -200,8 +230,9 @@ function validHand(value: unknown): value is HandPose {
 export function connectLiveHands(options: {
   navigation: HandNavigation;
   receive: (frame: PoseFrame, receivedAt: number) => void;
-  reset: (reason?: 'depth-range') => void;
+  reset: (reason?: 'depth-range' | 'visitor-turn') => void;
   status: (status: LiveHandStatus) => void;
+  visitor?: (turn: VisitorTurn | undefined) => void;
 }) {
   const session = new AbortController();
   let timer: ReturnType<typeof setTimeout>;
@@ -211,12 +242,14 @@ export function connectLiveHands(options: {
   let lastCapturedAt = -Infinity;
   let lastContactAt = -Infinity;
   let lastDepthRangeRevision = 0;
+  let lastVisitorRevision: number | undefined;
   let status: LiveHandStatus = { phase: 'connecting' };
   let display: string | undefined;
 
   function setStatus(next: LiveHandStatus) {
     if (next.phase === status.phase && next.display === status.display && next.step === status.step && next.message === status.message
-      && next.captureReady === status.captureReady && next.captureHint === status.captureHint) return;
+      && next.captureReady === status.captureReady && next.captureHint === status.captureHint
+      && next.visitorPhase === status.visitorPhase) return;
     status = next;
     options.status(next);
   }
@@ -242,7 +275,7 @@ export function connectLiveHands(options: {
       if (display !== currentDisplay) {
         display = currentDisplay;
         sourceId = undefined;
-        options.reset();
+        options.reset(lastVisitorRevision !== undefined ? 'visitor-turn' : undefined);
       }
       // The bridge is still connected. Leave the controller's stall timer in
       // charge and keep polling at full speed for the next fresh pose.
@@ -252,8 +285,9 @@ export function connectLiveHands(options: {
       }
       const next = readStatus(value, currentDisplay);
       if (next.phase !== 'ready') {
-        if (sourceId !== undefined) options.reset();
+        if (sourceId !== undefined) options.reset(lastVisitorRevision !== undefined ? 'visitor-turn' : undefined);
         sourceId = undefined;
+        options.visitor?.(undefined);
         setStatus(next);
         interval = next.phase === 'calibration' ? 150 : 1000;
         return;
@@ -267,37 +301,44 @@ export function connectLiveHands(options: {
       const receivedAt = performance.now();
       lastContactAt = receivedAt;
       if (value.ageMs >= 220) return;
+      const visitor = readVisitorTurn(value.visitor);
+      if (value.visitor !== undefined && visitor === undefined) throw new Error('Invalid visitor turn.');
       const depthRangeRevision = Number.isSafeInteger(value.depthRangeRevision) ? value.depthRangeRevision : 0;
       if (sourceId !== value.session) {
         sourceId = value.session;
         lastSequence = -1;
         lastCapturedAt = -Infinity;
-        lastDepthRangeRevision = depthRangeRevision;
-        options.reset();
+        options.reset(visitor || lastVisitorRevision !== undefined ? 'visitor-turn' : undefined);
+      } else if (value.sequence > lastSequence && visitor?.revision !== lastVisitorRevision) {
+        options.reset('visitor-turn');
       } else if (depthRangeRevision !== lastDepthRangeRevision) {
-        lastDepthRangeRevision = depthRangeRevision;
         options.reset('depth-range');
       }
-      setStatus(next);
-      if (value.sequence > lastSequence) {
-        lastSequence = value.sequence;
-        waitForPose = value.waitForPose === true;
-        if (waitForPose) interval = 0;
-        // Remove the time waiting for a pose on the bridge before estimating
-        // return transit. Older bridges respond immediately and omit bridgeMs.
-        const bridgeMs = Number.isFinite(value.bridgeMs) && value.bridgeMs >= 0 ? value.bridgeMs : 0;
-        const transitMs = Math.max(0, receivedAt - startedAt - bridgeMs) / 2;
-        const capturedAt = receivedAt - transitMs - value.ageMs;
-        lastCapturedAt = Math.max(lastCapturedAt, capturedAt);
-        options.receive({ sequence: value.sequence, capturedAt: lastCapturedAt, tracking: value.tracking, hands: value.hands }, receivedAt);
-      }
+      lastDepthRangeRevision = depthRangeRevision;
+      if (value.sequence <= lastSequence) return;
+      lastVisitorRevision = visitor?.revision;
+      setStatus({ ...next, visitorPhase: visitor?.phase });
+      options.visitor?.(visitor);
+      lastSequence = value.sequence;
+      waitForPose = value.waitForPose === true;
+      if (waitForPose) interval = 0;
+      // Remove the time waiting for a pose on the bridge before estimating
+      // return transit. Older bridges respond immediately and omit bridgeMs.
+      const bridgeMs = Number.isFinite(value.bridgeMs) && value.bridgeMs >= 0 ? value.bridgeMs : 0;
+      const transitMs = Math.max(0, receivedAt - startedAt - bridgeMs) / 2;
+      const capturedAt = receivedAt - transitMs - value.ageMs;
+      lastCapturedAt = Math.max(lastCapturedAt, capturedAt);
+      const ownerActive = visitor === undefined || visitor.phase === 'active';
+      const tracking = ownerActive ? value.tracking : visitor.phase === 'paused' ? 'ambiguous' : 'lost';
+      options.receive({ sequence: value.sequence, capturedAt: lastCapturedAt, tracking, hands: ownerActive ? value.hands : [] }, receivedAt);
     } catch {
       if (session.signal.aborted) return;
       // One failed poll can recover in the same camera session. The gesture
       // controller pauses stale motion while we wait for a fresh observation.
       if (sourceId !== undefined && performance.now() - lastContactAt < POSE_RETRY_WINDOW_MS) return;
-      if (sourceId !== undefined) options.reset();
+      if (sourceId !== undefined) options.reset(lastVisitorRevision !== undefined ? 'visitor-turn' : undefined);
       sourceId = undefined;
+      options.visitor?.(undefined);
       setStatus({ phase: 'offline', display });
       interval = 1500;
     } finally {

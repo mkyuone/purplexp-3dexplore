@@ -244,6 +244,7 @@ class CameraService:
         self.fuzzy = FuzzyMapper()
         self.calibrated: dict[str, CalibratedMapper] = {}
         self.navigation_session: str | None = None
+        self.visitor_revision: int | None = None
         self.active_depth_range: DepthRange | None = None
         self.depth_range_revision = 0
         self.depth_attempt: DepthRangeAttempt | None = None
@@ -254,8 +255,8 @@ class CameraService:
     def settings(self, value: dict | None = None) -> dict:
         with self.lock:
             if value is not None:
-                options = CameraOptions.from_dict(value)
                 settings = self.feed.settings()
+                options = CameraOptions.from_dict({'interaction': settings.get('interaction', 'visitors'), **value})
                 if options.fps not in settings['frameRates']:
                     raise ValueError('The selected capture rate is unavailable for this camera.')
                 available = next(
@@ -358,16 +359,17 @@ class CameraService:
             return False
         return True
 
-    def refresh_navigation(self, info: CameraInfo) -> None:
+    def refresh_navigation(self, info: CameraInfo, visitor_revision: int | None = None) -> None:
         depth_range = self.profiles.depth_ranges.get(info.serial) if info.serial is not None else None
         changed = depth_range != self.active_depth_range
         if changed:
             self.depth_range_revision += 1
-        if changed or self.navigation_session != info.session:
+        if changed or self.navigation_session != info.session or self.visitor_revision != visitor_revision:
             self.fuzzy = FuzzyMapper(depth_range)
             self.calibrated.clear()
             self.active_depth_range = depth_range
             self.navigation_session = info.session
+            self.visitor_revision = visitor_revision
 
     def active_attempt(self, info: CameraInfo, display: str) -> Attempt | None:
         attempt = self.attempts.get(display)
@@ -386,11 +388,15 @@ class CameraService:
                 return offline(snapshot.error or WAITING_FOR_FRAMES)
             if stale := stale_pose(monotonic() - frame.at):
                 return stale
-            self.refresh_navigation(info)
+            visitor = frame.visitor
+            self.refresh_navigation(info, visitor['revision'] if visitor is not None else None)
+            control_hands = frame.hands if visitor is None or visitor['phase'] == 'active' else ()
             if mode == 'fuzzy':
-                mapped = self.fuzzy.update(frame.hands, frame.at)
+                mapped = self.fuzzy.update(control_hands, frame.at)
             else:
                 if attempt := self.active_attempt(info, display):
+                    if visitor is not None:
+                        self.feed.request_reach_calibration()
                     return attempt_status(attempt, capture_readiness(snapshot, attempt))
                 if info.profile is None:
                     return calibrating(message=WAITING_FOR_DEPTH)
@@ -400,7 +406,7 @@ class CameraService:
                 mapper = self.calibrated.get(display)
                 if mapper is None or mapper.calibration is not calibration or mapper.project_image is not info.project_image:
                     mapper = self.calibrated[display] = CalibratedMapper(calibration, info.project_image, self.active_depth_range)
-                mapped = mapper.update(frame.hands, frame.at, frame.sequence)
+                mapped = mapper.update(control_hands, frame.at, frame.sequence)
             suppress_thumb = self.suppress_capture_thumb(info, frame)
             hands = [{
                 'id': hand.id, 'x': hand.x, 'y': hand.y, 'depth': hand.depth, 'depthValid': hand.depth_valid,
@@ -416,6 +422,7 @@ class CameraService:
                 'status': 'ready', 'session': f'{info.session}:{mode}:{display}', 'sequence': frame.sequence,
                 'depthRangeRevision': self.depth_range_revision,
                 'ageMs': max(0, age * 1000), 'tracking': tracking, 'hands': hands,
+                **({'visitor': visitor} if visitor is not None else {}),
             }
 
     def diagnostics(self) -> dict:
@@ -437,6 +444,8 @@ class CameraService:
             result['resetSuppressed'] = True
         if message := self.feed.infrared_status():
             result['infraredMessage'] = message
+        if snapshot.frame.visitor is not None:
+            result['visitor'] = snapshot.frame.visitor
         return result
 
     def diagnostic_frame(self, stream: str) -> bytes | None:
@@ -468,6 +477,8 @@ class CameraService:
             snapshot = self.feed.snapshot()
             if snapshot.info is None or self.active_attempt(snapshot.info, display) is None:
                 return None
+            if snapshot.frame is not None and snapshot.frame.visitor is not None:
+                self.feed.request_reach_calibration()
             return self.feed.request_preview(snapshot.info.session, attempt.after, token)
 
     def expire_previews(self) -> None:
@@ -516,6 +527,8 @@ class CameraService:
                     if key in self.profiles.records else calibrating(message='Calibration canceled.')
                 )
             if action == 'begin':
+                if frame.visitor is not None:
+                    self.feed.request_reach_calibration()
                 self.calibrated.pop(display, None)
                 attempt = Attempt(info.session, frame.at, monotonic())
                 self.attempts[display] = attempt
@@ -527,6 +540,8 @@ class CameraService:
             attempt = self.active_attempt(info, display)
             if attempt is None:
                 return calibrating(message='This calibration session ended. Cancel and restart it in Setup.')
+            if frame.visitor is not None:
+                self.feed.request_reach_calibration()
             attempt.touched = monotonic()
             readiness = capture_readiness(snapshot, attempt)
             if readiness.pose is None:

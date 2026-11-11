@@ -15,15 +15,19 @@ class CameraOptions:
     source: str = 'rgb'
     tracker: str = 'mediapipe'
     fps: int = 30
+    interaction: str = 'visitors'
 
     @classmethod
     def from_dict(cls, value: object) -> 'CameraOptions':
-        if not isinstance(value, dict) or set(value) != {'source', 'tracker', 'fps'}:
+        required = {'source', 'tracker', 'fps'}
+        if not isinstance(value, dict) or set(value) not in (required, required | {'interaction'}):
             raise ValueError('Choose a hand tracker and frame rate.')
         if value['source'] != 'rgb' or value['tracker'] != 'mediapipe':
             raise ValueError('Choose RGB and a supported hand tracker.')
         if type(value['fps']) is not int or value['fps'] not in (30, 60):
             raise ValueError('Choose 30 or 60 frames per second.')
+        if value.get('interaction', 'visitors') not in ('visitors', 'single-user'):
+            raise ValueError('Choose visitor turns or single-user interaction.')
         return cls(**value)
 
     def to_dict(self) -> dict:

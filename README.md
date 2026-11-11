@@ -46,6 +46,10 @@ The bridge runs as your regular user. If Linux denies access to depth, grant tha
 
 ### Connect and calibrate
 
+Visitor turns are the default. Frame the visitor's shoulders, elbows, and hands, and mark a standing spot in the middle of the camera view. A visitor raises an open palm from that spot to take control. They can lower their hands while keeping their turn. To pass control, release the current gesture and hold an open palm over **Pass control**, or step out of the interaction area. Each visitor starts with a fresh open-palm raise. The model stays where the previous visitor left it.
+
+Use **Operator settings → Hand camera → Camera settings → Visitor interaction → Single-user** to use the original hand tracking without visitor turns. If you already installed the hand model, run `python camera/download_rgb_models.py` again to install the body pose model used for visitor turns.
+
 Open [Operator settings](http://localhost:4180/operator) and use **Hand camera → Connect**. It starts in **Fuzzy · no calibration** mode with a live mirrored preview on the operator page. The visitor preview is off by default. Enable **Show hand camera preview in the exhibit** to show it for visitors. The browser remembers that choice. Choose **Open exhibit** and bring one relaxed open hand into view. Move it across the central camera area to aim, pinch to move a part, or make a fist to orbit. With one fist held, pull your hand toward yourself to zoom in and push it toward the camera to zoom out. With two fists, move them together to pan or change the distance between them to zoom. Add a second pinch to resize and rotate a part. The cursor is mirrored and smoothed, with a small dead zone to reduce jitter. Depth adapts while your hands are open and stays fixed during a grip.
 
 A short tracking interruption pauses the held part or view. Returning the same grip resumes from that position. If you move out of frame, come back and hold a pinch over a part to grab it again. When one hand drops out during a two-hand grip, the hand still in view can keep moving the part.

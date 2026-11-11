@@ -106,7 +106,7 @@ class CaptureTests(TestCase):
         preview, overlay = Mock(), Mock()
         with (
             patch('realsense.monotonic', side_effect=lambda: clock[0]),
-            patch('realsense.fuse_hand', return_value=candidate),
+            patch('realsense.fuse_hand', return_value=candidate) as fuse,
             patch('realsense.diagnostic_hands', wraps=diagnostic_hands) as summaries,
             patch.object(CameraSample, 'read', side_effect=lambda _, f: CameraSample(f, f.number, 0, 'camera', None)),
         ):
@@ -115,6 +115,8 @@ class CaptureTests(TestCase):
         frames = [call.args[0] for call in feed.publish.call_args_list]
         self.assertTrue(all(frame.tracking == 'tracking' for frame in frames))
         self.assertEqual(summaries.call_count, 4)
+        self.assertEqual([call.kwargs['notes'] is not None for call in fuse.call_args_list],
+                         [False, True, True, True, False, False, False, False])
         self.assertEqual([frame.at for frame in frames if frame.hand_diagnostics], [10.1, 10.5, 10.8, 11.2])
         self.assertEqual(frames[1].hand_diagnostics[0].side, 'Left')
         self.assertTrue(preview.submit.call_args_list[0].args[2][0].valid)

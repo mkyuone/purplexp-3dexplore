@@ -58,6 +58,19 @@ test('applying a capture rate uses RGB MediaPipe and shares cancellation', async
   assert.equal(requestSignal?.aborted, true)
 })
 
+test('visitor interaction can be set on a camera with a fixed capture rate', async t => {
+  withWindow(t)
+  t.mock.method(globalThis, 'fetch', async (_url: URL, init: RequestInit) => {
+    assert.equal(init.method, 'POST')
+    assert.deepEqual(JSON.parse(String(init.body)), {
+      source: 'rgb', tracker: 'mediapipe', fps: 30, interaction: 'single-user',
+    })
+    return Response.json({ fps: 30, applying: true, frameRates: [30], interaction: 'single-user' })
+  })
+  const result = await applyHandCameraSettings(30, new AbortController().signal, 'single-user')
+  assert.equal(result.interaction, 'single-user')
+})
+
 test('camera settings reject server failures and unsupported capture rates', async t => {
   withWindow(t)
   const fetch = t.mock.method(globalThis, 'fetch', async () => Response.json({ error: 'Capture rate unavailable' }, { status: 400 }))
@@ -191,4 +204,43 @@ test('a new depth range drops the old grip before delivering depth in the new co
   t.after(disconnect)
   await received.promise
   assert.deepEqual(events, ['pose 1', 'depth-range', 'pose 2'])
+})
+
+test('visitor handoff resets the old grip and a brief pause keeps the same turn', { timeout: 1000 }, async t => {
+  withWindow(t)
+  const received = Promise.withResolvers<void>()
+  const events: Array<[number, PoseFrame['tracking'], number] | string> = []
+  const turns: unknown[] = []
+  const frames = [
+    { sequence: 1, visitor: { phase: 'active', revision: 1 } },
+    { sequence: 2, visitor: { phase: 'paused', revision: 1 } },
+    { sequence: 3, visitor: { phase: 'active', revision: 1, passCursor: { x: .82, y: .62 } } },
+    { sequence: 3, visitor: { phase: 'ready', revision: 0 } },
+    { sequence: 4, visitor: { phase: 'ready', revision: 2 } },
+    { sequence: 5, visitor: { phase: 'claiming', revision: 2, progress: .5 } },
+    { sequence: 6, visitor: { phase: 'active', revision: 3 } },
+    { sequence: 7 },
+  ]
+  t.mock.method(globalThis, 'fetch', async () => Response.json({
+    status: 'ready', session: 'same-camera', ageMs: 0, tracking: 'tracking', waitForPose: true,
+    hands: [{ id: 'held', x: .5, y: .5, depth: 0, depthValid: false, pinched: true }],
+    ...frames.shift(),
+  }))
+  const disconnect = connectLiveHands({
+    navigation: 'fuzzy', status: () => {},
+    reset: reason => { if (reason) events.push(reason) },
+    visitor: turn => { turns.push(turn?.passCursor ?? turn?.progress ?? turn?.phase) },
+    receive: frame => {
+      events.push([frame.sequence, frame.tracking, frame.hands.length])
+      if (frame.sequence === 7) received.resolve()
+    },
+  })
+  t.after(disconnect)
+  await received.promise
+  assert.deepEqual(events, [
+    'visitor-turn', [1, 'tracking', 1], [2, 'ambiguous', 0], [3, 'tracking', 1],
+    'visitor-turn', [4, 'lost', 0], [5, 'lost', 0], 'visitor-turn', [6, 'tracking', 1],
+    'visitor-turn', [7, 'tracking', 1],
+  ])
+  assert.deepEqual(turns, ['active', 'paused', { x: .82, y: .62 }, 'ready', .5, 'active', undefined])
 })

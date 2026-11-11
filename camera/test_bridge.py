@@ -92,6 +92,32 @@ class StubFeed:
 
 
 class CalibrationBridgeTests(TestCase):
+    def test_visitor_handoff_resets_mapping_and_keeps_setup_hands_out_of_exhibit(self):
+        display = '1280x720@1'
+        feed = StubFeed()
+        with TemporaryDirectory() as folder, patch('server.monotonic', lambda: feed.now):
+            service = CameraService(feed, Profiles(Path(folder) / 'profiles.json'))
+            hands = (replace(feed.history[-1].hands[0], image=(.5, .5)),)
+            feed.replace_sample(-1, hands=hands, visitor={'phase': 'active', 'revision': 1})
+            active = service.poses(display)
+            self.assertEqual(len(active['hands']), 1)
+            original_mapper = service.fuzzy
+            feed.replace_sample(-1, at=feed.now - .015, sequence=7,
+                                visitor={'phase': 'paused', 'revision': 1}, tracking='ambiguous')
+            self.assertEqual(service.poses(display)['hands'], [])
+            self.assertIs(service.fuzzy, original_mapper)
+
+            feed.replace_sample(-1, at=feed.now, sequence=8,
+                                visitor={'phase': 'ready', 'revision': 2}, tracking='tracking')
+            self.assertEqual(service.poses(display)['hands'], [])
+            self.assertIsNot(service.fuzzy, original_mapper)
+            self.assertTrue(feed.snapshot().frame.hands)
+
+            feed.replace_sample(-1, visitor=None)
+            single_user = service.poses(display)
+            self.assertEqual(len(single_user['hands']), 1)
+            self.assertNotIn('visitor', single_user)
+
     def test_rgb_only_startup_is_ready_in_fuzzy_mode_and_waits_for_depth_to_calibrate(self):
         feed = StubFeed()
         snapshot = replace(feed.snapshot(), info=CameraInfo(None, 'session-1'))

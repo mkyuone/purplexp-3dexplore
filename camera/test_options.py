@@ -75,6 +75,16 @@ class CameraSettingsTests(TestCase):
             path.write_text('{"source":"ir1","tracker":"mercury","fps":true}')
             self.assertEqual(load_options(path), CameraOptions())
 
+    def test_visitor_turns_default_and_single_user_survives_legacy_capture_rate_update(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / 'settings.json'
+            feed = SettingsFeed()
+            service = CameraService(feed, Profiles(Path(directory) / 'profiles.json'), path)
+            self.assertEqual(service.settings()['interaction'], 'visitors')
+            service.settings(CameraOptions(interaction='single-user').to_dict())
+            service.settings({'source': 'rgb', 'tracker': 'mediapipe', 'fps': 60})
+            self.assertEqual(load_options(path), CameraOptions(fps=60, interaction='single-user'))
+
     def test_unavailable_tracker_cannot_replace_the_current_saved_configuration(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / 'settings.json'

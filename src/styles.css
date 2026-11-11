@@ -81,6 +81,61 @@ button svg { flex: none; }
   pointer-events: none;
 }
 .visitor-hint.simulator-hint { bottom: 52px; }
+.visitor-turn-hint {
+  position: absolute;
+  z-index: 3;
+  inset: auto 18px 18px;
+  justify-self: center;
+  max-width: min(440px, calc(100% - 36px));
+  padding: 10px 14px;
+  border: 1px solid #765b96;
+  border-radius: 10px;
+  background: #21182deb;
+  text-align: center;
+  pointer-events: none;
+}
+.visitor-turn-hint p { margin: 0; font-size: 13px; }
+.visitor-turn-hint progress, .visitor-pass progress {
+  display: block;
+  width: 100%;
+  height: 5px;
+  accent-color: var(--mint);
+}
+.visitor-turn-hint progress { margin-top: 7px; }
+.visitor-pass {
+  position: absolute;
+  z-index: 2;
+  inset: 58% 5% 18% 75%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: clamp(5px, 1vw, 12px);
+  border: 1px dashed #765b96;
+  border-radius: 11px;
+  background: #21182dbd;
+  text-align: center;
+  pointer-events: none;
+}
+.visitor-pass[data-aiming="true"] { border-color: var(--mint); background: #21182deb; }
+.visitor-pass strong { font-size: clamp(11px, 1.35vw, 15px); }
+.visitor-pass span { color: var(--muted); font-size: clamp(10px, 1vw, 12px); }
+.visitor-pass progress { width: min(100%, 120px); margin-top: 4px; }
+.visitor-pass-cursor {
+  position: absolute;
+  z-index: 4;
+  display: grid;
+  width: 31px;
+  height: 31px;
+  place-items: center;
+  border: 1px solid var(--mint);
+  border-radius: 50%;
+  background: #21182deb;
+  color: var(--mint);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
 .reset-countdown {
   position: absolute;
   top: 76px;

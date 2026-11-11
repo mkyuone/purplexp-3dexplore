@@ -16,6 +16,13 @@ class Landmark(Protocol):
     z: float
 
 
+@dataclass(frozen=True, slots=True)
+class ImageLandmark:
+    x: float
+    y: float
+    z: float
+
+
 @dataclass(frozen=True)
 class HandSide:
     category_name: str
@@ -110,7 +117,7 @@ def tracker_choices(model: Path) -> list[dict]:
 
 
 @contextmanager
-def create_estimator(tracker: str, model: Path):
+def create_estimator(tracker: str, model: Path, *, num_hands: int = 2):
     if problem := tracker_problem(tracker, model):
         raise RuntimeError(problem)
     try:
@@ -120,7 +127,7 @@ def create_estimator(tracker: str, model: Path):
         options = vision.HandLandmarkerOptions(
             base_options=python.BaseOptions(model_asset_path=str(model)),
             running_mode=vision.RunningMode.VIDEO,
-            num_hands=2,
+            num_hands=num_hands,
             min_hand_detection_confidence=0.5,
             min_hand_presence_confidence=0.5,
             min_tracking_confidence=0.5,
