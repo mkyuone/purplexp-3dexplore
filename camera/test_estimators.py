@@ -1,9 +1,9 @@
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from estimators import MediaPipeEstimator, create_estimator, tracker_choices
+from estimators import GpuInferenceError, MediaPipeEstimator, create_estimator, tracker_choices
 
 
 def landmarks(width=640, height=480):
@@ -49,6 +49,58 @@ class EstimatorTests(TestCase):
         with self.assertRaisesRegex(RuntimeError, 'Unknown hand tracker'):
             with create_estimator('rtmpose', Path('/model.task')):
                 self.fail('An unsupported estimator cannot enter its context.')
+
+    def test_gpu_option_is_applied_to_the_native_task_and_startup_failure_is_recoverable(self):
+        base_options = Mock(Delegate=SimpleNamespace(GPU='gpu'))
+        detector = Mock()
+        factory = Mock(return_value=detector)
+        vision = SimpleNamespace(
+            HandLandmarkerOptions=lambda **options: options,
+            RunningMode=SimpleNamespace(VIDEO='video'),
+            HandLandmarker=SimpleNamespace(create_from_options=factory),
+        )
+        python = SimpleNamespace(BaseOptions=base_options, vision=vision)
+        modules = {
+            'mediapipe': SimpleNamespace(),
+            'mediapipe.tasks': SimpleNamespace(python=python),
+            'mediapipe.tasks.python': python,
+        }
+        with patch('estimators.tracker_problem', return_value=None), patch.dict('sys.modules', modules):
+            with create_estimator('mediapipe', Path('/model.task'), num_hands=4, delegate='gpu'):
+                base_options.assert_called_once_with(model_asset_path='/model.task', delegate='gpu')
+                self.assertEqual(factory.call_args.args[0]['num_hands'], 4)
+            detector.close.assert_called_once()
+
+            init_failure = RuntimeError('EGL initialization failed')
+            factory.side_effect = init_failure
+            with self.assertRaisesRegex(GpuInferenceError, 'initialize the GPU hand tracker') as failure:
+                with create_estimator('mediapipe', Path('/model.task'), delegate='gpu'):
+                    self.fail('A failed native task cannot enter its context.')
+            self.assertIs(failure.exception.__cause__, init_failure)
+            factory.side_effect = FileNotFoundError('No model file')
+            with self.assertRaisesRegex(RuntimeError, 'No model file') as failure:
+                with create_estimator('mediapipe', Path('/model.task'), delegate='gpu'):
+                    self.fail('A missing model cannot enter its context.')
+            self.assertNotIsInstance(failure.exception, GpuInferenceError)
+
+    def test_only_native_gpu_processing_errors_trigger_recovery(self):
+        detector = Mock()
+        mp = SimpleNamespace(Image=lambda **options: options, ImageFormat=SimpleNamespace(SRGB='srgb'))
+        gpu_estimator = MediaPipeEstimator(mp, detector, delegate='gpu')
+        cpu_estimator = MediaPipeEstimator(mp, detector)
+
+        inference_failure = RuntimeError('Context lost')
+        detector.detect_for_video.side_effect = inference_failure
+        with self.assertRaisesRegex(GpuInferenceError, 'process a hand frame on the GPU') as failure:
+            gpu_estimator.detect('rgb-frame', 1000)
+        self.assertIs(failure.exception.__cause__, inference_failure)
+        with self.assertRaisesRegex(RuntimeError, 'Context lost') as failure:
+            cpu_estimator.detect('rgb-frame', 1000)
+        self.assertNotIsInstance(failure.exception, GpuInferenceError)
+
+        detector.detect_for_video.side_effect = ValueError('Invalid timestamp')
+        with self.assertRaisesRegex(ValueError, 'Invalid timestamp'):
+            gpu_estimator.detect('rgb-frame', 1000)
 
     def test_mediapipe_factory_loads_selected_bundle_with_two_hand_tracking(self):
         closed, options_seen = [], []

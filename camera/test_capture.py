@@ -1,16 +1,18 @@
 from collections import deque
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from threading import Event
+from time import monotonic
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
 from calibration import Pose
 from diagnostics import diagnostic_hands
-from estimators import EstimatedHand, HandSide
+from estimators import EstimatedHand, GpuInferenceError, HandSide
 from infrared_preview import InfraredPreview
-from realsense import CameraError, CameraFeed, CameraInfo, CameraSample, DepthMatcher, DepthStream, PreviewEncoder, image_projector, open_depth
+from options import CameraOptions
+from realsense import CameraError, CameraFeed, CameraInfo, CameraSample, DepthMatcher, DepthStream, Frame, PreviewEncoder, image_projector, open_depth
 from tracking import Candidate, GripFeatures
 
 
@@ -19,6 +21,81 @@ def sample(number, timestamp, domain='camera', arrival=None):
 
 
 class CaptureTests(TestCase):
+    def test_gpu_failure_restarts_both_hand_graphs_and_waits_for_explicit_retry(self):
+        with patch('realsense.Thread'):
+            feed = CameraFeed(Path('unused-model'), options=CameraOptions(hand_inference='gpu'))
+        sessions = []
+        lifecycle = []
+        recovered = []
+
+        @contextmanager
+        def hand_graph(_tracker, _model, *, num_hands=2, delegate):
+            lifecycle.append(('open', delegate, num_hands))
+            try:
+                yield object()
+            finally:
+                lifecycle.append(('close', delegate, num_hands))
+
+        def capture(revision):
+            options, delegate = feed.capture_options(revision)
+            with ExitStack() as resources:
+                feed.open_estimators(resources, options, delegate)
+                session = feed.begin_session(revision, options, 'serial', delegate)
+                sessions.append(session)
+                if len(sessions) == 1:
+                    raise GpuInferenceError('GPU test failure')
+                for sequence, elapsed in enumerate((10, 20, 30)):
+                    feed.publish(Frame(sequence, monotonic(), 'lost', (), diagnostics={'handInferenceMs': elapsed}),
+                                 revision)
+                recovered.append(feed.settings())
+                feed.stop.set()
+
+        with (
+            patch.object(feed, 'capture', side_effect=capture),
+            patch('estimators.create_estimator', side_effect=hand_graph),
+            patch('visitor_pose.create_pose_estimator', side_effect=lambda: ExitStack()),
+            patch('realsense.logging.warning'),
+        ):
+            feed.snapshot()
+            feed.run()
+
+        self.assertEqual(lifecycle, [
+            ('open', 'gpu', 4), ('open', 'gpu', 2), ('close', 'gpu', 2), ('close', 'gpu', 4),
+            ('open', 'cpu', 4), ('open', 'cpu', 2), ('close', 'cpu', 2), ('close', 'cpu', 4),
+        ])
+        self.assertNotEqual(*sessions)
+        settings, = recovered
+        self.assertEqual((settings['handInference'], settings['activeHandInference']), ('gpu', 'cpu'))
+        self.assertEqual(settings['handInferenceFallback'], 'GPU test failure')
+        self.assertEqual(settings['diagnostics']['handInferenceP50Ms'], 20)
+        self.assertEqual(settings['diagnostics']['handInferenceP95Ms'], 30)
+
+        new_rate = CameraOptions(fps=60, hand_inference='gpu')
+        feed.configure(new_rate)
+        self.assertEqual(feed.capture_options(feed.revision), (new_rate, 'cpu'))
+        feed.configure(new_rate, retry_gpu=True)
+        self.assertEqual(feed.capture_options(feed.revision), (new_rate, 'gpu'))
+        self.assertIsNone(feed.settings()['handInferenceFallback'])
+
+    def test_stale_gpu_failure_does_not_disable_gpu_for_new_settings(self):
+        with patch('realsense.Thread'):
+            feed = CameraFeed(Path('unused-model'), options=CameraOptions(hand_inference='gpu'))
+        latest = []
+
+        def capture(revision):
+            if revision == 0:
+                feed.configure(CameraOptions(fps=60, hand_inference='gpu'))
+                raise GpuInferenceError('Failure from the previous capture')
+            latest.append(feed.capture_options(revision))
+            feed.stop.set()
+
+        with patch.object(feed, 'capture', side_effect=capture) as attempts:
+            feed.snapshot()
+            feed.run()
+        self.assertEqual(attempts.call_count, 2)
+        self.assertEqual(latest, [(CameraOptions(fps=60, hand_inference='gpu'), 'gpu')])
+        self.assertIsNone(feed.settings()['handInferenceFallback'])
+
     def test_matching_uses_one_fresh_depth_sample_and_recovers_after_a_gap(self):
         pending = deque()
         queue = SimpleNamespace(poll_for_frame=lambda: pending.popleft() if pending else None)

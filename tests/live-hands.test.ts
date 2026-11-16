@@ -9,6 +9,7 @@ const settings = {
     poseFps: 28.5, processingMs: 22.4, frameAgeMs: 8,
     estimatedHands: 2, depthHands: 1, trackedHands: 1,
     queueMs: 2, inferenceMs: 19, alignmentMs: 2, fusionMs: 1,
+    handInferenceP50Ms: 18, handInferenceP95Ms: 21,
     processingP95Ms: 24, captureDroppedFrames: 2, depthFrameAvailable: true, frameAgeSource: 'hostArrival',
   },
 }
@@ -38,6 +39,7 @@ test('camera settings retain capture rates and diagnostics', async t => {
   assert.equal(requestUrl, 'http://127.0.0.1:4182/settings')
   assert.deepEqual(result.frameRates, [30, 60])
   assert.deepEqual(result.diagnostics, settings.diagnostics)
+  assert.equal(result.handInference, undefined)
   assert.equal(result.fps, 60)
   assert.equal(fetch.mock.callCount(), 1)
 })
@@ -69,6 +71,28 @@ test('visitor interaction can be set on a camera with a fixed capture rate', asy
   })
   const result = await applyHandCameraSettings(30, new AbortController().signal, 'single-user')
   assert.equal(result.interaction, 'single-user')
+})
+
+test('GPU fallback reports the active CPU and can be retried explicitly', async t => {
+  withWindow(t)
+  const requests: unknown[] = []
+  const fallback = 'GPU initialization failed. Hand tracking is using the CPU.'
+  t.mock.method(globalThis, 'fetch', async (_url: URL, init: RequestInit) => {
+    requests.push(JSON.parse(String(init.body)))
+    return Response.json({
+      ...settings, handInference: 'gpu', activeHandInference: 'cpu', handInferenceFallback: fallback,
+    })
+  })
+  const controller = new AbortController()
+  const requested = await applyHandCameraSettings(60, controller.signal, 'visitors', 'gpu')
+  await applyHandCameraSettings(60, controller.signal, 'visitors', 'gpu', true)
+  assert.deepEqual(requests, [
+    { source: 'rgb', tracker: 'mediapipe', fps: 60, interaction: 'visitors', handInference: 'gpu' },
+    { source: 'rgb', tracker: 'mediapipe', fps: 60, interaction: 'visitors', handInference: 'gpu', retryGpu: true },
+  ])
+  assert.equal(requested.handInference, 'gpu')
+  assert.equal(requested.activeHandInference, 'cpu')
+  assert.equal(requested.handInferenceFallback, fallback)
 })
 
 test('camera settings reject server failures and unsupported capture rates', async t => {
@@ -204,6 +228,34 @@ test('a new depth range drops the old grip before delivering depth in the new co
   t.after(disconnect)
   await received.promise
   assert.deepEqual(events, ['pose 1', 'depth-range', 'pose 2'])
+})
+
+test('GPU fallback requires a fresh grip across offline and failed GPU startup', { timeout: 2200 }, async t => {
+  withWindow(t)
+  const received = Promise.withResolvers<void>()
+  const events: string[] = []
+  const pose = {
+    status: 'ready', sequence: 1, ageMs: 0, tracking: 'tracking',
+    hands: [{ id: 'held', x: .5, y: .5, depth: 0, depthValid: false, pinched: true }],
+  }
+  const frames = [
+    { ...pose, session: 'gpu-session', activeHandInference: 'gpu' },
+    { status: 'offline' },
+    { ...pose, session: 'cpu-session', activeHandInference: 'cpu' },
+    { ...pose, session: 'failed-gpu-startup', activeHandInference: 'cpu', inferenceFallback: true },
+    { ...pose, session: 'failed-gpu-startup', activeHandInference: 'cpu', inferenceFallback: true, sequence: 2 },
+  ]
+  t.mock.method(globalThis, 'fetch', async () => Response.json(frames.shift()))
+  t.after(connectLiveHands({
+    navigation: 'fuzzy', status: () => {},
+    reset: reason => { if (reason) events.push(reason) },
+    receive: frame => {
+      events.push('pose ' + frame.sequence)
+      if (!frames.length) received.resolve()
+    },
+  }))
+  await received.promise
+  assert.deepEqual(events, ['pose 1', 'hand-inference', 'pose 1', 'hand-inference', 'pose 1', 'pose 2'])
 })
 
 test('visitor handoff resets the old grip and a brief pause keeps the same turn', { timeout: 1000 }, async t => {

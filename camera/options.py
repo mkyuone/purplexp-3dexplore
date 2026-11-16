@@ -1,6 +1,6 @@
 """Operator-selected camera acquisition and hand estimator settings."""
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 import json
@@ -16,22 +16,31 @@ class CameraOptions:
     tracker: str = 'mediapipe'
     fps: int = 30
     interaction: str = 'visitors'
+    hand_inference: str = 'cpu'
 
     @classmethod
     def from_dict(cls, value: object) -> 'CameraOptions':
         required = {'source', 'tracker', 'fps'}
-        if not isinstance(value, dict) or set(value) not in (required, required | {'interaction'}):
+        optional = {'interaction', 'handInference'}
+        if not isinstance(value, dict) or not required <= value.keys() <= required | optional:
             raise ValueError('Choose a hand tracker and frame rate.')
         if value['source'] != 'rgb' or value['tracker'] != 'mediapipe':
             raise ValueError('Choose RGB and a supported hand tracker.')
         if type(value['fps']) is not int or value['fps'] not in (30, 60):
             raise ValueError('Choose 30 or 60 frames per second.')
-        if value.get('interaction', 'visitors') not in ('visitors', 'single-user'):
+        interaction = value.get('interaction', 'visitors')
+        if interaction not in ('visitors', 'single-user'):
             raise ValueError('Choose visitor turns or single-user interaction.')
-        return cls(**value)
+        hand_inference = value.get('handInference', 'cpu')
+        if hand_inference not in ('cpu', 'gpu'):
+            raise ValueError('Choose CPU or GPU hand inference.')
+        return cls(value['source'], value['tracker'], value['fps'], interaction, hand_inference)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        return {
+            'source': self.source, 'tracker': self.tracker, 'fps': self.fps,
+            'interaction': self.interaction, 'handInference': self.hand_inference,
+        }
 
 
 def load_options(path: Path) -> CameraOptions:

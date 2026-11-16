@@ -256,7 +256,15 @@ class CameraService:
         with self.lock:
             if value is not None:
                 settings = self.feed.settings()
-                options = CameraOptions.from_dict({'interaction': settings.get('interaction', 'visitors'), **value})
+                request = dict(value)
+                retry_gpu = request.pop('retryGpu', False)
+                if type(retry_gpu) is not bool:
+                    raise ValueError('GPU retry must be true or false.')
+                request.setdefault('interaction', settings['interaction'])
+                request.setdefault('handInference', settings['handInference'])
+                options = CameraOptions.from_dict(request)
+                if retry_gpu and options.hand_inference != 'gpu':
+                    raise ValueError('Choose GPU hand inference before retrying it.')
                 if options.fps not in settings['frameRates']:
                     raise ValueError('The selected capture rate is unavailable for this camera.')
                 available = next(
@@ -266,7 +274,7 @@ class CameraService:
                 if available is None or not available['available']:
                     raise ValueError(available.get('reason', 'Hand tracker unavailable.') if available else 'Hand tracker unavailable.')
                 save_options(self.settings_path, options)
-                self.feed.configure(options)
+                self.feed.configure(options, retry_gpu=retry_gpu)
                 self.attempts.clear()
             self.feed.snapshot()
             return self.feed.settings()
@@ -422,6 +430,8 @@ class CameraService:
                 'status': 'ready', 'session': f'{info.session}:{mode}:{display}', 'sequence': frame.sequence,
                 'depthRangeRevision': self.depth_range_revision,
                 'ageMs': max(0, age * 1000), 'tracking': tracking, 'hands': hands,
+                **({'activeHandInference': info.active_hand_inference} if info.active_hand_inference is not None else {}),
+                **({'inferenceFallback': True} if info.inference_fallback else {}),
                 **({'visitor': visitor} if visitor is not None else {}),
             }
 

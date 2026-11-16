@@ -156,16 +156,18 @@ class AstraFeed(CameraFeed):
             import numpy as np
         except ImportError as error:
             raise CameraError('Install the packages from camera/requirements.txt in the camera bridge Python environment.') from error
-        with self.lock:
-            options = self.options
+        configuration = self.capture_options(revision)
+        if configuration is None:
+            return
+        options, delegate = configuration
         try:
             device = discover_astra(usb_parent=self.usb_port)
             with ExitStack() as resources:
-                estimator, pose_estimator, visitor_estimator = self.open_estimators(resources, options)
+                estimator, pose_estimator, visitor_estimator = self.open_estimators(resources, options, delegate)
                 if not self.wanted(revision):
                     return
                 color = resources.enter_context(open_rgb(cv2, device))
-                session = self.begin_session(revision, options, device.identity)
+                session = self.begin_session(revision, options, device.identity, delegate)
                 if session is None:
                     return
 

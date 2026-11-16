@@ -2,6 +2,7 @@ import type { HandPose, PoseFrame } from './gestures';
 
 export type HandNavigation = 'fuzzy' | 'calibrated';
 export type HandInteraction = 'visitors' | 'single-user';
+export type HandInference = 'cpu' | 'gpu';
 
 export type VisitorTurn = {
   phase: 'ready' | 'claiming' | 'active' | 'paused';
@@ -17,6 +18,9 @@ export type HandCameraSettings = {
   fps: number;
   frameRates: number[];
   interaction?: HandInteraction;
+  handInference?: HandInference;
+  activeHandInference?: HandInference;
+  handInferenceFallback?: string;
   applying: boolean;
   error?: string;
   depthError?: string;
@@ -24,6 +28,7 @@ export type HandCameraSettings = {
     poseFps?: number; processingMs?: number; frameAgeMs?: number;
     estimatedHands?: number; depthHands?: number; trackedHands?: number;
     queueMs?: number; inferenceMs?: number; alignmentMs?: number; fusionMs?: number;
+    handInferenceP50Ms?: number; handInferenceP95Ms?: number;
     processingP95Ms?: number; captureDroppedFrames?: number; depthFrameAvailable?: boolean;
     frameAgeSource?: 'hostArrival' | 'dequeue';
   };
@@ -63,6 +68,10 @@ export function handCameraUrl(path: string) {
   return new URL(path, new URL(poseUrl, window.location.href));
 }
 
+function readHandInference(value: unknown): HandInference | undefined {
+  return value === 'cpu' || value === 'gpu' ? value : undefined;
+}
+
 export function readVisitorTurn(value: unknown): VisitorTurn | undefined {
   if (!value || typeof value !== 'object') return undefined;
   const turn = value as Partial<VisitorTurn>;
@@ -97,12 +106,16 @@ function readCameraSettings(value: unknown): HandCameraSettings {
     fps: settings.fps,
     frameRates: settings.frameRates,
     interaction: settings.interaction === 'visitors' || settings.interaction === 'single-user' ? settings.interaction : undefined,
+    handInference: readHandInference(settings.handInference),
+    activeHandInference: readHandInference(settings.activeHandInference),
+    handInferenceFallback: typeof settings.handInferenceFallback === 'string' ? settings.handInferenceFallback : undefined,
     applying: settings.applying, error: typeof settings.error === 'string' ? settings.error : undefined,
     depthError: typeof settings.depthError === 'string' ? settings.depthError : undefined,
     diagnostics: metrics && typeof metrics === 'object' ? {
       poseFps: finiteMetric(metrics.poseFps), processingMs: finiteMetric(metrics.processingMs), frameAgeMs: finiteMetric(metrics.frameAgeMs),
       estimatedHands: handCount(metrics.estimatedHands), depthHands: handCount(metrics.depthHands), trackedHands: handCount(metrics.trackedHands),
       queueMs: finiteMetric(metrics.queueMs), inferenceMs: finiteMetric(metrics.inferenceMs),
+      handInferenceP50Ms: finiteMetric(metrics.handInferenceP50Ms), handInferenceP95Ms: finiteMetric(metrics.handInferenceP95Ms),
       alignmentMs: finiteMetric(metrics.alignmentMs), fusionMs: finiteMetric(metrics.fusionMs),
       processingP95Ms: finiteMetric(metrics.processingP95Ms), captureDroppedFrames: handCount(metrics.captureDroppedFrames),
       depthFrameAvailable: typeof metrics.depthFrameAvailable === 'boolean' ? metrics.depthFrameAvailable : undefined,
@@ -111,13 +124,19 @@ function readCameraSettings(value: unknown): HandCameraSettings {
   };
 }
 
-async function cameraSettingsRequest(fps: number | undefined, signal: AbortSignal, interaction?: HandInteraction): Promise<HandCameraSettings> {
-  const updating = fps !== undefined;
-  const response = await fetch(new URL('./settings', new URL(poseUrl, window.location.href)), {
-    method: updating ? 'POST' : 'GET', cache: 'no-store',
-    ...(updating ? {
+type CameraSettingsUpdate = {
+  fps: number;
+  interaction?: HandInteraction;
+  handInference?: HandInference;
+  retryGpu?: true;
+};
+
+async function cameraSettingsRequest(signal: AbortSignal, settings?: CameraSettingsUpdate): Promise<HandCameraSettings> {
+  const response = await fetch(handCameraUrl('./settings'), {
+    method: settings ? 'POST' : 'GET', cache: 'no-store',
+    ...(settings ? {
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ source: 'rgb', tracker: 'mediapipe', fps, interaction }),
+      body: JSON.stringify({ source: 'rgb', tracker: 'mediapipe', ...settings }),
     } : {}),
     signal: AbortSignal.any([signal, AbortSignal.timeout(2200)]),
   });
@@ -128,11 +147,13 @@ async function cameraSettingsRequest(fps: number | undefined, signal: AbortSigna
 }
 
 export function fetchHandCameraSettings(signal: AbortSignal) {
-  return cameraSettingsRequest(undefined, signal);
+  return cameraSettingsRequest(signal);
 }
 
-export function applyHandCameraSettings(fps: number, signal: AbortSignal, interaction?: HandInteraction) {
-  return cameraSettingsRequest(fps, signal, interaction);
+export function applyHandCameraSettings(
+  fps: number, signal: AbortSignal, interaction?: HandInteraction, handInference?: HandInference, retryGpu?: true,
+) {
+  return cameraSettingsRequest(signal, { fps, interaction, handInference, retryGpu });
 }
 
 export async function requestDepthRange(signal: AbortSignal, action?: DepthRangeAction): Promise<DepthRangeStatus> {
@@ -230,7 +251,7 @@ function validHand(value: unknown): value is HandPose {
 export function connectLiveHands(options: {
   navigation: HandNavigation;
   receive: (frame: PoseFrame, receivedAt: number) => void;
-  reset: (reason?: 'depth-range' | 'visitor-turn') => void;
+  reset: (reason?: 'depth-range' | 'visitor-turn' | 'hand-inference') => void;
   status: (status: LiveHandStatus) => void;
   visitor?: (turn: VisitorTurn | undefined) => void;
 }) {
@@ -243,6 +264,7 @@ export function connectLiveHands(options: {
   let lastContactAt = -Infinity;
   let lastDepthRangeRevision = 0;
   let lastVisitorRevision: number | undefined;
+  let lastHandInference: HandInference | undefined;
   let status: LiveHandStatus = { phase: 'connecting' };
   let display: string | undefined;
 
@@ -304,11 +326,16 @@ export function connectLiveHands(options: {
       const visitor = readVisitorTurn(value.visitor);
       if (value.visitor !== undefined && visitor === undefined) throw new Error('Invalid visitor turn.');
       const depthRangeRevision = Number.isSafeInteger(value.depthRangeRevision) ? value.depthRangeRevision : 0;
+      const handInference = readHandInference(value.activeHandInference);
+      const handInferenceChanged = handInference !== undefined && lastHandInference !== undefined && handInference !== lastHandInference;
       if (sourceId !== value.session) {
         sourceId = value.session;
         lastSequence = -1;
         lastCapturedAt = -Infinity;
-        options.reset(visitor || lastVisitorRevision !== undefined ? 'visitor-turn' : undefined);
+        options.reset(handInferenceChanged || value.inferenceFallback === true ? 'hand-inference'
+          : visitor || lastVisitorRevision !== undefined ? 'visitor-turn' : undefined);
+      } else if (value.sequence > lastSequence && handInferenceChanged) {
+        options.reset('hand-inference');
       } else if (value.sequence > lastSequence && visitor?.revision !== lastVisitorRevision) {
         options.reset('visitor-turn');
       } else if (depthRangeRevision !== lastDepthRangeRevision) {
@@ -317,6 +344,7 @@ export function connectLiveHands(options: {
       lastDepthRangeRevision = depthRangeRevision;
       if (value.sequence <= lastSequence) return;
       lastVisitorRevision = visitor?.revision;
+      lastHandInference = handInference ?? lastHandInference;
       setStatus({ ...next, visitorPhase: visitor?.phase });
       options.visitor?.(visitor);
       lastSequence = value.sequence;

@@ -92,6 +92,20 @@ class StubFeed:
 
 
 class CalibrationBridgeTests(TestCase):
+    def test_pose_reports_the_active_inference_backend(self):
+        feed = StubFeed()
+        snapshot = feed.snapshot()
+        gpu = replace(snapshot, info=replace(snapshot.info, active_hand_inference='gpu'))
+        fallback = replace(snapshot, info=replace(snapshot.info, active_hand_inference='cpu', inference_fallback=True))
+        with (TemporaryDirectory() as folder, patch('server.monotonic', lambda: feed.now),
+              patch.object(feed, 'snapshot', side_effect=[snapshot, gpu, fallback])):
+            service = CameraService(feed, Profiles(Path(folder) / 'profiles.json'))
+            self.assertNotIn('activeHandInference', service.poses('1280x720@1'))
+            self.assertEqual(service.poses('1280x720@1')['activeHandInference'], 'gpu')
+            pose = service.poses('1280x720@1')
+            self.assertEqual(pose['activeHandInference'], 'cpu')
+            self.assertTrue(pose['inferenceFallback'])
+
     def test_visitor_handoff_resets_mapping_and_keeps_setup_hands_out_of_exhibit(self):
         display = '1280x720@1'
         feed = StubFeed()

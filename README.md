@@ -68,9 +68,11 @@ Optional calibration is saved per camera and display. If the camera or display m
 
 **Operator settings → Hand camera → Camera settings** shows the active camera and configured capture rate. The RealSense D435i offers 30 or 60 fps. Select **Apply and restart** to change it. The Astra Pro uses the 30 fps capture mode. Both use RGB and MediaPipe Full for hand tracking. Capture settings persist on the local camera service.
 
+**Hand inference** defaults to **CPU**. Select **GPU** and **Apply and restart** to use MediaPipe's native GPU delegate for both hand detectors. Visitor body tracking still runs on the CPU. The panel reports the active backend once the camera starts. If GPU inference fails, tracking restarts on the CPU and the panel shows the reason. Use **Retry GPU** to try it again.
+
 **Operator settings → Hand camera → Diagnostics** opens [a separate page](http://localhost:4180/diagnostics) with live MediaPipe landmarks on RGB and per-hand grip and depth readings. The Astra Pro supplies one infrared preview and the D435i supplies two. Infrared previews start on demand when Diagnostics is visible. Camera diagnostics stay local and do not record frames.
 
-Start at 30 fps. The capture setting is the requested sensor rate, **Pose rate** counts tracker output, and **Browser rate** counts delivered updates. When comparing 60 fps, check pose age and skipped frames as well as how the controls feel. Move a part or the view in the exhibit, then use the browser’s Back button to return to the operator page and see render-submission timings. Those timings end when the browser submits the draw, before it reaches the display.
+Start at 30 fps. The capture setting is the requested sensor rate, **Pose rate** counts tracker output, and **Browser rate** counts delivered updates. Compare CPU and GPU using hand inference, pose age, and skipped frames while actively moving the model. Repeat at 60 fps if the GPU comparison improves response. Move a part or the view in the exhibit, then use the browser’s Back button to return to the operator page and see render-submission timings. Those timings end when the browser submits the draw, before it reaches the display.
 
 ## Head-coupled perspective experiment
 

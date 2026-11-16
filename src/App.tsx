@@ -7,7 +7,7 @@ import { CadScene, type SurfaceFinishes } from './scene';
 import { GestureController, RESET_HOLD_MS, type GestureState } from './gestures';
 import { HandSimulator } from './simulator';
 import { AssemblyPanel, indexOccurrences, PartPanel } from './panels';
-import { applyHandCameraSettings, calibrateHands, connectLiveHands, fetchHandCameraSettings, handDisplayKey, type HandCameraSettings, type HandInteraction, type HandNavigation, type LiveHandStatus, type VisitorTurn } from './live-hands';
+import { applyHandCameraSettings, calibrateHands, connectLiveHands, fetchHandCameraSettings, handDisplayKey, type HandCameraSettings, type HandInference, type HandInteraction, type HandNavigation, type LiveHandStatus, type VisitorTurn } from './live-hands';
 import { attachVisitorControls } from './visitor-controls';
 import { CalibrationPanel } from './calibration-panel';
 import { CameraPreview } from './camera-preview';
@@ -149,6 +149,7 @@ function CameraSettings({ navigation, performance }: { navigation: HandNavigatio
   const [activeFps, setActiveFps] = useState<number | null>(null);
   const [draftFps, setDraftFps] = useState<number | null>(null);
   const [draftInteraction, setDraftInteraction] = useState<HandInteraction>();
+  const [draftHandInference, setDraftHandInference] = useState<HandInference>();
   const [sending, setSending] = useState(false);
   const [pollError, setPollError] = useState<string | null>(null);
   const [applyError, setApplyError] = useState<string | null>(null);
@@ -160,10 +161,12 @@ function CameraSettings({ navigation, performance }: { navigation: HandNavigatio
       if (!dirty.current) {
         setDraftFps(next.fps);
         setDraftInteraction(next.interaction);
+        setDraftHandInference(next.handInference);
       }
     } else {
       setDraftFps(current => current ?? next.fps);
       setDraftInteraction(current => current ?? next.interaction);
+      setDraftHandInference(current => current ?? next.handInference);
     }
   }
 
@@ -198,7 +201,10 @@ function CameraSettings({ navigation, performance }: { navigation: HandNavigatio
 
   const busy = sending || settings?.applying === true;
   const validDraft = draftFps !== null && settings?.frameRates.includes(draftFps);
-  const changed = draftFps !== activeFps || draftInteraction !== settings?.interaction;
+  const changed = draftFps !== activeFps || draftInteraction !== settings?.interaction
+    || draftHandInference !== settings?.handInference;
+  const retryGpu = settings?.handInference === 'gpu' && Boolean(settings.handInferenceFallback)
+    && draftFps === settings.fps && draftInteraction === settings.interaction && draftHandInference === 'gpu';
 
   function editDraft(fps: number) {
     dirty.current = true;
@@ -212,6 +218,12 @@ function CameraSettings({ navigation, performance }: { navigation: HandNavigatio
     setApplyError(null);
   }
 
+  function editHandInference(handInference: HandInference) {
+    dirty.current = true;
+    setDraftHandInference(handInference);
+    setApplyError(null);
+  }
+
   async function apply() {
     const controller = session.current;
     if (!controller || draftFps === null || !validDraft || busy || posting.current) return;
@@ -220,11 +232,14 @@ function CameraSettings({ navigation, performance }: { navigation: HandNavigatio
     setSending(true);
     setApplyError(null);
     try {
-      const next = await applyHandCameraSettings(draftFps, controller.signal, draftInteraction);
+      const next = await applyHandCameraSettings(
+        draftFps, controller.signal, draftInteraction, draftHandInference, retryGpu ? true : undefined,
+      );
       if (controller.signal.aborted) return;
       dirty.current = false;
       setDraftFps(next.fps);
       setDraftInteraction(next.interaction);
+      setDraftHandInference(next.handInference);
       receive(next);
       setPollError(null);
     } catch (cause) {
@@ -257,22 +272,31 @@ function CameraSettings({ navigation, performance }: { navigation: HandNavigatio
             <option value="single-user">Single-user</option>
           </select>
         </label>}
-        {(settings.frameRates.length > 1 || settings.interaction !== undefined) && <>
+        {settings.handInference !== undefined && <label className="navigation-choice">Hand inference
+          <select value={draftHandInference ?? settings.handInference} onChange={event => editHandInference(event.target.value as HandInference)}>
+            <option value="cpu">CPU</option>
+            <option value="gpu">GPU</option>
+          </select>
+        </label>}
+        {(settings.frameRates.length > 1 || settings.interaction !== undefined || settings.handInference !== undefined) && <>
           <p className="camera-option-note">Applying camera settings restarts the camera.</p>
-          <button className="button" type="button" disabled={!changed || !validDraft} onClick={() => void apply()}>
-            {busy && <LoaderCircle size={15} className="camera-settings-spinner" />}{busy ? 'Applying…' : 'Apply and restart'}
+          <button className="button" type="button" disabled={(!changed && !retryGpu) || !validDraft} onClick={() => void apply()}>
+            {busy && <LoaderCircle size={15} className="camera-settings-spinner" />}{busy ? 'Applying…' : retryGpu ? 'Retry GPU' : 'Apply and restart'}
           </button>
         </>}
       </> : <p className="camera-option-note">Loading camera settings…</p>}
     </fieldset>
     {busy && <p className="camera-option-note" role="status">Restarting the camera with the requested settings…</p>}
     {issue && <p className="camera-settings-error" role="alert">{issue}</p>}
+    {!busy && settings?.handInferenceFallback && <p className="camera-option-note" role="status">{settings.handInferenceFallback}</p>}
     {activeFps !== null && <dl className="camera-diagnostics" aria-label="Active camera diagnostics">
       <div><dt>Configured capture</dt><dd>{activeFps} fps</dd></div>
+      {!busy && settings?.activeHandInference && <div><dt>Active inference</dt><dd>{settings.activeHandInference.toUpperCase()}</dd></div>}
       {!busy && metrics && [metrics.estimatedHands, metrics.depthHands, metrics.trackedHands].some(value => value !== undefined) && <div><dt>Hands</dt><dd>{metrics.estimatedHands ?? '—'} seen · {metrics.depthHands ?? '—'} depth · {metrics.trackedHands ?? '—'} tracked</dd></div>}
       {!busy && metrics?.poseFps !== undefined && <div><dt>Pose rate</dt><dd>{metrics.poseFps.toFixed(1)} fps</dd></div>}
       {!busy && metrics?.processingMs !== undefined && <div><dt>Processing</dt><dd>{metrics.processingMs.toFixed(1)} ms</dd></div>}
       {!busy && metrics?.processingP95Ms !== undefined && <div><dt>Processing p95</dt><dd>{metrics.processingP95Ms.toFixed(1)} ms</dd></div>}
+      {!busy && metrics?.handInferenceP50Ms !== undefined && metrics.handInferenceP95Ms !== undefined && <div><dt>Hand inference</dt><dd>{metrics.handInferenceP50Ms.toFixed(1)} ms median · {metrics.handInferenceP95Ms.toFixed(1)} ms p95</dd></div>}
       {!busy && metrics?.inferenceMs !== undefined && <div><dt>Bridge stages</dt><dd>{metrics.inferenceMs.toFixed(1)} ms inference · {metrics.alignmentMs?.toFixed(1) ?? '—'} ms align · {metrics.fusionMs?.toFixed(1) ?? '—'} ms fusion</dd></div>}
       {!busy && metrics?.queueMs !== undefined && <div><dt>Capture queue</dt><dd>{metrics.queueMs.toFixed(1)} ms</dd></div>}
       {!busy && metrics?.frameAgeMs !== undefined && <div><dt>Pose age</dt><dd>{Math.round(metrics.frameAgeMs)} ms at bridge{metrics.frameAgeSource ? ` from ${metrics.frameAgeSource === 'hostArrival' ? 'host arrival' : 'capture dequeue'}` : ''}</dd></div>}

@@ -18,10 +18,12 @@ class SettingsFeed(StubFeed):
         self.changes = 0
         self.model_available = True
         self.frame_rates = [30, 60]
+        self.retry_gpu = False
 
-    def configure(self, options):
+    def configure(self, options, *, retry_gpu=False):
         self.options = options
         self.changes += 1
+        self.retry_gpu = retry_gpu
 
     def settings(self):
         tracker = {'value': 'mediapipe', 'label': 'MediaPipe Full', 'available': self.model_available}
@@ -84,6 +86,30 @@ class CameraSettingsTests(TestCase):
             service.settings(CameraOptions(interaction='single-user').to_dict())
             service.settings({'source': 'rgb', 'tracker': 'mediapipe', 'fps': 60})
             self.assertEqual(load_options(path), CameraOptions(fps=60, interaction='single-user'))
+
+    def test_gpu_selection_survives_legacy_updates_and_retry_is_explicit(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / 'settings.json'
+            feed = SettingsFeed()
+            service = CameraService(feed, Profiles(Path(directory) / 'profiles.json'), path)
+            previous_settings = {'source': 'rgb', 'tracker': 'mediapipe', 'fps': 30, 'interaction': 'single-user'}
+            path.write_text('{"source":"rgb","tracker":"mediapipe","fps":30,"interaction":"single-user"}')
+            self.assertEqual(load_options(path), CameraOptions(interaction='single-user'))
+
+            selected = service.settings({**previous_settings, 'handInference': 'gpu'})
+            self.assertEqual(selected['handInference'], 'gpu')
+            self.assertEqual(load_options(path), CameraOptions(interaction='single-user', hand_inference='gpu'))
+            service.settings({'source': 'rgb', 'tracker': 'mediapipe', 'fps': 60})
+            self.assertEqual(load_options(path), CameraOptions(fps=60, interaction='single-user', hand_inference='gpu'))
+            self.assertFalse(feed.retry_gpu)
+
+            service.settings({**previous_settings, 'retryGpu': True})
+            self.assertTrue(feed.retry_gpu)
+            self.assertEqual(load_options(path), CameraOptions(interaction='single-user', hand_inference='gpu'))
+            for extra in ({'handInference': 'auto'}, {'retryGpu': 1}, {'handInference': 'cpu', 'retryGpu': True}):
+                with self.subTest(extra=extra), self.assertRaises(ValueError):
+                    service.settings({**previous_settings, **extra})
+            self.assertEqual(feed.changes, 3)
 
     def test_unavailable_tracker_cannot_replace_the_current_saved_configuration(self):
         with TemporaryDirectory() as directory:

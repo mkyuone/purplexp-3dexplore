@@ -14,7 +14,7 @@ import logging
 
 from calibration import MAX_DEPTH_M, MIN_DEPTH_M, Pose, Vec3, median_point, valid_point
 from diagnostics import DiagnosticHand, HandDiagnosticNotes, diagnostic_hands, encode_diagnostic_rgb, hand_overlay, matching_track
-from estimators import is_thumbs_up
+from estimators import GpuInferenceError, is_thumbs_up
 from infrared_preview import INFRARED_INDEXES, InfraredEncoder, InfraredPreview
 from options import CameraOptions
 from tracking import (
@@ -56,6 +56,8 @@ class CameraInfo:
     session: str
     project_image: ImageProjector | None = None
     serial: str | None = None
+    active_hand_inference: str | None = None
+    inference_fallback: bool = False
 
 
 @dataclass(frozen=True)
@@ -724,17 +726,21 @@ class CameraFeed:
         self.depth_error: str | None = None
         self.options = options
         self.active_options: CameraOptions | None = None
+        self.hand_inference_fallback: str | None = None
         self.revision = 0
         self.frame_times: deque[float] = deque(maxlen=60)
         self.processing_times: deque[float] = deque(maxlen=60)
+        self.hand_inference_times: deque[float] = deque(maxlen=60)
         self.processing_ms = 0.0
         self.thread = Thread(target=self.run, name=f'{self.camera_name} capture', daemon=True)
         self.thread.start()
 
-    def configure(self, options: CameraOptions) -> None:
+    def configure(self, options: CameraOptions, *, retry_gpu: bool = False) -> None:
         with self.lock:
-            if options == self.options and self.error is None:
+            if options == self.options and self.error is None and not retry_gpu:
                 return
+            if retry_gpu or options.hand_inference != self.options.hand_inference:
+                self.hand_inference_fallback = None
             self.options = options
             self.revision += 1
             self.info = None
@@ -748,6 +754,7 @@ class CameraFeed:
             self.gesture_history.clear()
             self.frame_times.clear()
             self.processing_times.clear()
+            self.hand_inference_times.clear()
             self.processing_ms = 0.0
             self.error = None
             self.depth_error = None
@@ -763,10 +770,13 @@ class CameraFeed:
             last = (frame.diagnostics or {}) if frame else {}
             span = self.frame_times[-1] - self.frame_times[0] if len(self.frame_times) > 1 else 0
             processing = sorted(self.processing_times)
+            inference = sorted(self.hand_inference_times)
             diagnostics = {
                 'poseFps': (len(self.frame_times) - 1) / span if span > 0 and frame and now - frame.at < FRAME_MAX_AGE else 0,
                 'processingMs': self.processing_ms,
                 'processingP95Ms': processing[(len(processing) * 95 + 99) // 100 - 1] if processing else None,
+                'handInferenceP50Ms': median(inference) if inference else None,
+                'handInferenceP95Ms': inference[(len(inference) * 95 + 99) // 100 - 1] if inference else None,
                 'frameAgeMs': max(0, (now - frame.at) * 1000) if frame else None,
                 'estimatedHands': frame.detected_hands if frame else 0,
                 'depthHands': last.get('depthHands', 0),
@@ -783,6 +793,8 @@ class CameraFeed:
                 'sources': [{'value': 'rgb', 'label': 'RGB'}],
                 'trackers': tracker_choices(self.model), 'frameRates': list(self.frame_rates),
                 'applying': self.error is None and (self.active_options != self.options or self.info is None or frame is None),
+                'activeHandInference': self.info.active_hand_inference if self.info and frame else None,
+                'handInferenceFallback': self.hand_inference_fallback,
                 'error': self.error, 'depthError': self.depth_error, 'diagnostics': diagnostics,
             }
 
@@ -926,6 +938,9 @@ class CameraFeed:
                     self.gesture_history.clear()
             self.frame_times.append(frame.at)
             self.processing_times.append(frame.processing_ms)
+            hand_inference = (frame.diagnostics or {}).get('handInferenceMs')
+            if hand_inference is not None:
+                self.hand_inference_times.append(hand_inference)
             self.processing_ms += (frame.processing_ms - self.processing_ms) * 0.2
             self.changed.notify_all()
             if frame.detected_hands > 1:
@@ -943,10 +958,14 @@ class CameraFeed:
                 self.wake.clear()
                 continue
             message = None
+            gpu_error = None
+            fell_back_to_cpu = False
             with self.lock:
                 revision = self.revision
             try:
                 self.capture(revision)
+            except GpuInferenceError as error:
+                gpu_error = error
             except CameraError as error:
                 message = str(error)
             except Exception:
@@ -956,11 +975,18 @@ class CameraFeed:
                 with self.lock:
                     if revision != self.revision:
                         message = None
+                    elif gpu_error is not None:
+                        if self.options.hand_inference == 'gpu' and self.hand_inference_fallback is None:
+                            self.hand_inference_fallback = str(gpu_error)
+                            fell_back_to_cpu = True
+                        else:
+                            message = str(gpu_error)
                     self.info = None
                     self.active_options = None
                     self.frame = None
                     self.frame_times.clear()
                     self.processing_times.clear()
+                    self.hand_inference_times.clear()
                     self.processing_ms = 0.0
                     self.history.clear()
                     self.gesture_history.clear()
@@ -975,8 +1001,17 @@ class CameraFeed:
                     self.error = message
                     self.depth_error = None
                     self.changed.notify_all()
+            if fell_back_to_cpu:
+                logging.warning('Hand inference is switching to CPU.', exc_info=gpu_error)
             if message is not None:
                 self.stop.wait(2)
+
+    def capture_options(self, revision: int) -> tuple[CameraOptions, str] | None:
+        with self.lock:
+            if revision != self.revision:
+                return None
+            delegate = 'cpu' if self.hand_inference_fallback is not None else self.options.hand_inference
+            return self.options, delegate
 
     def capture(self, revision: int) -> None:
         try:
@@ -990,8 +1025,10 @@ class CameraFeed:
             cv2 = None
             logging.warning('Camera preview requires OpenCV, installed with MediaPipe.')
 
-        with self.lock:
-            options = self.options
+        configuration = self.capture_options(revision)
+        if configuration is None:
+            return
+        options, delegate = configuration
         context = rs.context()
         devices = [
             device for device in context.query_devices()
@@ -1005,7 +1042,7 @@ class CameraFeed:
 
         serial = devices[0].get_info(rs.camera_info.serial_number)
         with ExitStack() as resources:
-            estimator, pose_estimator, visitor_estimator = self.open_estimators(resources, options)
+            estimator, pose_estimator, visitor_estimator = self.open_estimators(resources, options, delegate)
             if not self.wanted(revision):
                 return
             device = devices[0]
@@ -1015,7 +1052,7 @@ class CameraFeed:
             def profile_key(width):
                 return f'{serial}:{RGB_SIZE[0]}x{RGB_SIZE[1]}:{width}:{options.fps}:{alignment}'
 
-            session = self.begin_session(revision, options, serial)
+            session = self.begin_session(revision, options, serial, delegate)
             if session is None:
                 return
 
@@ -1029,7 +1066,7 @@ class CameraFeed:
             self.track_frames(rs, np, estimator, color_queue, depth, align, revision, preview, diagnostic_rgb,
                               pose_estimator=pose_estimator, visitor_estimator=visitor_estimator)
 
-    def open_estimators(self, resources: ExitStack, options: CameraOptions):
+    def open_estimators(self, resources: ExitStack, options: CameraOptions, delegate: str):
         from estimators import create_estimator
         try:
             pose_estimator = None
@@ -1037,18 +1074,23 @@ class CameraFeed:
             if options.interaction == 'visitors':
                 from visitor_pose import create_pose_estimator
                 pose_estimator = resources.enter_context(create_pose_estimator())
-                visitor_estimator = resources.enter_context(create_estimator(options.tracker, self.model, num_hands=4))
-            estimator = resources.enter_context(create_estimator(options.tracker, self.model))
+                visitor_estimator = resources.enter_context(
+                    create_estimator(options.tracker, self.model, num_hands=4, delegate=delegate)
+                )
+            estimator = resources.enter_context(create_estimator(options.tracker, self.model, delegate=delegate))
             return estimator, pose_estimator, visitor_estimator
+        except GpuInferenceError:
+            raise
         except (RuntimeError, ValueError) as error:
             raise CameraError(str(error)) from error
 
-    def begin_session(self, revision: int, options: CameraOptions, serial: str) -> str | None:
+    def begin_session(self, revision: int, options: CameraOptions, serial: str, delegate: str) -> str | None:
         with self.lock:
             if revision != self.revision:
                 return None
             session = uuid4().hex
-            self.info = CameraInfo(None, session, serial=serial)
+            self.info = CameraInfo(None, session, serial=serial, active_hand_inference=delegate,
+                                   inference_fallback=delegate != options.hand_inference)
             self.active_options = options
             self.error = self.depth_error = None
             return session
@@ -1142,6 +1184,7 @@ class CameraFeed:
                         hand_image = visitor_hand_image(np, rgb, owner)
                     elif visitor_estimator is not None:
                         hand_estimator = visitor_estimator
+            before_hand_inference = monotonic()
             detections = hand_estimator.detect(hand_image, timestamp)
             after_inference = monotonic()
             try:
@@ -1206,6 +1249,7 @@ class CameraFeed:
                 'model': dict(getattr(hand_estimator, 'diagnostics', {})),
                 'queueMs': queue_ms,
                 'inferenceMs': (after_inference - before_inference) * 1000,
+                'handInferenceMs': (after_inference - before_hand_inference) * 1000,
                 'alignmentMs': (after_alignment - after_inference) * 1000,
                 'fusionMs': (after_tracking - after_alignment) * 1000,
                 'captureDroppedFrames': dropped,
